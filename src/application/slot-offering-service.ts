@@ -84,15 +84,29 @@ export interface SlotOfferParams {
    * Phase 4C: omitted (the default) is the exact, unchanged Phase 3C booking behavior --
    * assertOfferable requires QUALIFIED_A/QUALIFIED_B/BOOKING_PENDING, an existing active
    * appointment always short-circuits to ALREADY_BOOKED, and a successful round transitions the
-   * lead to BOOKING_PENDING. "RESCHEDULE" instead requires RESCHEDULE_REQUESTED, never treats the
-   * lead's still-active OLD appointment as a conflict (that's the expected precondition, not a
-   * problem -- WhatsAppRescheduleHandler validates it's exactly one BEFORE calling this), and
-   * never changes the lead's status (it's already RESCHEDULE_REQUESTED, set by the caller before
-   * this call -- see item 3 of the Phase 4C spec, "si ya existe RESCHEDULE_REQUESTED,
-   * reutilízalo"). Every other mechanic (claim/reclaim concurrency, round counting, TTL,
-   * createMany atomicity, assertSingleActiveRound) is fully shared, unmodified, between both modes.
+   * lead to BOOKING_PENDING. `{type:"RESCHEDULE", oldAppointmentId}` instead requires
+   * RESCHEDULE_REQUESTED, never treats the lead's still-active OLD appointment as a conflict
+   * (that's the expected precondition, not a problem -- WhatsAppRescheduleHandler validates it's
+   * exactly one BEFORE calling this), and never changes the lead's status (it's already
+   * RESCHEDULE_REQUESTED, set by the caller before this call -- see item 3 of the Phase 4C spec,
+   * "si ya existe RESCHEDULE_REQUESTED, reutilízalo"). Every other mechanic (claim/reclaim
+   * concurrency, TTL, createMany atomicity, assertSingleActiveRound) is fully shared, unmodified,
+   * between both modes.
+   *
+   * `oldAppointmentId` is carried here (not just a bare "RESCHEDULE" flag) so MAX_OFFER_ROUNDS can
+   * be scoped per reschedule episode instead of cumulatively per conversation forever -- see
+   * offered-slot.ts's rescheduleContextId doc comment. It's a stable, already-persistent
+   * identifier (never a timestamp heuristic), available the moment
+   * WhatsAppRescheduleHandler.handleIntentTurn finds the target appointment.
    */
-  mode?: "RESCHEDULE";
+  mode?: { type: "RESCHEDULE"; oldAppointmentId: string };
+}
+
+/** Extracts the round-counting/tagging context id from a SlotOfferParams["mode"] -- undefined for
+ * booking mode (the default), the old appointment's id for reschedule mode. Centralized here so
+ * every call site derives it identically. */
+function rescheduleContextIdOf(mode: SlotOfferParams["mode"]): string | undefined {
+  return mode?.type === "RESCHEDULE" ? mode.oldAppointmentId : undefined;
 }
 
 export interface SlotOfferingServiceOptions {
@@ -173,7 +187,7 @@ export class SlotOfferingService {
     const { lead, conversationId, now, mode } = params;
     this.assertOfferable(lead, mode);
 
-    if (mode !== "RESCHEDULE") {
+    if (mode?.type !== "RESCHEDULE") {
       // RESCHEDULE mode: the lead's old appointment is expected to still be active at this point
       // (it isn't superseded until AFTER a new slot is selected) -- never a conflict, so this
       // guard simply does not apply. WhatsAppRescheduleHandler is the one that validates "exactly
@@ -185,7 +199,7 @@ export class SlotOfferingService {
     const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
     if (activeSlots.length > 0) return this.resolveReused(lead, now, conversationId, activeSlots, mode);
 
-    const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId);
+    const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode));
     if (roundIds.length >= MAX_OFFER_ROUNDS) return { type: "MAX_ROUNDS_REACHED" };
 
     return this.claimAndCreateRound(lead, conversationId, now, mode);
@@ -216,7 +230,7 @@ export class SlotOfferingService {
     const { lead, conversationId, now, mode } = params;
     this.assertOfferable(lead, mode);
 
-    if (mode !== "RESCHEDULE") {
+    if (mode?.type !== "RESCHEDULE") {
       const activeAppointment = await this.appointments.findActiveByLeadId(lead.id);
       if (activeAppointment) return { type: "ALREADY_BOOKED", appointment: activeAppointment };
     }
@@ -224,7 +238,7 @@ export class SlotOfferingService {
     const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
     assertSingleActiveRound(conversationId, activeSlots); // refuse to replace an already-inconsistent offer
 
-    const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId);
+    const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode));
     if (roundIds.length >= MAX_OFFER_ROUNDS) return { type: "MAX_ROUNDS_REACHED" };
 
     const availabilityResult = await this.claimAndCreateRound(lead, conversationId, now, mode);
@@ -239,14 +253,14 @@ export class SlotOfferingService {
     return availabilityResult;
   }
 
-  private assertOfferable(lead: Lead, mode?: "RESCHEDULE"): void {
-    const allowed = mode === "RESCHEDULE" ? lead.status === "RESCHEDULE_REQUESTED" : OFFERABLE_LEAD_STATUSES.has(lead.status);
+  private assertOfferable(lead: Lead, mode?: SlotOfferParams["mode"]): void {
+    const allowed = mode?.type === "RESCHEDULE" ? lead.status === "RESCHEDULE_REQUESTED" : OFFERABLE_LEAD_STATUSES.has(lead.status);
     if (!allowed) {
       throw new LeadNotOfferableError(lead.id, lead.status);
     }
   }
 
-  private async resolveReused(lead: Lead, now: Date, conversationId: string, activeSlots: OfferedSlot[], mode?: "RESCHEDULE"): Promise<SlotOfferOutcome> {
+  private async resolveReused(lead: Lead, now: Date, conversationId: string, activeSlots: OfferedSlot[], mode?: SlotOfferParams["mode"]): Promise<SlotOfferOutcome> {
     assertSingleActiveRound(conversationId, activeSlots); // throws if data is inconsistent
     const updatedLead = await this.ensureOfferableLeadStatus(lead, now, mode);
     return { type: "REUSED", slots: activeSlots, lead: updatedLead };
@@ -265,8 +279,8 @@ export class SlotOfferingService {
    * no equivalent "offer started" event to record here; CANCELLATION_REQUESTED-shaped semantics
    * don't apply to a status the lead already durably holds.
    */
-  private async ensureOfferableLeadStatus(lead: Lead, now: Date, mode?: "RESCHEDULE"): Promise<Lead> {
-    if (mode === "RESCHEDULE") return lead;
+  private async ensureOfferableLeadStatus(lead: Lead, now: Date, mode?: SlotOfferParams["mode"]): Promise<Lead> {
+    if (mode?.type === "RESCHEDULE") return lead;
     if (lead.status === "BOOKING_PENDING") return lead;
     assertTransition(lead.status, "BOOKING_PENDING");
     const updated = await this.leads.update(lead.id, {
@@ -287,7 +301,7 @@ export class SlotOfferingService {
    * ownerToken + intendedRoundId, then tries to win the claim outright. Losing means someone
    * else already holds it -- see waitOrReclaim for what happens next.
    */
-  private async claimAndCreateRound(lead: Lead, conversationId: string, now: Date, mode?: "RESCHEDULE"): Promise<SlotOfferOutcome> {
+  private async claimAndCreateRound(lead: Lead, conversationId: string, now: Date, mode?: SlotOfferParams["mode"]): Promise<SlotOfferOutcome> {
     const ownerToken = this.ownerTokenFactory();
     const intendedRoundId = this.roundIdFactory();
 
@@ -315,7 +329,7 @@ export class SlotOfferingService {
     now: Date,
     ownerToken: string,
     intendedRoundId: string,
-    mode?: "RESCHEDULE",
+    mode?: SlotOfferParams["mode"],
   ): Promise<SlotOfferOutcome> {
     const deadline = this.clock().getTime() + OFFER_CLAIM_POLL_BUDGET_MS;
     while (this.clock().getTime() < deadline) {
@@ -367,7 +381,7 @@ export class SlotOfferingService {
    * regardless of outcome (success, NO_AVAILABILITY, or a thrown error) -- best-effort; a failed
    * release just means OFFER_CLAIM_STALE_THRESHOLD_MS is the backstop instead of an immediate
    * retry, never a crash. */
-  private async runClaimedWork(lead: Lead, conversationId: string, now: Date, ownerToken: string, intendedRoundId: string, mode?: "RESCHEDULE"): Promise<SlotOfferOutcome> {
+  private async runClaimedWork(lead: Lead, conversationId: string, now: Date, ownerToken: string, intendedRoundId: string, mode?: SlotOfferParams["mode"]): Promise<SlotOfferOutcome> {
     try {
       return await this.fetchAndPersistRound(lead, conversationId, now, intendedRoundId, mode);
     } finally {
@@ -392,7 +406,7 @@ export class SlotOfferingService {
    * (claimAndCreateRound/waitOrReclaim) -- never generated here, so every offered_slots row this
    * method persists always matches its claim's intended_round_id exactly.
    */
-  private async fetchAndPersistRound(lead: Lead, conversationId: string, now: Date, roundId: string, mode?: "RESCHEDULE"): Promise<SlotOfferOutcome> {
+  private async fetchAndPersistRound(lead: Lead, conversationId: string, now: Date, roundId: string, mode?: SlotOfferParams["mode"]): Promise<SlotOfferOutcome> {
     const to = new Date(now.getTime() + config.BOOKING_MAX_DAYS_AHEAD * 86_400_000);
     const available = await this.calendar.getAvailableSlots(now, to, config.MEETING_DURATION_MINUTES);
     if (available.length === 0) return { type: "NO_AVAILABILITY" };
@@ -400,6 +414,7 @@ export class SlotOfferingService {
     const chosen = available.slice(0, MAX_OFFERED_SLOTS);
     const expiresAt = new Date(now.getTime() + OFFERED_SLOT_TTL_MS);
 
+    const rescheduleContextId = rescheduleContextIdOf(mode);
     const persisted = await this.offeredSlots.createMany(
       chosen.map((slot, i) => ({
         conversationId,
@@ -410,6 +425,7 @@ export class SlotOfferingService {
         position: i + 1,
         expiresAt,
         selected: false,
+        rescheduleContextId,
       })),
     );
 

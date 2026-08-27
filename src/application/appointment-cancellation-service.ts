@@ -36,8 +36,16 @@ export class AppointmentCancellationService {
    * calling this again for an appointment that's already CANCELLED (this call's own doing, or a
    * concurrent winner's) never re-runs the CAS, never writes a second history row, and simply
    * (re)attempts Calendar cleanup if it's still pending.
+   *
+   * `eventType` (default "APPOINTMENT_CANCELLED", unchanged for every existing WhatsApp-facing
+   * caller) exists so a technical, internal rollback -- AppointmentRescheduleService's
+   * loser-rollback path, see its class doc comment -- can label the SAME BOOKED->CANCELLED
+   * transition distinctly ("APPOINTMENT_RESCHEDULE_ROLLBACK") in appointment_status_history,
+   * never mislabeling a spurious internal cleanup as a real customer-initiated cancellation. This
+   * method NEVER touches leads or sends any message regardless of eventType -- callers reusing it
+   * for a technical rollback can rely on that being true unconditionally, not just by convention.
    */
-  async cancel(appointment: Appointment, leadId: string): Promise<CancellationOutcome> {
+  async cancel(appointment: Appointment, leadId: string, eventType: string = "APPOINTMENT_CANCELLED"): Promise<CancellationOutcome> {
     if (appointment.status === "CANCELLED") {
       await this.ensureCleanup(appointment, leadId);
       return { type: "CANCELLED", appointment };
@@ -70,7 +78,7 @@ export class AppointmentCancellationService {
       leadId,
       fromStatus: "BOOKED",
       toStatus: "CANCELLED",
-      eventType: "APPOINTMENT_CANCELLED",
+      eventType,
     });
 
     await this.ensureCleanup(claimed, leadId);

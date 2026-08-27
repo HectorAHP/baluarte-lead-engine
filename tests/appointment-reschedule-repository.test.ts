@@ -67,6 +67,8 @@ describe("SupabaseAppointmentRescheduleRepository -- row mapping (pure, no netwo
       lead_id: "lead-1",
       old_appointment_id: "appt-old-1",
       new_appointment_id: "appt-new-1",
+      new_calendar_event_id: "evt-new-1",
+      phase_a_status: "COMPLETED",
       idempotency_key: "whatsapp-reschedule:lead-1:appt-old-1:slot-1",
       old_calendar_event_id: "evt-old-1",
       status: "COMPLETED",
@@ -83,6 +85,8 @@ describe("SupabaseAppointmentRescheduleRepository -- row mapping (pure, no netwo
       leadId: "lead-1",
       oldAppointmentId: "appt-old-1",
       newAppointmentId: "appt-new-1",
+      newCalendarEventId: "evt-new-1",
+      phaseAStatus: "COMPLETED",
       idempotencyKey: "whatsapp-reschedule:lead-1:appt-old-1:slot-1",
       oldCalendarEventId: "evt-old-1",
       status: "COMPLETED",
@@ -95,13 +99,16 @@ describe("SupabaseAppointmentRescheduleRepository -- row mapping (pure, no netwo
     });
   });
 
-  it("maps a null new_appointment_id to undefined (Phase A not yet complete)", () => {
+  it("maps a null new_appointment_id/new_calendar_event_id to undefined (Phase A not yet complete)", () => {
     const row: AppointmentRescheduleRow = {
       id: "resch-1", lead_id: "lead-1", old_appointment_id: "appt-old-1", new_appointment_id: null,
+      new_calendar_event_id: null, phase_a_status: "PENDING",
       idempotency_key: "k", old_calendar_event_id: null, status: "PENDING", attempt_count: 0,
       last_attempt_at: null, completed_at: null, error_code: null,
       created_at: "2026-03-02T12:00:00.000Z", updated_at: "2026-03-02T12:00:00.000Z",
     };
     expect(mapRowToAppointmentReschedule(row).newAppointmentId).toBeUndefined();
+    expect(mapRowToAppointmentReschedule(row).newCalendarEventId).toBeUndefined();
+    expect(mapRowToAppointmentReschedule(row).phaseAStatus).toBe("PENDING");
   });
 });

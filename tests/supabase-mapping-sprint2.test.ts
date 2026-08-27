@@ -123,6 +123,7 @@ describe("supabase offered slot mapping", () => {
     id: "o1", conversation_id: "c1", lead_id: "l1", round_id: "r1",
     slot_start: "2026-03-02T15:00:00.000Z", slot_end: "2026-03-02T15:30:00.000Z",
     position: 1, expires_at: "2026-03-02T14:55:00.000Z", selected: false, created_at: "2026-03-02T14:00:00.000Z",
+    reschedule_context_id: null,
   };
 
   it("maps row to domain", () => {

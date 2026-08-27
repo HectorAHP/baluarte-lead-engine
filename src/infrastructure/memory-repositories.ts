@@ -224,10 +224,10 @@ export class InMemoryOfferedSlotRepository implements OfferedSlotRepository{
       .sort((a,b)=>a.position-b.position);
   }
 
-  async listRoundIdsByConversationId(conversationId:string):Promise<string[]>{
+  async listRoundIdsByConversationId(conversationId:string,rescheduleContextId?:string):Promise<string[]>{
     const ids=new Set<string>();
     for(const s of this.data.values()){
-      if(s.conversationId===conversationId) ids.add(s.roundId);
+      if(s.conversationId===conversationId && s.rescheduleContextId===rescheduleContextId) ids.add(s.roundId);
     }
     return [...ids];
   }
@@ -400,10 +400,10 @@ export class InMemoryAppointmentRescheduleRepository implements AppointmentResch
   private data=new Map<string,AppointmentReschedule>();
   private byIdempotencyKey=new Map<string,string>();
 
-  async tryCreate(input:Omit<AppointmentReschedule,"id"|"createdAt"|"updatedAt"|"attemptCount"|"status"|"newAppointmentId">&{status?:AppointmentReschedule["status"]}):Promise<AppointmentReschedule|null>{
+  async tryCreate(input:Omit<AppointmentReschedule,"id"|"createdAt"|"updatedAt"|"attemptCount"|"status"|"phaseAStatus"|"newAppointmentId">&{status?:AppointmentReschedule["status"];phaseAStatus?:AppointmentReschedule["phaseAStatus"]}):Promise<AppointmentReschedule|null>{
     if(this.byIdempotencyKey.has(input.idempotencyKey)) return null;
     const now=new Date();
-    const row:AppointmentReschedule={...input,status:input.status??"PENDING",attemptCount:0,id:randomUUID(),createdAt:now,updatedAt:now};
+    const row:AppointmentReschedule={...input,status:input.status??"PENDING",phaseAStatus:input.phaseAStatus??"PENDING",attemptCount:0,id:randomUUID(),createdAt:now,updatedAt:now};
     this.data.set(row.id,row);
     this.byIdempotencyKey.set(input.idempotencyKey,row.id);
     return row;
@@ -420,5 +420,17 @@ export class InMemoryAppointmentRescheduleRepository implements AppointmentResch
     const n={...c,...patch,id,updatedAt:new Date()};
     this.data.set(id,n);
     return n;
+  }
+
+  /** Mirrors InMemoryBookingAttemptRepository.claimTransition exactly -- no `await` before the
+   * Map mutation, so concurrent Promise.all() calls never interleave mid-check. */
+  async claimTransition(id:string,expectedStatus:AppointmentReschedule["phaseAStatus"],nextStatus:AppointmentReschedule["phaseAStatus"],options?:{updatedBefore:Date}):Promise<AppointmentReschedule|null>{
+    const current=this.data.get(id);
+    if(!current) return null;
+    if(current.phaseAStatus!==expectedStatus) return null;
+    if(options?.updatedBefore && !(current.updatedAt<options.updatedBefore)) return null;
+    const claimed={...current,phaseAStatus:nextStatus,updatedAt:new Date()};
+    this.data.set(id,claimed);
+    return claimed;
   }
 }

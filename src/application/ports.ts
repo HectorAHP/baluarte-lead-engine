@@ -4,15 +4,31 @@ export interface AppointmentRepository {
   create(input:Omit<Appointment,"id">):Promise<Appointment>;
   findById(id:string):Promise<Appointment|null>;
   update(id:string,patch:Partial<Appointment>):Promise<Appointment>;
-  /** The lead's most recent appointment with status "BOOKED" -- CANCELLED and any other status
-   * never count as "active". Returns null (never throws) when none exists. */
+  /**
+   * The lead's most recent appointment with status "BOOKED" -- CANCELLED and any other status
+   * never count as "active". Returns null (never throws) when none exists.
+   *
+   * AMBIGUOUS BY DESIGN during the brief Phase 4C reschedule coexistence window (new appointment
+   * persisted BOOKED, old not yet CAS'd to RESCHEDULED -- see AppointmentRescheduleService's class
+   * doc comment, item 7 of the Phase 4C hardening report): with two BOOKED rows for one lead, this
+   * always returns the NEWEST one (most recently created -- both InMemory's insertion-order "last
+   * match" and Supabase's `order(created_at desc).limit(1)` agree on this). Callers that could
+   * plausibly run DURING that window (WhatsAppCancellationHandler, WhatsAppRescheduleHandler) NEVER
+   * use this single-row method for their own target-appointment resolution -- both exclusively use
+   * listActiveByLeadId below and treat >1 as a hard escalation, precisely so this ambiguity can
+   * never cause either handler to act on the wrong appointment. Only WhatsAppBookingHandler and
+   * SlotOfferingService (booking mode) still use this method, and neither is ever reachable for a
+   * lead that could be mid-reschedule (both require BOOKING_PENDING/QUALIFIED_A/B, never
+   * RESCHEDULE_REQUESTED).
+   */
   findActiveByLeadId(leadId:string):Promise<Appointment|null>;
   /**
-   * Every BOOKED appointment for this lead (there should only ever be at most one -- this exists
-   * so a caller can DETECT ">1" as a genuine data-consistency violation, which
-   * findActiveByLeadId's single-row "most recent" contract cannot surface). Phase 4B:
-   * WhatsAppCancellationHandler uses this to decide between "proceed" (exactly 1), "escalate,
-   * nothing to cancel" (0), and "escalate, inconsistent" (>1).
+   * Every BOOKED appointment for this lead (there should only ever be at most one outside the
+   * Phase 4C reschedule coexistence window above -- this exists so a caller can DETECT ">1" as a
+   * genuine data-consistency violation, which findActiveByLeadId's single-row "most recent"
+   * contract cannot surface). Phase 4B: WhatsAppCancellationHandler uses this to decide between
+   * "proceed" (exactly 1), "escalate, nothing to cancel" (0), and "escalate, inconsistent" (>1).
+   * Phase 4C: WhatsAppRescheduleHandler does the same.
    */
   listActiveByLeadId(leadId:string):Promise<Appointment[]>;
   /** The lead's single most recent appointment regardless of status, or null if none ever
@@ -70,16 +86,22 @@ export interface OfferedSlotRepository {
   listActiveByConversationId(conversationId:string,now:Date):Promise<OfferedSlot[]>;
   update(id:string,patch:Partial<OfferedSlot>):Promise<OfferedSlot>;
   /**
-   * Every distinct round_id offered for this conversation, across ALL rounds (active, expired,
-   * or selected) -- used exclusively for round counting (see MAX_OFFER_ROUNDS in
-   * slot-offering-service.ts). Deduplicated by the repository itself: the returned array has one
-   * entry per round, never one per offered_slots row. Supabase/PostgREST has no clean way to
-   * express `COUNT(DISTINCT round_id)` through the query builder without a custom RPC function,
-   * so implementations instead fetch round_id for every matching row and dedupe in application
-   * code -- correct (if occasionally fetching a few extra values) rather than a wrong
-   * pseudo-aggregate.
+   * Every distinct round_id offered for this conversation IN THIS BOOKING CONTEXT, across ALL
+   * rounds (active, expired, or selected) -- used exclusively for round counting (see
+   * MAX_OFFER_ROUNDS in slot-offering-service.ts). Deduplicated by the repository itself: the
+   * returned array has one entry per round, never one per offered_slots row. Supabase/PostgREST
+   * has no clean way to express `COUNT(DISTINCT round_id)` through the query builder without a
+   * custom RPC function, so implementations instead fetch round_id for every matching row and
+   * dedupe in application code -- correct (if occasionally fetching a few extra values) rather
+   * than a wrong pseudo-aggregate.
+   *
+   * Phase 4C: `rescheduleContextId` scopes the count so a reschedule's round budget is
+   * independent of the conversation's original booking rounds (and vice versa) -- omitted/
+   * undefined (the default, unchanged Phase 3C behavior) counts only rounds with
+   * reschedule_context_id IS NULL (booking-mode rounds); passing a value counts only rounds
+   * tagged with that exact reschedule_context_id. Never a mix of both.
    */
-  listRoundIdsByConversationId(conversationId:string):Promise<string[]>;
+  listRoundIdsByConversationId(conversationId:string,rescheduleContextId?:string):Promise<string[]>;
 }
 export interface SlotOfferClaimRepository {
   /** Wins outright (INSERT succeeds) or returns null on a PK conflict (conversation_id already
@@ -148,10 +170,21 @@ export interface AppointmentCancellationRepository {
 // appointment_cancellations or booking_attempts.
 export interface AppointmentRescheduleRepository {
   /** Wins outright (INSERT succeeds) or returns null on an idempotency_key conflict -- never
-   * throws for the "already tracked" case, same convention as every other tryCreate here. */
-  tryCreate(input: Omit<AppointmentReschedule, "id" | "createdAt" | "updatedAt" | "attemptCount" | "status" | "newAppointmentId"> & { status?: AppointmentReschedule["status"] }): Promise<AppointmentReschedule | null>;
+   * throws for the "already tracked" case, same convention as every other tryCreate here.
+   * phaseAStatus defaults to 'PENDING', mirroring booking_attempts.status's default. */
+  tryCreate(input: Omit<AppointmentReschedule, "id" | "createdAt" | "updatedAt" | "attemptCount" | "status" | "phaseAStatus" | "newAppointmentId"> & { status?: AppointmentReschedule["status"]; phaseAStatus?: AppointmentReschedule["phaseAStatus"] }): Promise<AppointmentReschedule | null>;
   findByIdempotencyKey(idempotencyKey: string): Promise<AppointmentReschedule | null>;
   update(id: string, patch: Partial<AppointmentReschedule>): Promise<AppointmentReschedule>;
+  /**
+   * Atomic compare-and-set on phaseAStatus ONLY (never Phase B's `status` field) -- transitions
+   * row `id` from `expectedStatus` to `nextStatus` ONLY if its current phaseAStatus still matches,
+   * and (when `options.updatedBefore` is given) only if updatedAt is older than that cutoff too.
+   * Returns the updated row if this call won the race, or null if another request already changed
+   * it first -- never throws for the "lost the race" case. Mirrors
+   * BookingAttemptRepository.claimTransition's exact contract (including the two-step
+   * PENDING -> FAILED -> PENDING stale-reclaim pattern AppointmentRescheduleService uses).
+   */
+  claimTransition(id: string, expectedStatus: AppointmentReschedule["phaseAStatus"], nextStatus: AppointmentReschedule["phaseAStatus"], options?: { updatedBefore: Date }): Promise<AppointmentReschedule | null>;
 }
 
 export interface CalendarSlot{start:Date;end:Date;} export interface CalendarEventInput{title:string;description:string;start:Date;end:Date;attendeeEmail?:string;} export interface CalendarEventResult{eventId:string;meetingUrl?:string;}

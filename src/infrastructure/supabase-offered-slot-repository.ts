@@ -13,6 +13,7 @@ export interface OfferedSlotRow {
   expires_at: string;
   selected: boolean;
   created_at: string;
+  reschedule_context_id: string | null;
 }
 
 export function mapRowToOfferedSlot(row: OfferedSlotRow): OfferedSlot {
@@ -27,6 +28,7 @@ export function mapRowToOfferedSlot(row: OfferedSlotRow): OfferedSlot {
     expiresAt: new Date(row.expires_at),
     selected: row.selected,
     createdAt: new Date(row.created_at),
+    rescheduleContextId: row.reschedule_context_id ?? undefined,
   };
 }
 
@@ -40,6 +42,7 @@ export function mapOfferedSlotToInsertRow(input: Omit<OfferedSlot, "id" | "creat
     position: input.position,
     expires_at: input.expiresAt.toISOString(),
     selected: input.selected,
+    reschedule_context_id: input.rescheduleContextId ?? null,
   };
 }
 
@@ -97,11 +100,13 @@ export class SupabaseOfferedSlotRepository implements OfferedSlotRepository {
    * belonging to the conversation and dedupes here, in application code. Correct (if it fetches
    * a few more values than strictly needed) beats a plausible-looking but wrong pseudo-aggregate.
    */
-  async listRoundIdsByConversationId(conversationId: string): Promise<string[]> {
-    const { data, error } = await this.client
-      .from("offered_slots")
-      .select("round_id")
-      .eq("conversation_id", conversationId);
+  async listRoundIdsByConversationId(conversationId: string, rescheduleContextId?: string): Promise<string[]> {
+    let query = this.client.from("offered_slots").select("round_id").eq("conversation_id", conversationId);
+    // Scoped by booking context (Phase 4C): undefined counts only booking-mode rounds
+    // (reschedule_context_id IS NULL); a value counts only rounds tagged with that exact
+    // reschedule context. Never a mix of both -- see ports.ts's doc comment.
+    query = rescheduleContextId === undefined ? query.is("reschedule_context_id", null) : query.eq("reschedule_context_id", rescheduleContextId);
+    const { data, error } = await query;
     if (error) throw new Error(`SUPABASE_OFFERED_SLOT_LIST_ROUNDS_FAILED: ${error.message}`);
     return [...new Set((data as Array<{ round_id: string }>).map((row) => row.round_id))];
   }

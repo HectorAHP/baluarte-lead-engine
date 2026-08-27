@@ -90,15 +90,15 @@ describe("WhatsAppRescheduleHandler -- intent turn (BOOKED)", () => {
   });
 });
 
-describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
-  async function toRescheduleRequested(h: ReturnType<typeof makeHandler>) {
-    const ctx = await makeBookedLeadWithAppointment(h);
-    await h.handler.handleTurn({ lead: ctx.lead, conversationId: ctx.conversation.id, whatsappUserId: "5214771234567", inboundText: "quiero reagendar", now: NOW });
-    const pendingLead = (await h.leads.findById(ctx.lead.id))!;
-    const activeSlots = await h.offeredSlots.listActiveByConversationId(ctx.conversation.id, NOW);
-    return { ...ctx, pendingLead, activeSlots };
-  }
+async function toRescheduleRequested(h: ReturnType<typeof makeHandler>) {
+  const ctx = await makeBookedLeadWithAppointment(h);
+  await h.handler.handleTurn({ lead: ctx.lead, conversationId: ctx.conversation.id, whatsappUserId: "5214771234567", inboundText: "quiero reagendar", now: NOW });
+  const pendingLead = (await h.leads.findById(ctx.lead.id))!;
+  const activeSlots = await h.offeredSlots.listActiveByConversationId(ctx.conversation.id, NOW);
+  return { ...ctx, pendingLead, activeSlots };
+}
 
+describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
   it("valid slot selection -> new appointment BOOKED (rescheduledFrom = old.id), old -> RESCHEDULED, lead -> BOOKED, confirmation message with the new date", async () => {
     const h = makeHandler();
     const { pendingLead, conversation, appointment } = await toRescheduleRequested(h);
@@ -178,6 +178,56 @@ describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
     expect(apptHistory).toHaveLength(1);
     const leadHistory = await h.leadStatusHistory.listByLeadId(pendingLead.id);
     expect(leadHistory.filter((r) => r.toStatus === "BOOKED")).toHaveLength(1);
+  });
+});
+
+describe("WhatsAppRescheduleHandler -- item 13: cancellation-vs-reschedule race", () => {
+  it("reschedule completing AFTER a concurrent cancellation-handoff already set CANCEL_PENDING never forces the lead back to BOOKED -- the reschedule's DB effects still land (new appointment BOOKED, old RESCHEDULED), but the pending cancellation question is never silently discarded", async () => {
+    const h = makeHandler();
+    const { pendingLead, conversation, appointment } = await toRescheduleRequested(h);
+
+    // Simulate Turn B (a concurrent "cancelar cita" handoff) landing FIRST, moving the lead to
+    // CANCEL_PENDING behind Turn A's back -- the appointment itself is untouched by this (a
+    // cancellation handoff never touches the appointment, only the lead).
+    await h.leads.update(pendingLead.id, { status: "CANCEL_PENDING" });
+
+    // Turn A (a valid slot selection, "1") still holds the STALE RESCHEDULE_REQUESTED snapshot.
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+
+    // The reschedule's own DB truth still lands correctly.
+    expect((await h.appointments.findById(appointment.id))?.status).toBe("RESCHEDULED");
+    const newAppt = await h.appointments.findActiveByLeadId(pendingLead.id);
+    expect(newAppt?.status).toBe("BOOKED");
+    expect(newAppt?.rescheduledFrom).toBe(appointment.id);
+
+    // But the lead's CANCEL_PENDING (representing the user's still-open cancellation question)
+    // is NEVER silently overwritten back to BOOKED.
+    expect((await h.leads.findById(pendingLead.id))?.status).toBe("CANCEL_PENDING");
+    const history = await h.leadStatusHistory.listByLeadId(pendingLead.id);
+    expect(history.some((r) => r.eventType === "RESCHEDULE_CONFIRMED")).toBe(false);
+  });
+
+  it("'cancelar cita' arriving from a stale RESCHEDULE_REQUESTED snapshot, after a concurrent reschedule selection already resolved the lead to BOOKED, is left unactioned -- no CANCEL_PENDING, no message, no misleading history row", async () => {
+    const h = makeHandler();
+    const { pendingLead, conversation, appointment } = await toRescheduleRequested(h);
+
+    // Simulate Turn A (a valid slot selection) completing FIRST -- lead now BOOKED with a new
+    // appointment.
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+    expect((await h.leads.findById(pendingLead.id))?.status).toBe("BOOKED");
+    const messageCountBeforeRace = h.messaging.sentTexts.length;
+
+    // Turn B ("cancelar cita") still holds the STALE RESCHEDULE_REQUESTED snapshot from before
+    // Turn A ran.
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "cancelar cita", now: NOW });
+
+    // Left completely unactioned -- lead stays BOOKED (never forced into CANCEL_PENDING against a
+    // stale precondition), no new message sent, no history row for this turn.
+    expect((await h.leads.findById(pendingLead.id))?.status).toBe("BOOKED");
+    expect(h.messaging.sentTexts.length).toBe(messageCountBeforeRace);
+    const history = await h.leadStatusHistory.listByLeadId(pendingLead.id);
+    expect(history.some((r) => r.toStatus === "CANCEL_PENDING")).toBe(false);
+    expect((await h.appointments.findById(appointment.id))?.status).toBe("RESCHEDULED"); // untouched by the race
   });
 });
 

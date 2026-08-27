@@ -92,17 +92,24 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     const updatedLead = await this.transitionLead(lead, "RESCHEDULE_REQUESTED", "RESCHEDULE_REQUESTED");
     await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, RESCHEDULE_INTRO_MESSAGE);
 
-    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead: updatedLead, conversationId, now, mode: "RESCHEDULE" });
+    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead: updatedLead, conversationId, now, mode: { type: "RESCHEDULE", oldAppointmentId: oldAppointment.id } });
     await dispatchSlotOfferOutcome(this.deps, outcome, updatedLead, conversationId, whatsappUserId, this.advisorTimezone);
   }
 
   /** RESCHEDULE_REQUESTED: cancellation-intent is checked FIRST, before ever trying to parse a
-   * slot selection -- item 13 of the Phase 4C spec. */
+   * slot selection -- item 13 of the Phase 4C spec. The target (old) appointment is resolved once
+   * here (source of truth, never inferred) and its id threads into every SlotOfferingService call
+   * below as the reschedule context, so MAX_OFFER_ROUNDS is scoped to THIS reschedule episode. */
   private async handleRescheduleRequestedTurn(lead: Lead, conversationId: string, whatsappUserId: string, inboundText: string, now: Date): Promise<void> {
     if (isCancellationRequest(inboundText)) {
       await this.handOffToCancellation(lead, conversationId, whatsappUserId);
       return;
     }
+
+    const oldAppointment = await this.findTargetAppointment(lead.id);
+    if (oldAppointment === "INCONSISTENT") throw new AppointmentRescheduleInconsistentError(lead.id, "MULTIPLE_APPOINTMENTS");
+    if (!oldAppointment) throw new AppointmentRescheduleInconsistentError(lead.id, "NO_APPOINTMENT");
+    const rescheduleMode = { type: "RESCHEDULE" as const, oldAppointmentId: oldAppointment.id };
 
     const activeSlots = await this.deps.offeredSlots.listActiveByConversationId(conversationId, now);
 
@@ -110,7 +117,7 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
       // Nothing to interpret the inbound text against (e.g. the round expired, or this is a
       // recovery retry) -- get (or create) a fresh offer first, same bootstrap as
       // WhatsAppBookingHandler.
-      const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, mode: "RESCHEDULE" });
+      const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, mode: rescheduleMode });
       await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
       return;
     }
@@ -123,7 +130,7 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     }
 
     if (selection.type === "DECLINED") {
-      const replacement = await this.deps.slotOffering.replaceOffer({ lead, conversationId, now, mode: "RESCHEDULE" });
+      const replacement = await this.deps.slotOffering.replaceOffer({ lead, conversationId, now, mode: rescheduleMode });
       await dispatchSlotOfferOutcome(this.deps, replacement, lead, conversationId, whatsappUserId, this.advisorTimezone, "slot_unavailable");
       return;
     }
@@ -203,13 +210,33 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     return updated;
   }
 
-  /** Set-once/idempotent, and re-fetches the lead's current status before deciding -- same
+  /**
+   * Set-once/idempotent, and re-fetches the lead's current status before deciding -- same
    * defensive discipline as WhatsAppCancellationHandler.ensureLeadCancelled (see its doc comment
-   * for the exact stale-snapshot race this guards against, applied here to
-   * RESCHEDULE_REQUESTED -> BOOKED instead of CANCEL_PENDING -> CANCELLED). */
+   * for the general stale-snapshot race this guards against).
+   *
+   * Item 13 hardening: ONLY forces BOOKED when the current status is still RESCHEDULE_REQUESTED
+   * (the expected precondition) or already BOOKED (idempotent no-op). Any OTHER current status --
+   * concretely, CANCEL_PENDING, reached via a concurrent "cancelar cita" turn (handOffToCancellation
+   * below) racing this exact reschedule selection -- is left completely untouched. Without this
+   * check, a reschedule that finishes AFTER a concurrent cancellation-handoff already moved the
+   * lead to CANCEL_PENDING would silently force it back to BOOKED, discarding the user's pending
+   * cancellation question with a misleading "RESCHEDULE_CONFIRMED" history row that looks like a
+   * normal confirmation but actually overwrote an unrelated, still-open user request. The
+   * reschedule's own DB-side effects (new appointment BOOKED, old RESCHEDULED) are NEVER rolled
+   * back here regardless -- they already durably happened and are correct; only the LEAD's status
+   * is left alone.
+   */
   private async ensureLeadBookedAfterReschedule(lead: Lead): Promise<Lead> {
     const current = (await this.deps.leads.findById(lead.id)) ?? lead;
     if (current.status === "BOOKED") return current;
+    if (current.status !== "RESCHEDULE_REQUESTED") {
+      this.deps.logger.warn(
+        { leadId: lead.id, expectedStatus: "RESCHEDULE_REQUESTED", actualStatus: current.status },
+        "Lead status changed to something other than RESCHEDULE_REQUESTED/BOOKED by a concurrent turn while a reschedule was completing; leaving it exactly as that concurrent turn set it instead of forcing BOOKED.",
+      );
+      return current;
+    }
     return this.transitionLead(current, "BOOKED", "RESCHEDULE_CONFIRMED");
   }
 
@@ -217,13 +244,31 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
    * never a second cancellation UX. The next turn routes to WhatsAppCancellationHandler
    * (unmodified) since CANCEL_PENDING is already in its routing condition. */
   private async handOffToCancellation(lead: Lead, conversationId: string, whatsappUserId: string): Promise<void> {
+    // Re-fetch and re-verify BEFORE transitioning -- symmetric with
+    // ensureLeadBookedAfterReschedule's hardening above. If a concurrent slot-selection turn
+    // already completed the reschedule (lead now BOOKED with a NEW active appointment) between
+    // when this turn started and now, blindly transitioning from the stale RESCHEDULE_REQUESTED
+    // snapshot would write a CANCEL_PENDING with a wrong fromStatus in the audit trail and could
+    // target a display appointment that's already stale. Safer to leave this "cancelar cita" text
+    // unactioned for THIS turn -- no state change, no message -- than to write something
+    // misleading; the lead is already correctly BOOKED with its new appointment, and the user can
+    // simply send "cancelar cita" again if they still want to.
+    const current = (await this.deps.leads.findById(lead.id)) ?? lead;
+    if (current.status !== "RESCHEDULE_REQUESTED") {
+      this.deps.logger.warn(
+        { leadId: lead.id, expectedStatus: "RESCHEDULE_REQUESTED", actualStatus: current.status },
+        "Cancellation-intent text arrived for a lead no longer RESCHEDULE_REQUESTED (a concurrent reschedule selection already resolved it) -- left unactioned rather than writing a misleading CANCEL_PENDING transition.",
+      );
+      return;
+    }
+
     const appointment = await this.findTargetAppointment(lead.id);
     if (appointment === "INCONSISTENT") throw new AppointmentRescheduleInconsistentError(lead.id, "MULTIPLE_APPOINTMENTS");
     if (!appointment) throw new AppointmentRescheduleInconsistentError(lead.id, "NO_APPOINTMENT");
 
     // Same eventType 4B already uses for BOOKED -> CANCEL_PENDING -- no new vocabulary for the
     // same real-world event ("the lead asked to cancel").
-    await this.transitionLead(lead, "CANCEL_PENDING", "CANCELLATION_REQUESTED");
+    await this.transitionLead(current, "CANCEL_PENDING", "CANCELLATION_REQUESTED");
     const when = formatSlotForDisplay(appointment.startsAt, this.advisorTimezone);
     await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildCancelConfirmationPromptMessage(when));
   }

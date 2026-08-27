@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import { z } from "zod";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { config, hasGoogleCalendarCredentials, hasWhatsAppCredentials } from "./config.js";
 import {
   InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository,
@@ -59,6 +60,19 @@ declare module "fastify" {
 }
 
 export interface AppDependencies {
+  /**
+   * Phase 4C hardening (item 15): explicit override for the Supabase client itself, not just the
+   * individual repositories built from it. `undefined` (the default) keeps today's production
+   * behavior -- construct a real client whenever config.SUPABASE_URL/SUPABASE_SECRET_KEY are set.
+   * `null` forces NO Supabase client to ever be constructed, regardless of what's in .env --
+   * tests/helpers/test-app.ts always passes `null` explicitly, so `npm test` can never touch a
+   * real Supabase client even when real production credentials are present in the environment's
+   * .env (this repo's own .env does carry them -- see the Phase 4C hardening report). This also
+   * makes /health's `persistenceProvider` field accurate in tests (it was previously driven by
+   * config.SUPABASE_URL/SUPABASE_SECRET_KEY's mere presence, not by which persistence layer the
+   * app actually wired -- a cosmetic-only mismatch in test runs, now closed).
+   */
+  supabaseClient?: SupabaseClient | null;
   leadsRepo?: LeadRepository;
   appointmentsRepo?: AppointmentRepository;
   bookingAttemptsRepo?: BookingAttemptRepository;
@@ -147,7 +161,10 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   const whatsappVerifyToken = overrides.whatsappVerifyToken ?? config.WHATSAPP_VERIFY_TOKEN;
   const metaAppSecret = overrides.metaAppSecret ?? config.META_APP_SECRET;
 
-  const supabaseClient = config.SUPABASE_URL && config.SUPABASE_SECRET_KEY ? createSupabaseClient() : null;
+  // overrides.supabaseClient !== undefined lets a caller force EITHER a specific client OR null
+  // (never constructing one) -- see AppDependencies' doc comment (Phase 4C hardening item 15).
+  // undefined (production's only path) preserves today's exact behavior.
+  const supabaseClient = overrides.supabaseClient !== undefined ? overrides.supabaseClient : config.SUPABASE_URL && config.SUPABASE_SECRET_KEY ? createSupabaseClient() : null;
   const leadsRepo = overrides.leadsRepo ?? (supabaseClient ? new SupabaseLeadRepository(supabaseClient) : new InMemoryLeadRepository());
   const appointmentsRepo = overrides.appointmentsRepo ?? (supabaseClient ? new SupabaseAppointmentRepository(supabaseClient) : new InMemoryAppointmentRepository());
   const bookingAttemptsRepo = overrides.bookingAttemptsRepo ?? (supabaseClient ? new SupabaseBookingAttemptRepository(supabaseClient) : new InMemoryBookingAttemptRepository());
@@ -193,6 +210,13 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   const whatsappCredentialsConfigured = overrides.whatsappCredentialsConfigured ?? hasWhatsAppCredentials;
   const whatsappProvider: "meta" | "fake" | "unconfigured" =
     overrides.messaging instanceof FakeMessagingProvider ? "fake" : whatsappCredentialsConfigured ? "meta" : "unconfigured";
+
+  // Same "explicit test override wins" reasoning as whatsappProvider above -- /health must report
+  // "fake" whenever a caller (always true for buildTestApp) explicitly injected a
+  // FakeCalendarProvider, never "google" just because real Google credentials happen to be
+  // present in .env while they're structurally unused.
+  const calendarProviderLabel: "google" | "fake" =
+    overrides.calendar instanceof FakeCalendarProvider ? "fake" : hasGoogleCalendarCredentials ? "google" : "fake";
 
   // Phase 3B feature flag. false (the default) keeps WhatsApp behavior byte-for-byte identical
   // to Phase 2 -- handleInboundWhatsAppText never receives a qualificationHandler, so its new
@@ -311,7 +335,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   app.get("/health", async () => ({
     ok: true,
     service: "baluarte-lead-engine",
-    calendarProvider: hasGoogleCalendarCredentials ? "google" : "fake",
+    calendarProvider: calendarProviderLabel,
     persistenceProvider: supabaseClient ? "supabase" : "memory",
     whatsappProvider,
   }));

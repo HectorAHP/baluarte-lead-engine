@@ -9,6 +9,8 @@ export interface AppointmentRescheduleRow {
   lead_id: string;
   old_appointment_id: string;
   new_appointment_id: string | null;
+  new_calendar_event_id: string | null;
+  phase_a_status: string;
   idempotency_key: string;
   old_calendar_event_id: string | null;
   status: string;
@@ -26,6 +28,8 @@ export function mapRowToAppointmentReschedule(row: AppointmentRescheduleRow): Ap
     leadId: row.lead_id,
     oldAppointmentId: row.old_appointment_id,
     newAppointmentId: row.new_appointment_id ?? undefined,
+    newCalendarEventId: row.new_calendar_event_id ?? undefined,
+    phaseAStatus: row.phase_a_status as AppointmentReschedule["phaseAStatus"],
     idempotencyKey: row.idempotency_key,
     oldCalendarEventId: row.old_calendar_event_id ?? undefined,
     status: row.status as AppointmentRescheduleCleanupStatus,
@@ -42,7 +46,7 @@ export class SupabaseAppointmentRescheduleRepository implements AppointmentResch
   constructor(private readonly client: SupabaseClient) {}
 
   async tryCreate(
-    input: Omit<AppointmentReschedule, "id" | "createdAt" | "updatedAt" | "attemptCount" | "status" | "newAppointmentId"> & { status?: AppointmentRescheduleCleanupStatus },
+    input: Omit<AppointmentReschedule, "id" | "createdAt" | "updatedAt" | "attemptCount" | "status" | "phaseAStatus" | "newAppointmentId"> & { status?: AppointmentRescheduleCleanupStatus; phaseAStatus?: AppointmentReschedule["phaseAStatus"] },
   ): Promise<AppointmentReschedule | null> {
     const { data, error } = await this.client
       .from("appointment_reschedules")
@@ -52,6 +56,7 @@ export class SupabaseAppointmentRescheduleRepository implements AppointmentResch
         idempotency_key: input.idempotencyKey,
         old_calendar_event_id: input.oldCalendarEventId ?? null,
         status: input.status ?? "PENDING",
+        phase_a_status: input.phaseAStatus ?? "PENDING",
       })
       .select()
       .single();
@@ -75,6 +80,8 @@ export class SupabaseAppointmentRescheduleRepository implements AppointmentResch
   async update(id: string, patch: Partial<AppointmentReschedule>): Promise<AppointmentReschedule> {
     const row: Record<string, unknown> = { updated_at: new Date().toISOString() };
     if (patch.newAppointmentId !== undefined) row.new_appointment_id = patch.newAppointmentId;
+    if (patch.newCalendarEventId !== undefined) row.new_calendar_event_id = patch.newCalendarEventId;
+    if (patch.phaseAStatus !== undefined) row.phase_a_status = patch.phaseAStatus;
     if (patch.status !== undefined) row.status = patch.status;
     if (patch.attemptCount !== undefined) row.attempt_count = patch.attemptCount;
     if (patch.lastAttemptAt !== undefined) row.last_attempt_at = patch.lastAttemptAt.toISOString();
@@ -83,5 +90,27 @@ export class SupabaseAppointmentRescheduleRepository implements AppointmentResch
     const { data, error } = await this.client.from("appointment_reschedules").update(row).eq("id", id).select().single();
     if (error) throw new Error(`SUPABASE_APPOINTMENT_RESCHEDULE_UPDATE_FAILED: ${error.message}`);
     return mapRowToAppointmentReschedule(data as AppointmentRescheduleRow);
+  }
+
+  /** Mirrors SupabaseBookingAttemptRepository.claimTransition exactly, scoped to phase_a_status. */
+  async claimTransition(
+    id: string,
+    expectedStatus: AppointmentReschedule["phaseAStatus"],
+    nextStatus: AppointmentReschedule["phaseAStatus"],
+    options?: { updatedBefore: Date },
+  ): Promise<AppointmentReschedule | null> {
+    let query = this.client
+      .from("appointment_reschedules")
+      .update({ phase_a_status: nextStatus, updated_at: new Date().toISOString() })
+      .eq("id", id)
+      .eq("phase_a_status", expectedStatus);
+    if (options?.updatedBefore) {
+      query = query.lt("updated_at", options.updatedBefore.toISOString());
+    }
+    // maybeSingle(), not single(): zero matching rows (lost the CAS) is an expected outcome here,
+    // never an error -- must come back as `data: null`.
+    const { data, error } = await query.select().maybeSingle();
+    if (error) throw new Error(`SUPABASE_APPOINTMENT_RESCHEDULE_CLAIM_TRANSITION_FAILED: ${error.message}`);
+    return data ? mapRowToAppointmentReschedule(data as AppointmentRescheduleRow) : null;
   }
 }

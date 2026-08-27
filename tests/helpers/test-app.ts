@@ -22,6 +22,16 @@ export const TEST_META_APP_SECRET = "test-app-secret";
 
 export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
   return buildApp({
+    // Phase 4C hardening (item 15): forces buildApp() to NEVER construct a real Supabase client,
+    // regardless of what SUPABASE_URL/SUPABASE_SECRET_KEY are set to in this repo's real .env
+    // (which does carry live production credentials). Without this, buildApp() would still
+    // construct a genuine SupabaseClient object whenever those env vars are set -- harmless by
+    // itself (the JS client's constructor makes no network call, and every repo below is already
+    // overridden with an InMemory instance so the client is never actually used for a query) but
+    // an unnecessary, avoidable exposure and a cosmetic accuracy problem for /health's
+    // persistenceProvider field. See tests/test-harness-safety.test.ts for the guard that proves
+    // this holds.
+    supabaseClient: null,
     leadsRepo: new InMemoryLeadRepository(),
     appointmentsRepo: new InMemoryAppointmentRepository(),
     bookingAttemptsRepo: new InMemoryBookingAttemptRepository(),
