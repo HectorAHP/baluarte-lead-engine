@@ -138,3 +138,34 @@ export const BOOKING_NO_AVAILABILITY_MESSAGE =
  */
 export const SLOT_OFFER_CLAIM_IN_PROGRESS_MESSAGE =
   "Estoy preparando los horarios disponibles. Inténtalo nuevamente en unos segundos.";
+
+// ---------------------------------------------------------------------------------------------
+// Phase 4B -- cancellation copy. Same deterministic, professional style as the booking copy
+// above; every date/time shown reuses formatSlotForDisplay, never raw UTC.
+// ---------------------------------------------------------------------------------------------
+
+/** A. First turn: intent detected while BOOKED -- asks for explicit confirmation before ever
+ * cancelling anything. */
+export function buildCancelConfirmationPromptMessage(when: string): string {
+  return `¿Quieres cancelar tu cita programada para el ${when}?\n\n1. Sí, cancelar\n2. No, conservar`;
+}
+
+/** B. Ambiguous reply while CANCEL_PENDING -- re-asks the SAME question, never cancels on an
+ * unclear answer. */
+export function buildCancelConfirmationRepromptMessage(when: string): string {
+  return `No entendí tu respuesta.\n\n${buildCancelConfirmationPromptMessage(when)}`;
+}
+
+/** C. Declined ("2" / "no" / "conservar") -- reverts to BOOKED, nothing was ever cancelled. */
+export const CANCELLATION_ABORTED_MESSAGE = "Entendido, tu cita se mantiene sin cambios.";
+
+/** D. Confirmed and cancelled -- sent once appointments.status is durably CANCELLED, regardless
+ * of whether Google Calendar cleanup has completed yet (that's an internal operational concern,
+ * never exposed to the lead -- see AppointmentCancellationService). */
+export const CANCELLATION_CONFIRMED_MESSAGE =
+  "Listo, tu cita quedó cancelada. Si después quieres agendar nuevamente, puedo ayudarte por aquí.";
+
+/** E. Recoverable technical failure (DB/infra) while processing a cancellation -- no state
+ * change, the lead can simply try again. */
+export const CANCELLATION_TECHNICAL_ERROR_MESSAGE =
+  "Tuve un problema técnico al procesar tu cancelación. Puedes intentarlo nuevamente en un momento.";

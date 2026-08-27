@@ -101,4 +101,36 @@ export class SupabaseAppointmentRepository implements AppointmentRepository {
     if (error) throw new Error(`SUPABASE_APPOINTMENT_FIND_ACTIVE_FAILED: ${error.message}`);
     return data ? mapRowToAppointment(data as AppointmentRow) : null;
   }
+
+  async listActiveByLeadId(leadId: string): Promise<Appointment[]> {
+    const { data, error } = await this.client.from("appointments").select().eq("lead_id", leadId).eq("status", "BOOKED");
+    if (error) throw new Error(`SUPABASE_APPOINTMENT_LIST_ACTIVE_FAILED: ${error.message}`);
+    return (data as AppointmentRow[]).map(mapRowToAppointment);
+  }
+
+  async findMostRecentByLeadId(leadId: string): Promise<Appointment | null> {
+    const { data, error } = await this.client
+      .from("appointments")
+      .select()
+      .eq("lead_id", leadId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw new Error(`SUPABASE_APPOINTMENT_FIND_MOST_RECENT_FAILED: ${error.message}`);
+    return data ? mapRowToAppointment(data as AppointmentRow) : null;
+  }
+
+  async claimTransition(id: string, expectedStatus: Appointment["status"], nextStatus: Appointment["status"]): Promise<Appointment | null> {
+    // maybeSingle(), not single(): zero matching rows (lost the CAS) is an expected outcome here,
+    // never an error -- must come back as `data: null`.
+    const { data, error } = await this.client
+      .from("appointments")
+      .update({ status: nextStatus })
+      .eq("id", id)
+      .eq("status", expectedStatus)
+      .select()
+      .maybeSingle();
+    if (error) throw new Error(`SUPABASE_APPOINTMENT_CLAIM_TRANSITION_FAILED: ${error.message}`);
+    return data ? mapRowToAppointment(data as AppointmentRow) : null;
+  }
 }

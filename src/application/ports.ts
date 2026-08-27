@@ -1,4 +1,4 @@
-import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js"; import type { LeadStatusHistoryEntry } from "../domain/lead-status-history.js"; import type { AppointmentStatusHistoryEntry } from "../domain/appointment-status-history.js"; import type { AppointmentMessageDelivery } from "../domain/appointment-message-delivery.js";
+import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment, AppointmentStatus } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js"; import type { LeadStatusHistoryEntry } from "../domain/lead-status-history.js"; import type { AppointmentStatusHistoryEntry } from "../domain/appointment-status-history.js"; import type { AppointmentMessageDelivery } from "../domain/appointment-message-delivery.js"; import type { AppointmentCancellation } from "../domain/appointment-cancellation.js";
 export interface LeadRepository { create(input:Omit<Lead,"id"|"createdAt"|"updatedAt">):Promise<Lead>; findById(id:string):Promise<Lead|null>; update(id:string,patch:Partial<Lead>):Promise<Lead>; findByDedupKey(key:LeadDedupKey):Promise<Lead|null>; }
 export interface AppointmentRepository {
   create(input:Omit<Appointment,"id">):Promise<Appointment>;
@@ -7,6 +7,29 @@ export interface AppointmentRepository {
   /** The lead's most recent appointment with status "BOOKED" -- CANCELLED and any other status
    * never count as "active". Returns null (never throws) when none exists. */
   findActiveByLeadId(leadId:string):Promise<Appointment|null>;
+  /**
+   * Every BOOKED appointment for this lead (there should only ever be at most one -- this exists
+   * so a caller can DETECT ">1" as a genuine data-consistency violation, which
+   * findActiveByLeadId's single-row "most recent" contract cannot surface). Phase 4B:
+   * WhatsAppCancellationHandler uses this to decide between "proceed" (exactly 1), "escalate,
+   * nothing to cancel" (0), and "escalate, inconsistent" (>1).
+   */
+  listActiveByLeadId(leadId:string):Promise<Appointment[]>;
+  /** The lead's single most recent appointment regardless of status, or null if none ever
+   * existed. Used only to locate the target appointment for an idempotent cancellation retry once
+   * it's no longer BOOKED (i.e. already CANCELLED) -- never to guess which appointment a booking
+   * flow should act on. */
+  findMostRecentByLeadId(leadId:string):Promise<Appointment|null>;
+  /**
+   * Atomic compare-and-set: transitions row `id` from `expectedStatus` to `nextStatus` ONLY if its
+   * current status still matches `expectedStatus`. Returns the updated row if this call won the
+   * race, or null if another request already changed the status first -- never throws for the
+   * "lost the race" case. Mirrors BookingAttemptRepository.claimTransition's exact contract
+   * (appointments has no updatedAt column, so there is no `updatedBefore` staleness option here --
+   * unlike a booking attempt, an appointment has no legitimate "in progress, not yet decided"
+   * intermediate status to ever go stale).
+   */
+  claimTransition(id:string,expectedStatus:AppointmentStatus,nextStatus:AppointmentStatus):Promise<Appointment|null>;
 }
 export interface BookingAttemptRepository {
   findByKey(idempotencyKey:string):Promise<BookingAttempt|null>;
@@ -103,6 +126,19 @@ export interface AppointmentMessageDeliveryRepository {
   tryCreate(input: Omit<AppointmentMessageDelivery, "id" | "createdAt" | "updatedAt" | "attemptCount" | "status"> & { status?: AppointmentMessageDelivery["status"] }): Promise<AppointmentMessageDelivery | null>;
   findByIdempotencyKey(idempotencyKey: string): Promise<AppointmentMessageDelivery | null>;
   update(id: string, patch: Partial<AppointmentMessageDelivery>): Promise<AppointmentMessageDelivery>;
+}
+
+// Phase 4B -- appointment cancellation (see docs/PHASE4-DESIGN.md, migration
+// 014_appointment_cancellations.sql). Tracks Calendar-cleanup completion for a cancellation --
+// deliberately not booking_attempts or appointment_message_deliveries (wrong semantics for
+// either).
+export interface AppointmentCancellationRepository {
+  /** Wins outright (INSERT succeeds) or returns null on an idempotency_key conflict -- never
+   * throws for the "already tracked" case, same convention as SlotOfferClaimRepository.tryCreate
+   * / AppointmentMessageDeliveryRepository.tryCreate. */
+  tryCreate(input: Omit<AppointmentCancellation, "id" | "createdAt" | "updatedAt" | "attemptCount" | "status"> & { status?: AppointmentCancellation["status"] }): Promise<AppointmentCancellation | null>;
+  findByIdempotencyKey(idempotencyKey: string): Promise<AppointmentCancellation | null>;
+  update(id: string, patch: Partial<AppointmentCancellation>): Promise<AppointmentCancellation>;
 }
 
 export interface CalendarSlot{start:Date;end:Date;} export interface CalendarEventInput{title:string;description:string;start:Date;end:Date;attendeeEmail?:string;} export interface CalendarEventResult{eventId:string;meetingUrl?:string;}

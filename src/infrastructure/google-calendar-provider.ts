@@ -80,10 +80,19 @@ export class GoogleCalendarProvider implements CalendarProvider {
     return { eventId, meetingUrl: meetingUrl ?? undefined };
   }
 
+  /**
+   * Idempotent: a 404 (event not found) or 410 (event already deleted -- Google's status for a
+   * previously-cancelled event) is treated as SUCCESS, since the desired end state ("this event
+   * no longer exists") is already true. This matters for Phase 4B cancellation: a retry of a
+   * cleanup that actually succeeded server-side despite a client-side timeout must never be
+   * reported as a failure. Any other error (network, auth, rate limit, 5xx) still throws
+   * CalendarProviderError -- only a confirmed "already gone" status is ever treated as success.
+   */
   async deleteEvent(eventId: string): Promise<void> {
     try {
       await this.calendarApi.events.delete({ calendarId: this.calendarId, eventId });
     } catch (err) {
+      if (isEventAlreadyGoneError(err)) return;
       throw new CalendarProviderError("Failed to delete Google Calendar event", { cause: err });
     }
   }
@@ -112,4 +121,17 @@ export class GoogleCalendarProvider implements CalendarProvider {
       throw new CalendarProviderError("Failed to query Google Calendar free/busy", { cause: err });
     }
   }
+}
+
+/**
+ * googleapis (built on gaxios) errors don't have one single documented shape across versions --
+ * defensively checks every field a 404/410 has actually been observed under (`code`, `status`,
+ * `response.status`), coercing to a number since some surface it as a string. A plain Error with
+ * none of these fields (e.g. a generic network failure) safely yields NaN, which matches neither
+ * 404 nor 410 -- never misclassified as "already gone".
+ */
+function isEventAlreadyGoneError(err: unknown): boolean {
+  const candidate = err as { code?: unknown; status?: unknown; response?: { status?: unknown } };
+  const status = Number(candidate?.code ?? candidate?.status ?? candidate?.response?.status);
+  return status === 404 || status === 410;
 }

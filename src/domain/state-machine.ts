@@ -14,8 +14,12 @@ const transitions: Record<LeadStatus, readonly LeadStatus[]> = {
   // during a reschedule (mirroring ActiveOfferInconsistentError/BookingAttemptInconsistentError's
   // existing escalation during booking) had nowhere valid to escalate to. See
   // docs/PHASE4-DESIGN.md §3.2 for the full rationale of every edge below.
-  BOOKED:["CONFIRMED","RESCHEDULE_REQUESTED","CANCEL_PENDING","NO_SHOW","MEETING_COMPLETED","DO_NOT_CONTACT"],
-  CONFIRMED:["RESCHEDULE_REQUESTED","CANCEL_PENDING","NO_SHOW","MEETING_COMPLETED","DO_NOT_CONTACT"],
+  // Phase 4B addition: BOOKED/CONFIRMED -> HUMAN_HANDOFF was also missing -- needed for
+  // AppointmentCancellationInconsistentError (no BOOKED appointment found / more than one) to
+  // escalate from the very first cancellation-intent turn, before the lead ever reaches
+  // CANCEL_PENDING.
+  BOOKED:["CONFIRMED","RESCHEDULE_REQUESTED","CANCEL_PENDING","NO_SHOW","MEETING_COMPLETED","HUMAN_HANDOFF","DO_NOT_CONTACT"],
+  CONFIRMED:["RESCHEDULE_REQUESTED","CANCEL_PENDING","NO_SHOW","MEETING_COMPLETED","HUMAN_HANDOFF","DO_NOT_CONTACT"],
   RESCHEDULE_REQUESTED:["BOOKED","HUMAN_HANDOFF","DO_NOT_CONTACT"],
   // Phase 4A new states. CANCEL_PENDING always resolves to either CANCELLED (lead confirms) or
   // back to BOOKED (lead declines, or an ambiguous/timed-out reply -- never auto-cancels on an

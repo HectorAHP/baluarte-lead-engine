@@ -31,6 +31,11 @@ const schema=z.object({
   // alone must not change behavior until a Phase 3C booking handler actually exists to read it.
   // Same safe-parsing rationale as above: never z.coerce.boolean().
   WHATSAPP_BOOKING_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Phase 4B feature flag, independent of both flags above. false (default) leaves a BOOKED lead's
+  // inbound messages with no automated reply, byte-for-byte identical to Phase 3C -- routing to
+  // WhatsAppCancellationHandler only ever activates when this is explicitly "true". Same
+  // safe-parsing rationale: never z.coerce.boolean().
+  WHATSAPP_CANCELLATION_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
 }).superRefine((cfg,ctx)=>{
   const googleFields=[cfg.GOOGLE_CLIENT_ID,cfg.GOOGLE_CLIENT_SECRET,cfg.GOOGLE_REFRESH_TOKEN];
   const setCount=googleFields.filter(Boolean).length;

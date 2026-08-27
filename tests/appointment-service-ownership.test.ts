@@ -235,6 +235,15 @@ describe("AppointmentService.book -- ownership foundation", () => {
       async findActiveByLeadId() {
         return null;
       },
+      async listActiveByLeadId() {
+        return [];
+      },
+      async findMostRecentByLeadId() {
+        return null;
+      },
+      async claimTransition() {
+        return null;
+      },
     };
     const service = new AppointmentService(calendar, failingAppointments, bookingAttempts, leads, logger);
 

@@ -123,6 +123,21 @@ export class SlotOfferClaimInProgressError extends Error {
   }
 }
 
+/**
+ * Thrown by AppointmentCancellationService/WhatsAppCancellationHandler when the source of truth
+ * (appointments table, never inferred from messages) doesn't match what a cancellation flow
+ * requires: no BOOKED appointment exists for the lead, more than one does (data-consistency
+ * violation, never silently picks one), or a compare-and-set lost the race against a status that
+ * is neither BOOKED nor CANCELLED (unexpected in Phase 4B -- no reschedule path exists yet).
+ * Always escalates to HUMAN_HANDOFF -- never auto-retried, never silently ignored.
+ */
+export class AppointmentCancellationInconsistentError extends Error {
+  constructor(public readonly leadId: string, public readonly reason: "NO_APPOINTMENT" | "MULTIPLE_APPOINTMENTS" | "UNEXPECTED_STATUS") {
+    super(`Appointment cancellation inconsistency for lead ${leadId}: ${reason}`);
+    this.name = "AppointmentCancellationInconsistentError";
+  }
+}
+
 export class InvalidQualificationFieldError extends Error {
   constructor(public readonly vertical: string, public readonly fieldName: string) {
     super(`Field "${fieldName}" is not in the allowed qualification whitelist for ${vertical}`);

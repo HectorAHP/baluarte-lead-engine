@@ -75,7 +75,13 @@ export async function markLeadBooked(
  * conversation both HUMAN_HANDOFF, score/scoreClass untouched (this never writes to those
  * fields).
  */
-export async function escalateToHuman(deps: BookingOutcomeDeps, lead: Lead, conversationId: string, whatsappUserId: string): Promise<void> {
+export async function escalateToHuman(
+  deps: BookingOutcomeDeps,
+  lead: Lead,
+  conversationId: string,
+  whatsappUserId: string,
+  eventType: string = "BOOKING_INCONSISTENCY_HANDOFF",
+): Promise<void> {
   const target: LeadStatus = "HUMAN_HANDOFF";
   if (lead.status !== target) {
     assertTransition(lead.status, target);
@@ -84,7 +90,7 @@ export async function escalateToHuman(deps: BookingOutcomeDeps, lead: Lead, conv
       leadId: lead.id,
       fromStatus: lead.status,
       toStatus: target,
-      eventType: "BOOKING_INCONSISTENCY_HANDOFF",
+      eventType,
     });
   }
   await deps.conversations.update(conversationId, { status: "HUMAN_HANDOFF" });

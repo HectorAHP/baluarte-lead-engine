@@ -109,9 +109,50 @@ describe("GoogleCalendarProvider.deleteEvent", () => {
     expect(eventsDelete).toHaveBeenCalledWith({ calendarId: config.GOOGLE_CALENDAR_ID, eventId: "evt_1" });
   });
 
-  it("wraps a delete failure as CalendarProviderError", async () => {
+  it("wraps a delete failure with no recognizable status as CalendarProviderError", async () => {
     const eventsDelete = vi.fn().mockRejectedValue(new Error("not found"));
     const provider = new GoogleCalendarProvider(makeMockApi({ eventsDelete }));
     await expect(provider.deleteEvent("evt_1")).rejects.toThrow(CalendarProviderError);
+  });
+
+  // Phase 4B: idempotent cancellation retries depend on deleteEvent treating "the event is
+  // already gone" as success, not failure -- see the DB-CANCELLED-then-Calendar-cleanup ordering
+  // in AppointmentCancellationService.
+  it("a 404 (event not found, code field) is treated as success", async () => {
+    const eventsDelete = vi.fn().mockRejectedValue(Object.assign(new Error("Not Found"), { code: 404 }));
+    const provider = new GoogleCalendarProvider(makeMockApi({ eventsDelete }));
+    await expect(provider.deleteEvent("evt_1")).resolves.toBeUndefined();
+  });
+
+  it("a 410 (event already deleted, code field) is treated as success", async () => {
+    const eventsDelete = vi.fn().mockRejectedValue(Object.assign(new Error("Gone"), { code: 410 }));
+    const provider = new GoogleCalendarProvider(makeMockApi({ eventsDelete }));
+    await expect(provider.deleteEvent("evt_1")).resolves.toBeUndefined();
+  });
+
+  it("a 404 surfaced via response.status (a plausible alternate gaxios error shape) is also treated as success", async () => {
+    const eventsDelete = vi.fn().mockRejectedValue(Object.assign(new Error("Not Found"), { response: { status: 404 } }));
+    const provider = new GoogleCalendarProvider(makeMockApi({ eventsDelete }));
+    await expect(provider.deleteEvent("evt_1")).resolves.toBeUndefined();
+  });
+
+  it("a 404 surfaced as a string code is also treated as success (defensive coercion)", async () => {
+    const eventsDelete = vi.fn().mockRejectedValue(Object.assign(new Error("Not Found"), { code: "404" }));
+    const provider = new GoogleCalendarProvider(makeMockApi({ eventsDelete }));
+    await expect(provider.deleteEvent("evt_1")).resolves.toBeUndefined();
+  });
+
+  it("a 5xx / transient failure still throws CalendarProviderError -- never silently treated as success", async () => {
+    const eventsDelete = vi.fn().mockRejectedValue(Object.assign(new Error("Internal Server Error"), { code: 500 }));
+    const provider = new GoogleCalendarProvider(makeMockApi({ eventsDelete }));
+    await expect(provider.deleteEvent("evt_1")).rejects.toThrow(CalendarProviderError);
+  });
+
+  it("does not attempt a delete when the event was already deleted -- calling twice with a 404 the second time never throws", async () => {
+    const eventsDelete = vi.fn().mockResolvedValueOnce({}).mockRejectedValueOnce(Object.assign(new Error("Not Found"), { code: 404 }));
+    const provider = new GoogleCalendarProvider(makeMockApi({ eventsDelete }));
+    await provider.deleteEvent("evt_1");
+    await expect(provider.deleteEvent("evt_1")).resolves.toBeUndefined();
+    expect(eventsDelete).toHaveBeenCalledTimes(2);
   });
 });

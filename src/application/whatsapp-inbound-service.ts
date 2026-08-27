@@ -28,6 +28,15 @@ export interface BookingTurnHandler {
   handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
 }
 
+/**
+ * Phase 4B cancellation orchestrator, injected only when config.WHATSAPP_CANCELLATION_ENABLED is
+ * true (see app.ts). Same decoupling reason as BookingTurnHandler above --
+ * WhatsAppCancellationHandler implements this.
+ */
+export interface CancellationTurnHandler {
+  handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
+}
+
 export interface InboundWhatsAppText {
   whatsappUserId: string;
   phoneRaw: string;
@@ -50,6 +59,10 @@ export interface WhatsAppInboundDeps {
    * default), the BOOKING_PENDING routing branch below is never taken -- behavior is unchanged
    * from Phase 3B. */
   bookingHandler?: BookingTurnHandler;
+  /** Present only when the Phase 4B feature flag (WHATSAPP_CANCELLATION_ENABLED) is on. Absent
+   * (the default), the BOOKED/CANCEL_PENDING routing branch below is never taken -- a BOOKED lead
+   * falls through to the same "no automated reply" fallback as Phase 3C, unchanged. */
+  cancellationHandler?: CancellationTurnHandler;
 }
 
 export type WhatsAppInboundOutcome = "DUPLICATE" | "PROCESSED";
@@ -173,10 +186,20 @@ export async function handleInboundWhatsAppText(
         await deps.bookingHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
-      // No qualifier/booking handler configured (flags off), or an existing lead outside an
-      // active qualification/booking round (e.g. already QUALIFIED_A/B/NURTURE_C/BOOKED, or a
-      // CONTACTED lead that still carries a product from a prior round): no automated reply,
-      // same as Phase 2.
+      // Phase 4B: a lead in BOOKED (interpreting a cancellation-intent message, or anything else
+      // -- the handler itself no-ops on non-cancellation text) or CANCEL_PENDING (interpreting a
+      // confirm/decline/ambiguous reply). cancellationHandler is present only when
+      // WHATSAPP_CANCELLATION_ENABLED is true (see app.ts) -- absent, this branch is never taken
+      // and a BOOKED lead falls through to the same "no automated reply" fallback Phase 3C
+      // already has today, unchanged.
+      if (deps.cancellationHandler && (lead.status === "BOOKED" || lead.status === "CANCEL_PENDING")) {
+        await deps.cancellationHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
+        return;
+      }
+      // No qualifier/booking/cancellation handler configured (flags off), or an existing lead
+      // outside an active qualification/booking/cancellation round (e.g. already
+      // QUALIFIED_A/B/NURTURE_C, or a CONTACTED lead that still carries a product from a prior
+      // round): no automated reply, same as Phase 2.
     },
     deps.logger,
     { leadId, conversationId },
