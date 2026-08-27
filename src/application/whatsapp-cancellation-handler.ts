@@ -74,14 +74,35 @@ export class WhatsAppCancellationHandler implements CancellationTurnHandler {
     await this.replyConfirmationPrompt(lead.id, conversationId, whatsappUserId, appointment);
   }
 
-  /** CANCEL_PENDING: interpret the reply. AMBIGUOUS never cancels -- it just re-asks. */
+  /**
+   * CANCEL_PENDING: interpret the reply. The target appointment is looked up ONCE, up front,
+   * before branching -- and if it turns out to already be CANCELLED, every reply (CONFIRM,
+   * DECLINE, or AMBIGUOUS alike) converges on the same "already cancelled" resolution, never
+   * re-asking and never reverting the lead to BOOKED against a lie.
+   *
+   * This precondition matters for a real crash-recovery case: if a prior CONFIRM turn completed
+   * cancellationService.cancel() (appointment durably CANCELLED) but the process died before
+   * ensureLeadCancelled ran, the lead is left stuck in CANCEL_PENDING. Without this check, a
+   * user replying "2" in that exact window would have been told "tu cita se mantiene" and had
+   * their lead reverted to BOOKED -- while the appointment was, in reality, already cancelled.
+   * That is a genuine functional inconsistency (lead BOOKED with no active BOOKED appointment
+   * behind it), not merely a duplicated audit row, so it's fixed here rather than merely noted.
+   */
   private async handleConfirmationTurn(lead: Lead, conversationId: string, whatsappUserId: string, inboundText: string): Promise<void> {
+    const appointment = await this.findTargetAppointment(lead.id);
+    if (appointment === "INCONSISTENT") throw new AppointmentCancellationInconsistentError(lead.id, "MULTIPLE_APPOINTMENTS");
+    if (!appointment) throw new AppointmentCancellationInconsistentError(lead.id, "NO_APPOINTMENT");
+
+    if (appointment.status === "CANCELLED") {
+      await this.deps.cancellationService.cancel(appointment, lead.id); // idempotent -- retries cleanup if still pending, no-ops otherwise
+      await this.ensureLeadCancelled(lead);
+      await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, CANCELLATION_CONFIRMED_MESSAGE);
+      return;
+    }
+
     const result = parseCancelConfirmation(inboundText);
 
     if (result === "AMBIGUOUS") {
-      const appointment = await this.findTargetAppointment(lead.id);
-      if (appointment === "INCONSISTENT") throw new AppointmentCancellationInconsistentError(lead.id, "MULTIPLE_APPOINTMENTS");
-      if (!appointment) throw new AppointmentCancellationInconsistentError(lead.id, "NO_APPOINTMENT");
       const when = formatSlotForDisplay(appointment.startsAt, this.advisorTimezone);
       await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildCancelConfirmationRepromptMessage(when));
       return;
@@ -94,10 +115,6 @@ export class WhatsAppCancellationHandler implements CancellationTurnHandler {
     }
 
     // CONFIRM
-    const appointment = await this.findTargetAppointment(lead.id);
-    if (appointment === "INCONSISTENT") throw new AppointmentCancellationInconsistentError(lead.id, "MULTIPLE_APPOINTMENTS");
-    if (!appointment) throw new AppointmentCancellationInconsistentError(lead.id, "NO_APPOINTMENT");
-
     const outcome = await this.deps.cancellationService.cancel(appointment, lead.id);
     if (outcome.type === "INCONSISTENT") throw new AppointmentCancellationInconsistentError(lead.id, "UNEXPECTED_STATUS");
 

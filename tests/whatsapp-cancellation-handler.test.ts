@@ -27,7 +27,7 @@ function makeHandler() {
     { leads, conversations, appointments, messaging, messages, leadStatusHistory, cancellationService, logger },
     "America/Mexico_City",
   );
-  return { leads, conversations, appointments, messages, messaging, leadStatusHistory, appointmentStatusHistory, cancellations, calendar, logger, handler };
+  return { leads, conversations, appointments, messages, messaging, leadStatusHistory, appointmentStatusHistory, cancellations, calendar, logger, cancellationService, handler };
 }
 
 async function makeBookedLeadWithAppointment(h: ReturnType<typeof makeHandler>) {
@@ -170,6 +170,25 @@ describe("WhatsAppCancellationHandler -- confirmation turn (CANCEL_PENDING)", ()
 
     const leadHistory = await h.leadStatusHistory.listByLeadId(pendingLead.id);
     expect(leadHistory.filter((r) => r.toStatus === "CANCELLED")).toHaveLength(1);
+  });
+
+  it("regression: '2' (decline) against an appointment that's ALREADY cancelled (e.g. a crash left the lead stuck in CANCEL_PENDING after a prior CONFIRM completed) never reverts the lead to BOOKED against a lie -- it resolves as cancelled", async () => {
+    const h = makeHandler();
+    const { pendingLead, conversation, appointment } = await toCancelPending(h);
+    // Simulate the crash-recovery scenario precisely: the CONFIRM path already ran to completion
+    // at the appointment/DB level (cancellationService.cancel), but the lead itself never made it
+    // to CANCELLED (as if the process died right after cancel() returned, before
+    // ensureLeadCancelled ran) -- lead.status is still CANCEL_PENDING in reality.
+    await h.cancellationService.cancel(appointment, pendingLead.id);
+
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "2", now: NOW });
+
+    // Must NOT be BOOKED (that would claim an appointment that no longer exists) -- must resolve
+    // to CANCELLED, and the appointment stays CANCELLED throughout.
+    expect((await h.leads.findById(pendingLead.id))?.status).toBe("CANCELLED");
+    expect((await h.appointments.findById(appointment.id))?.status).toBe("CANCELLED");
+    const lastMessage = h.messaging.sentTexts[h.messaging.sentTexts.length - 1];
+    expect(lastMessage.body).toContain("Listo, tu cita quedó cancelada");
   });
 });
 
