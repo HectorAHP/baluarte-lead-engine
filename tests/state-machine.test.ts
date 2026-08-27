@@ -1,0 +1,1 @@
+import {describe,expect,it} from "vitest"; import {canTransition,assertTransition} from "../src/domain/state-machine.js"; describe("lead state machine",()=>{it("allows",()=>expect(canTransition("QUALIFYING","QUALIFIED_A")).toBe(true));it("blocks",()=>{expect(canTransition("NEW","CLOSED_WON")).toBe(false);expect(()=>assertTransition("NEW","CLOSED_WON")).toThrow();});});
