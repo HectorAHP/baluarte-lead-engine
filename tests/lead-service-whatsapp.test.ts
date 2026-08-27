@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { LeadService } from "../src/application/services.js";
-import { InMemoryLeadRepository, InMemoryLeadScoreRepository } from "../src/infrastructure/memory-repositories.js";
+import { InMemoryLeadRepository, InMemoryLeadScoreRepository, InMemoryLeadStatusHistoryRepository } from "../src/infrastructure/memory-repositories.js";
+import { FakeLogger } from "../src/infrastructure/fake-logger.js";
 import { InvalidLeadTransitionError } from "../src/domain/errors.js";
 
 function makeService() {
   const leads = new InMemoryLeadRepository();
-  const service = new LeadService(leads, new InMemoryLeadScoreRepository());
+  const service = new LeadService(leads, new InMemoryLeadScoreRepository(), new InMemoryLeadStatusHistoryRepository(), new FakeLogger());
   return { leads, service };
 }
 

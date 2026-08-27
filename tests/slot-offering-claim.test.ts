@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import { SlotOfferingService, OFFERED_SLOT_TTL_MS } from "../src/application/slot-offering-service.js";
 import {
   InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryOfferedSlotRepository,
-  InMemorySlotOfferClaimRepository, InMemorySlotOfferClaimStore,
+  InMemorySlotOfferClaimRepository, InMemorySlotOfferClaimStore, InMemoryLeadStatusHistoryRepository,
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
@@ -74,7 +74,7 @@ function makeService(overrides: {
   const leads = overrides.leads ?? new InMemoryLeadRepository();
   const slotOfferClaims = overrides.slotOfferClaims ?? new InMemorySlotOfferClaimRepository();
   const logger = new FakeLogger();
-  const service = new SlotOfferingService(calendar, offeredSlots, appointments, leads, slotOfferClaims, logger, {
+  const service = new SlotOfferingService(calendar, offeredSlots, appointments, leads, slotOfferClaims, new InMemoryLeadStatusHistoryRepository(), logger, {
     clock: overrides.clock,
     sleepFn: overrides.sleepFn,
     roundIdFactory: overrides.roundIdFactory,
@@ -392,8 +392,8 @@ describe("SlotOfferingService -- multi-instance semantics (K, M)", () => {
     // processes), each with its OWN SlotOfferClaimRepository wrapper -- but both wrappers point
     // at the SAME backing store, simulating "the same Postgres table" rather than two unrelated
     // in-memory tables that would trivially never conflict.
-    const instanceA = new SlotOfferingService(calendar, offeredSlots, appointments, leads, new InMemorySlotOfferClaimRepository(store), new FakeLogger());
-    const instanceB = new SlotOfferingService(calendar, offeredSlots, appointments, leads, new InMemorySlotOfferClaimRepository(store), new FakeLogger());
+    const instanceA = new SlotOfferingService(calendar, offeredSlots, appointments, leads, new InMemorySlotOfferClaimRepository(store), new InMemoryLeadStatusHistoryRepository(), new FakeLogger());
+    const instanceB = new SlotOfferingService(calendar, offeredSlots, appointments, leads, new InMemorySlotOfferClaimRepository(store), new InMemoryLeadStatusHistoryRepository(), new FakeLogger());
 
     const [r1, r2] = await Promise.all([
       instanceA.getOrCreateOffer({ lead, conversationId, now }),

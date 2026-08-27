@@ -9,9 +9,21 @@ const transitions: Record<LeadStatus, readonly LeadStatus[]> = {
   QUALIFIED_B:["BOOKING_PENDING","NURTURE_C","BOOKED","DO_NOT_CONTACT","HUMAN_HANDOFF"],
   NURTURE_C:["QUALIFYING","DO_NOT_CONTACT","HUMAN_HANDOFF"],
   BOOKING_PENDING:["BOOKED","NURTURE_C","DO_NOT_CONTACT","HUMAN_HANDOFF"],
-  BOOKED:["CONFIRMED","RESCHEDULE_REQUESTED","NO_SHOW","MEETING_COMPLETED","DO_NOT_CONTACT"],
-  CONFIRMED:["RESCHEDULE_REQUESTED","NO_SHOW","MEETING_COMPLETED","DO_NOT_CONTACT"],
-  RESCHEDULE_REQUESTED:["BOOKED","DO_NOT_CONTACT"],
+  // Phase 4A additions: BOOKED/CONFIRMED -> CANCEL_PENDING (cancellation entry point, Phase 4B);
+  // RESCHEDULE_REQUESTED -> HUMAN_HANDOFF was missing -- without it, a data-consistency error
+  // during a reschedule (mirroring ActiveOfferInconsistentError/BookingAttemptInconsistentError's
+  // existing escalation during booking) had nowhere valid to escalate to. See
+  // docs/PHASE4-DESIGN.md §3.2 for the full rationale of every edge below.
+  BOOKED:["CONFIRMED","RESCHEDULE_REQUESTED","CANCEL_PENDING","NO_SHOW","MEETING_COMPLETED","DO_NOT_CONTACT"],
+  CONFIRMED:["RESCHEDULE_REQUESTED","CANCEL_PENDING","NO_SHOW","MEETING_COMPLETED","DO_NOT_CONTACT"],
+  RESCHEDULE_REQUESTED:["BOOKED","HUMAN_HANDOFF","DO_NOT_CONTACT"],
+  // Phase 4A new states. CANCEL_PENDING always resolves to either CANCELLED (lead confirms) or
+  // back to BOOKED (lead declines, or an ambiguous/timed-out reply -- never auto-cancels on an
+  // ambiguous answer). CANCELLED can return to BOOKING_PENDING later (a cancelled lead may come
+  // back), same principle already established for NO_SHOW below. No handler drives either state
+  // yet -- that's Phase 4B.
+  CANCEL_PENDING:["CANCELLED","BOOKED","HUMAN_HANDOFF","DO_NOT_CONTACT"],
+  CANCELLED:["BOOKING_PENDING","HUMAN_HANDOFF","DO_NOT_CONTACT"],
   NO_SHOW:["BOOKING_PENDING","BOOKED","CLOSED_LOST","DO_NOT_CONTACT"],
   MEETING_COMPLETED:["QUOTE_PENDING","QUOTE_SENT","CLOSED_WON","CLOSED_LOST"],
   QUOTE_PENDING:["QUOTE_SENT","CLOSED_WON","CLOSED_LOST"],

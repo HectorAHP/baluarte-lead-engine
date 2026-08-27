@@ -3,7 +3,13 @@ export type Vertical = "PATRIMONIAL" | "GMM" | "UNKNOWN";
 export type LeadStatus =
   | "NEW" | "CONTACT_PENDING" | "CONTACTED" | "QUALIFYING"
   | "QUALIFIED_A" | "QUALIFIED_B" | "NURTURE_C" | "BOOKING_PENDING"
-  | "BOOKED" | "CONFIRMED" | "RESCHEDULE_REQUESTED" | "NO_SHOW"
+  | "BOOKED" | "CONFIRMED" | "RESCHEDULE_REQUESTED"
+  // Phase 4A: the only two genuinely new LeadStatus values (see docs/PHASE4-DESIGN.md §3.1/§E for
+  // why they're necessary -- CLOSED_LOST is a commercial-outcome closure, not a scheduling
+  // cancellation, and DO_NOT_CONTACT is opt-out with the wrong side effects; neither is an
+  // equivalent substitute). No handler sets these yet -- that's Phase 4B.
+  | "CANCEL_PENDING" | "CANCELLED"
+  | "NO_SHOW"
   | "MEETING_COMPLETED" | "QUOTE_PENDING" | "QUOTE_SENT"
   | "CLOSED_WON" | "CLOSED_LOST" | "DO_NOT_CONTACT" | "HUMAN_HANDOFF";
 

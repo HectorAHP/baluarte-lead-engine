@@ -1,4 +1,4 @@
-import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js";
+import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js"; import type { LeadStatusHistoryEntry } from "../domain/lead-status-history.js"; import type { AppointmentStatusHistoryEntry } from "../domain/appointment-status-history.js"; import type { AppointmentMessageDelivery } from "../domain/appointment-message-delivery.js";
 export interface LeadRepository { create(input:Omit<Lead,"id"|"createdAt"|"updatedAt">):Promise<Lead>; findById(id:string):Promise<Lead|null>; update(id:string,patch:Partial<Lead>):Promise<Lead>; findByDedupKey(key:LeadDedupKey):Promise<Lead|null>; }
 export interface AppointmentRepository {
   create(input:Omit<Appointment,"id">):Promise<Appointment>;
@@ -81,6 +81,30 @@ export interface SlotOfferClaimRepository {
    * to clean up; it means someone else already has (or now owns) this claim. */
   release(conversationId:string,ownerToken:string):Promise<boolean>;
 }
+// Phase 4A -- lifecycle audit foundation (see docs/PHASE4-DESIGN.md). No handler wires any of
+// these into a user-visible flow yet.
+
+export interface LeadStatusHistoryRepository {
+  create(input: Omit<LeadStatusHistoryEntry, "id" | "createdAt">): Promise<LeadStatusHistoryEntry>;
+  /** Read-only, chronological -- for audit/debugging inspection of one lead's history. Not
+   * consumed by any business logic in Phase 4A. */
+  listByLeadId(leadId: string): Promise<LeadStatusHistoryEntry[]>;
+}
+
+export interface AppointmentStatusHistoryRepository {
+  create(input: Omit<AppointmentStatusHistoryEntry, "id" | "createdAt">): Promise<AppointmentStatusHistoryEntry>;
+  listByAppointmentId(appointmentId: string): Promise<AppointmentStatusHistoryEntry[]>;
+}
+
+export interface AppointmentMessageDeliveryRepository {
+  /** Wins outright (INSERT succeeds) or returns null on an idempotency_key conflict -- never
+   * throws for the "already scheduled/sent" case, same convention as
+   * SlotOfferClaimRepository.tryCreate. No caller exists yet in Phase 4A. */
+  tryCreate(input: Omit<AppointmentMessageDelivery, "id" | "createdAt" | "updatedAt" | "attemptCount" | "status"> & { status?: AppointmentMessageDelivery["status"] }): Promise<AppointmentMessageDelivery | null>;
+  findByIdempotencyKey(idempotencyKey: string): Promise<AppointmentMessageDelivery | null>;
+  update(id: string, patch: Partial<AppointmentMessageDelivery>): Promise<AppointmentMessageDelivery>;
+}
+
 export interface CalendarSlot{start:Date;end:Date;} export interface CalendarEventInput{title:string;description:string;start:Date;end:Date;attendeeEmail?:string;} export interface CalendarEventResult{eventId:string;meetingUrl?:string;}
 export interface CalendarProvider{getAvailableSlots(from:Date,to:Date,durationMinutes:number):Promise<CalendarSlot[]>;isSlotAvailable(start:Date,end:Date):Promise<boolean>;createEvent(input:CalendarEventInput):Promise<CalendarEventResult>;deleteEvent(eventId:string):Promise<void>;}
 export interface AIProvider{generateStructured<T>(systemPrompt:string,messages:Array<{role:"user"|"assistant";content:string}>,schemaName:string):Promise<T>;}

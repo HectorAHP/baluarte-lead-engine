@@ -5,7 +5,7 @@ import { SlotOfferingService, OFFERED_SLOT_TTL_MS } from "../src/application/slo
 import {
   InMemoryLeadRepository, InMemoryConversationRepository, InMemoryAppointmentRepository,
   InMemoryOfferedSlotRepository, InMemoryBookingAttemptRepository, InMemoryMessageRepository,
-  InMemorySlotOfferClaimRepository,
+  InMemorySlotOfferClaimRepository, InMemoryLeadStatusHistoryRepository,
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import { FakeMessagingProvider } from "../src/infrastructure/fake-messaging-provider.js";
@@ -82,12 +82,13 @@ function makeHandler(overrides: { calendar?: CalendarProvider } = {}) {
   const logger = new FakeLogger();
   const appointmentService = new AppointmentService(calendar, appointments, bookingAttempts, leads, logger);
   const slotOfferClaims = new InMemorySlotOfferClaimRepository();
-  const slotOffering = new SlotOfferingService(calendar, offeredSlots, appointments, leads, slotOfferClaims, logger);
+  const leadStatusHistory = new InMemoryLeadStatusHistoryRepository();
+  const slotOffering = new SlotOfferingService(calendar, offeredSlots, appointments, leads, slotOfferClaims, leadStatusHistory, logger);
   const handler = new WhatsAppBookingHandler(
-    { leads, conversations, appointments, offeredSlots, slotOffering, appointmentService, messaging, messages, logger },
+    { leads, conversations, appointments, offeredSlots, slotOffering, appointmentService, messaging, messages, leadStatusHistory, logger },
     "America/Mexico_City",
   );
-  return { handler, leads, conversations, appointments, offeredSlots, bookingAttempts, messages, messaging, logger, calendar, slotOffering, appointmentService };
+  return { handler, leads, conversations, appointments, offeredSlots, bookingAttempts, messages, messaging, logger, calendar, slotOffering, appointmentService, leadStatusHistory };
 }
 
 async function makeLeadAndConversation(leads: InMemoryLeadRepository, conversations: InMemoryConversationRepository, overrides: Partial<Lead> = {}) {

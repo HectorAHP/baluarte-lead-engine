@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { LeadService } from "../src/application/services.js";
-import { InMemoryLeadRepository, InMemoryLeadScoreRepository } from "../src/infrastructure/memory-repositories.js";
+import { InMemoryLeadRepository, InMemoryLeadScoreRepository, InMemoryLeadStatusHistoryRepository } from "../src/infrastructure/memory-repositories.js";
+import { FakeLogger } from "../src/infrastructure/fake-logger.js";
 
 describe("lead score history", () => {
   it("appends a lead_scores record on every scoring call, while leads.score reflects only the latest", async () => {
     const leads = new InMemoryLeadRepository();
     const leadScores = new InMemoryLeadScoreRepository();
-    const service = new LeadService(leads, leadScores);
+    const service = new LeadService(leads, leadScores, new InMemoryLeadStatusHistoryRepository(), new FakeLogger());
     const lead = await service.createLead({ firstName: "Test", productVertical: "PATRIMONIAL" });
     await service.markContacted(lead.id);
     await service.startQualification(lead.id);
@@ -38,7 +39,7 @@ describe("lead score history", () => {
   it("records GMM scoring history under the GMM vertical", async () => {
     const leads = new InMemoryLeadRepository();
     const leadScores = new InMemoryLeadScoreRepository();
-    const service = new LeadService(leads, leadScores);
+    const service = new LeadService(leads, leadScores, new InMemoryLeadStatusHistoryRepository(), new FakeLogger());
     const lead = await service.createLead({ firstName: "Test", productVertical: "GMM" });
     await service.markContacted(lead.id);
     await service.startQualification(lead.id);

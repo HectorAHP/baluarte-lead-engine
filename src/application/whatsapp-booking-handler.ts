@@ -1,6 +1,6 @@
 import type {
   LeadRepository, ConversationRepository, MessageRepository, OfferedSlotRepository,
-  AppointmentRepository, MessagingProvider, Logger,
+  AppointmentRepository, MessagingProvider, LeadStatusHistoryRepository, Logger,
 } from "./ports.js";
 import type { Lead } from "../domain/lead.js";
 import type { Appointment } from "../domain/appointment.js";
@@ -30,6 +30,7 @@ export interface WhatsAppBookingHandlerDeps {
   appointmentService: AppointmentService;
   messaging: MessagingProvider;
   messages: MessageRepository;
+  leadStatusHistory: LeadStatusHistoryRepository;
   logger: Logger;
 }
 
@@ -71,7 +72,7 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     // re-run Calendar/booking logic once a real appointment exists.
     const existingAppointment = await this.deps.appointments.findActiveByLeadId(lead.id);
     if (existingAppointment) {
-      await markLeadBooked(this.deps.leads, lead, existingAppointment);
+      await markLeadBooked(this.deps, lead, existingAppointment);
       await this.replyExistingBooking(lead.id, conversationId, whatsappUserId, existingAppointment);
       return;
     }
@@ -125,7 +126,7 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     // B. Appointment guard, once more, immediately before booking.
     const existingAppointment = await this.deps.appointments.findActiveByLeadId(lead.id);
     if (existingAppointment) {
-      await markLeadBooked(this.deps.leads, lead, existingAppointment);
+      await markLeadBooked(this.deps, lead, existingAppointment);
       await this.replyExistingBooking(lead.id, conversationId, whatsappUserId, existingAppointment);
       return;
     }
@@ -178,7 +179,7 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     // below are identical and safe to repeat -- update(selected:true) is a plain overwrite (not
     // an increment/toggle), and markLeadBooked no-ops once the lead is already BOOKED.
     await this.deps.offeredSlots.update(slot.id, { selected: true });
-    await markLeadBooked(this.deps.leads, lead, appointment);
+    await markLeadBooked(this.deps, lead, appointment);
     await this.replyBookingConfirmed(lead.id, conversationId, whatsappUserId, appointment);
   }
 

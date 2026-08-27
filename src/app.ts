@@ -6,6 +6,7 @@ import {
   InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository,
   InMemoryLeadScoreRepository, InMemoryConversationRepository, InMemoryMessageRepository,
   InMemoryQualificationAnswerRepository, InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
+  InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository, InMemoryAppointmentMessageDeliveryRepository,
 } from "./infrastructure/memory-repositories.js";
 import { SupabaseLeadRepository } from "./infrastructure/supabase-lead-repository.js";
 import { SupabaseAppointmentRepository } from "./infrastructure/supabase-appointment-repository.js";
@@ -16,6 +17,9 @@ import { SupabaseMessageRepository } from "./infrastructure/supabase-message-rep
 import { SupabaseQualificationAnswerRepository } from "./infrastructure/supabase-qualification-answer-repository.js";
 import { SupabaseOfferedSlotRepository } from "./infrastructure/supabase-offered-slot-repository.js";
 import { SupabaseSlotOfferClaimRepository } from "./infrastructure/supabase-slot-offer-claim-repository.js";
+import { SupabaseLeadStatusHistoryRepository } from "./infrastructure/supabase-lead-status-history-repository.js";
+import { SupabaseAppointmentStatusHistoryRepository } from "./infrastructure/supabase-appointment-status-history-repository.js";
+import { SupabaseAppointmentMessageDeliveryRepository } from "./infrastructure/supabase-appointment-message-delivery-repository.js";
 import { createSupabaseClient } from "./infrastructure/supabase-client.js";
 import { FakeCalendarProvider } from "./infrastructure/fake-calendar.js";
 import { GoogleCalendarProvider } from "./infrastructure/google-calendar-provider.js";
@@ -37,6 +41,7 @@ import type {
   LeadRepository, AppointmentRepository, BookingAttemptRepository, LeadScoreRepository,
   ConversationRepository, MessageRepository, QualificationAnswerRepository, OfferedSlotRepository,
   SlotOfferClaimRepository, CalendarProvider, MessagingProvider,
+  LeadStatusHistoryRepository, AppointmentStatusHistoryRepository, AppointmentMessageDeliveryRepository,
 } from "./application/ports.js";
 
 declare module "fastify" {
@@ -59,6 +64,19 @@ export interface AppDependencies {
   /** Phase 3C concurrency hardening: protects SlotOfferingService's round-creation critical
    * section against two concurrent callers for the same conversation (see migration 011). */
   slotOfferClaimsRepo?: SlotOfferClaimRepository;
+  /** Phase 4A: lifecycle audit foundation (see docs/PHASE4-DESIGN.md). Consumed by LeadService,
+   * SlotOfferingService, and booking-outcome-dispatch.ts/whatsapp-booking-handler.ts's
+   * markLeadBooked/escalateToHuman to record lead_status_history rows -- no route or handler
+   * changes behavior based on it. */
+  leadStatusHistoryRepo?: LeadStatusHistoryRepository;
+  /** Phase 4A: constructed and injectable, but not consumed by any code yet -- appointments are
+   * only ever created directly as BOOKED today, never transitioned afterward (see
+   * lead-status-audit.ts's recordAppointmentStatusTransition doc comment). Ready for Phase
+   * 4B/4C/4E. */
+  appointmentStatusHistoryRepo?: AppointmentStatusHistoryRepository;
+  /** Phase 4A: constructed and injectable, but not consumed by any code yet -- no scheduler/sweep
+   * exists. Ready for Phase 4D/4E. */
+  appointmentMessageDeliveryRepo?: AppointmentMessageDeliveryRepository;
   calendar?: CalendarProvider;
   messaging?: MessagingProvider;
   /** Override for config.WHATSAPP_VERIFY_TOKEN -- exists so webhook verification is testable
@@ -117,15 +135,24 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   const qualificationAnswersRepo = overrides.qualificationAnswersRepo ?? (supabaseClient ? new SupabaseQualificationAnswerRepository(supabaseClient) : new InMemoryQualificationAnswerRepository());
   const slotOfferClaimsRepo = overrides.slotOfferClaimsRepo ?? (supabaseClient ? new SupabaseSlotOfferClaimRepository(supabaseClient) : new InMemorySlotOfferClaimRepository());
   const offeredSlotsRepo = overrides.offeredSlotsRepo ?? (supabaseClient ? new SupabaseOfferedSlotRepository(supabaseClient) : new InMemoryOfferedSlotRepository());
+  // Phase 4A -- lifecycle audit foundation. leadStatusHistoryRepo is actually consumed below
+  // (LeadService, SlotOfferingService, the booking-outcome-dispatch helpers); the other two are
+  // constructed and injectable but have no consumer yet in this block (see AppDependencies'
+  // doc comments above).
+  const leadStatusHistoryRepo = overrides.leadStatusHistoryRepo ?? (supabaseClient ? new SupabaseLeadStatusHistoryRepository(supabaseClient) : new InMemoryLeadStatusHistoryRepository());
+  const appointmentStatusHistoryRepo = overrides.appointmentStatusHistoryRepo ?? (supabaseClient ? new SupabaseAppointmentStatusHistoryRepository(supabaseClient) : new InMemoryAppointmentStatusHistoryRepository());
+  const appointmentMessageDeliveryRepo = overrides.appointmentMessageDeliveryRepo ?? (supabaseClient ? new SupabaseAppointmentMessageDeliveryRepository(supabaseClient) : new InMemoryAppointmentMessageDeliveryRepository());
+  void appointmentStatusHistoryRepo; // constructed for future Phase 4B/4C/4E wiring; unused in 4A
+  void appointmentMessageDeliveryRepo; // constructed for future Phase 4D/4E wiring; unused in 4A
   const calendar = overrides.calendar ?? (hasGoogleCalendarCredentials ? new GoogleCalendarProvider() : new FakeCalendarProvider());
   const messaging = overrides.messaging ?? (hasWhatsAppCredentials ? new MetaWhatsAppProvider() : new FakeMessagingProvider());
 
-  const leadService = new LeadService(leadsRepo, leadScoresRepo);
+  const leadService = new LeadService(leadsRepo, leadScoresRepo, leadStatusHistoryRepo, app.log);
   const appointmentService = new AppointmentService(calendar, appointmentsRepo, bookingAttemptsRepo, leadsRepo, app.log);
   // Always constructed -- cheap, stateless, and needed by both qualificationHandler (to offer
   // slots right after QUALIFIED_A/B) and bookingHandler below, each gated independently by its
   // own flag.
-  const slotOfferingService = new SlotOfferingService(calendar, offeredSlotsRepo, appointmentsRepo, leadsRepo, slotOfferClaimsRepo, app.log);
+  const slotOfferingService = new SlotOfferingService(calendar, offeredSlotsRepo, appointmentsRepo, leadsRepo, slotOfferClaimsRepo, leadStatusHistoryRepo, app.log);
 
   // "fake" only when a test/dev caller explicitly passed a FakeMessagingProvider override --
   // NOT whenever the resolved `messaging` instance happens to be one, since the normal
@@ -156,6 +183,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
         qualificationAnswers: qualificationAnswersRepo,
         leadService,
         messaging,
+        leadStatusHistory: leadStatusHistoryRepo,
         logger: app.log,
         // Present only when booking is ALSO enabled -- with it undefined, applyOutcome's
         // QUALIFICATION_COMPLETE branch behaves exactly as Phase 3B (message only, no offer).
@@ -177,6 +205,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
           appointmentService,
           messaging,
           messages: messagesRepo,
+          leadStatusHistory: leadStatusHistoryRepo,
           logger: app.log,
         },
         config.ADVISOR_TIMEZONE,

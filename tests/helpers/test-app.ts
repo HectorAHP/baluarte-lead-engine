@@ -3,6 +3,7 @@ import {
   InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository,
   InMemoryLeadScoreRepository, InMemoryConversationRepository, InMemoryMessageRepository,
   InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
+  InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository, InMemoryAppointmentMessageDeliveryRepository,
 } from "../../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../../src/infrastructure/fake-calendar.js";
 import { FakeMessagingProvider } from "../../src/infrastructure/fake-messaging-provider.js";
@@ -28,6 +29,11 @@ export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
     messagesRepo: new InMemoryMessageRepository(),
     offeredSlotsRepo: new InMemoryOfferedSlotRepository(),
     slotOfferClaimsRepo: new InMemorySlotOfferClaimRepository(),
+    // Phase 4A -- same "complete set, never a config-driven default" rationale as every repo
+    // above.
+    leadStatusHistoryRepo: new InMemoryLeadStatusHistoryRepository(),
+    appointmentStatusHistoryRepo: new InMemoryAppointmentStatusHistoryRepository(),
+    appointmentMessageDeliveryRepo: new InMemoryAppointmentMessageDeliveryRepository(),
     calendar: new FakeCalendarProvider(),
     messaging: new FakeMessagingProvider(),
     whatsappVerifyToken: TEST_WHATSAPP_VERIFY_TOKEN,

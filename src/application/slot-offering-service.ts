@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import type { CalendarProvider, OfferedSlotRepository, AppointmentRepository, LeadRepository, SlotOfferClaimRepository, Logger } from "./ports.js";
+import type { CalendarProvider, OfferedSlotRepository, AppointmentRepository, LeadRepository, SlotOfferClaimRepository, LeadStatusHistoryRepository, Logger } from "./ports.js";
 import type { OfferedSlot } from "../domain/offered-slot.js";
 import type { Lead, LeadStatus } from "../domain/lead.js";
 import type { Appointment } from "../domain/appointment.js";
 import { assertTransition } from "../domain/state-machine.js";
 import { LeadNotOfferableError, SlotOfferClaimInProgressError } from "../domain/errors.js";
 import { assertSingleActiveRound } from "../domain/active-offer-consistency.js";
+import { recordLeadStatusTransition } from "./lead-status-audit.js";
 import { config } from "../config.js";
 
 /**
@@ -139,6 +140,7 @@ export class SlotOfferingService {
     private readonly appointments: AppointmentRepository,
     private readonly leads: LeadRepository,
     private readonly slotOfferClaims: SlotOfferClaimRepository,
+    private readonly leadStatusHistory: LeadStatusHistoryRepository,
     private readonly logger: Logger,
     options: SlotOfferingServiceOptions = {},
   ) {
@@ -229,14 +231,23 @@ export class SlotOfferingService {
   }
 
   /** Set-once semantics for bookingStartedAt; a lead already BOOKING_PENDING is left untouched
-   * entirely (no write at all), so this is safe to call on every reuse. */
+   * entirely (no write at all), so this is safe to call on every reuse. Phase 4A: records exactly
+   * one lead_status_history row for a real transition (never for the already-BOOKING_PENDING
+   * no-op above), via the same shared helper LeadService.transitionTo uses. */
   private async ensureBookingPending(lead: Lead, now: Date): Promise<Lead> {
     if (lead.status === "BOOKING_PENDING") return lead;
     assertTransition(lead.status, "BOOKING_PENDING");
-    return this.leads.update(lead.id, {
+    const updated = await this.leads.update(lead.id, {
       status: "BOOKING_PENDING",
       ...(lead.bookingStartedAt ? {} : { bookingStartedAt: now }),
     });
+    await recordLeadStatusTransition(this.leadStatusHistory, this.logger, {
+      leadId: lead.id,
+      fromStatus: lead.status,
+      toStatus: "BOOKING_PENDING",
+      eventType: "BOOKING_OFFER_STARTED",
+    });
+    return updated;
   }
 
   /**

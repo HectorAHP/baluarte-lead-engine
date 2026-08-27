@@ -1,4 +1,4 @@
-import type { LeadRepository, ConversationRepository, MessageRepository, QualificationAnswerRepository, LeadScoreRepository, MessagingProvider, Logger } from "./ports.js";
+import type { LeadRepository, ConversationRepository, MessageRepository, QualificationAnswerRepository, LeadScoreRepository, MessagingProvider, LeadStatusHistoryRepository, Logger } from "./ports.js";
 import type { LeadService } from "./services.js";
 import type { Lead } from "../domain/lead.js";
 import type { AnswerRecord } from "../domain/qualification-state.js";
@@ -34,6 +34,7 @@ export interface WhatsAppQualificationHandlerDeps {
   leadScores: LeadScoreRepository;
   leadService: LeadService;
   messaging: MessagingProvider;
+  leadStatusHistory: LeadStatusHistoryRepository;
   logger: Logger;
   /** Phase 3C: present only when WHATSAPP_BOOKING_ENABLED is true (see app.ts). When absent,
    * applyOutcome's QUALIFICATION_COMPLETE branch behaves exactly as Phase 3B -- the completion

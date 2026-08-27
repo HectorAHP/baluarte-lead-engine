@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, it, expect } from "vitest";
 import { SlotOfferingService, OFFERED_SLOT_TTL_MS, MAX_OFFERED_SLOTS, MAX_OFFER_ROUNDS } from "../src/application/slot-offering-service.js";
-import { InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository } from "../src/infrastructure/memory-repositories.js";
+import { InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository, InMemoryLeadStatusHistoryRepository } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
 import { LeadNotOfferableError, ActiveOfferInconsistentError } from "../src/domain/errors.js";
@@ -86,7 +86,7 @@ function makeService(overrides: { calendar?: CalendarProvider; roundIdFactory?: 
   const leads = new InMemoryLeadRepository();
   const slotOfferClaims = new InMemorySlotOfferClaimRepository();
   const logger = new FakeLogger();
-  const service = new SlotOfferingService(calendar, offeredSlots, appointments, leads, slotOfferClaims, logger, { roundIdFactory: overrides.roundIdFactory });
+  const service = new SlotOfferingService(calendar, offeredSlots, appointments, leads, slotOfferClaims, new InMemoryLeadStatusHistoryRepository(), logger, { roundIdFactory: overrides.roundIdFactory });
   return { service, calendar, offeredSlots, appointments, leads, slotOfferClaims, logger };
 }
 
@@ -215,7 +215,7 @@ describe("SlotOfferingService.getOrCreateOffer", () => {
         return realLeads.update(id, patch);
       },
     };
-    const service = new SlotOfferingService(calendar, offeredSlots, appointments, flakyLeads, new InMemorySlotOfferClaimRepository(), new FakeLogger());
+    const service = new SlotOfferingService(calendar, offeredSlots, appointments, flakyLeads, new InMemorySlotOfferClaimRepository(), new InMemoryLeadStatusHistoryRepository(), new FakeLogger());
     const lead = await realLeads.create({
       country: "MX", productVertical: "PATRIMONIAL", status: "QUALIFIED_A",
       score: 80, assignedAdvisor: "Hector Herrera", consentContact: true,
@@ -317,7 +317,7 @@ describe("SlotOfferingService.getOrCreateOffer", () => {
       listRoundIdsByConversationId: async () => [],
       update: () => Promise.reject(new Error("not used")),
     };
-    const service = new SlotOfferingService(calendar, failingOfferedSlots, appointments, leads, new InMemorySlotOfferClaimRepository(), new FakeLogger());
+    const service = new SlotOfferingService(calendar, failingOfferedSlots, appointments, leads, new InMemorySlotOfferClaimRepository(), new InMemoryLeadStatusHistoryRepository(), new FakeLogger());
     const lead = await makeLead(leads, { status: "QUALIFIED_A" });
     const now = new Date("2026-03-02T12:00:00.000Z");
 

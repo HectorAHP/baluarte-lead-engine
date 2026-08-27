@@ -3,6 +3,7 @@ import { handleInboundWhatsAppText, type InboundWhatsAppText } from "../src/appl
 import { LeadService } from "../src/application/services.js";
 import {
   InMemoryLeadRepository, InMemoryConversationRepository, InMemoryMessageRepository, InMemoryLeadScoreRepository,
+  InMemoryLeadStatusHistoryRepository,
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeMessagingProvider } from "../src/infrastructure/fake-messaging-provider.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
@@ -16,7 +17,7 @@ function makeDeps() {
   const leadScores = new InMemoryLeadScoreRepository();
   const messaging = new FakeMessagingProvider();
   const logger = new FakeLogger();
-  const leadService = new LeadService(leads, leadScores);
+  const leadService = new LeadService(leads, leadScores, new InMemoryLeadStatusHistoryRepository(), logger);
   return { leads, conversations, messages, messaging, logger, leadService };
 }
 

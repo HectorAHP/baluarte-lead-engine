@@ -1,6 +1,7 @@
 import { describe, expect, it, beforeEach } from "vitest";
 import { LeadService } from "../src/application/services.js";
-import { InMemoryLeadRepository, InMemoryLeadScoreRepository } from "../src/infrastructure/memory-repositories.js";
+import { InMemoryLeadRepository, InMemoryLeadScoreRepository, InMemoryLeadStatusHistoryRepository } from "../src/infrastructure/memory-repositories.js";
+import { FakeLogger } from "../src/infrastructure/fake-logger.js";
 import { LeadNotFoundError, InvalidLeadTransitionError } from "../src/domain/errors.js";
 import type { PatrimonialScoreInput } from "../src/domain/scoring.js";
 
@@ -16,7 +17,7 @@ describe("LeadService qualification lifecycle", () => {
   beforeEach(() => {
     repo = new InMemoryLeadRepository();
     leadScores = new InMemoryLeadScoreRepository();
-    service = new LeadService(repo, leadScores);
+    service = new LeadService(repo, leadScores, new InMemoryLeadStatusHistoryRepository(), new FakeLogger());
   });
 
   async function newLead() {

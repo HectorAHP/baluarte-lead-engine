@@ -1,14 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { LeadService, AppointmentService } from "../src/application/services.js";
-import { InMemoryLeadRepository, InMemoryLeadScoreRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository } from "../src/infrastructure/memory-repositories.js";
+import { InMemoryLeadRepository, InMemoryLeadScoreRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository, InMemoryLeadStatusHistoryRepository } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
 
 describe("lifecycle timestamps", () => {
   it("sets first_contact_at on markContacted, and it stays stable afterward", async () => {
     const leads = new InMemoryLeadRepository();
-    const service = new LeadService(leads, new InMemoryLeadScoreRepository());
+    const service = new LeadService(leads, new InMemoryLeadScoreRepository(), new InMemoryLeadStatusHistoryRepository(), new FakeLogger());
     const lead = await service.createLead({ firstName: "Test", productVertical: "PATRIMONIAL" });
     expect(lead.firstContactAt).toBeUndefined();
 
@@ -22,7 +22,7 @@ describe("lifecycle timestamps", () => {
 
   it("sets qualified_at only when reaching QUALIFIED_A or QUALIFIED_B, not NURTURE_C", async () => {
     const leads = new InMemoryLeadRepository();
-    const service = new LeadService(leads, new InMemoryLeadScoreRepository());
+    const service = new LeadService(leads, new InMemoryLeadScoreRepository(), new InMemoryLeadStatusHistoryRepository(), new FakeLogger());
     const lead = await service.createLead({ firstName: "Test", productVertical: "PATRIMONIAL" });
     await service.markContacted(lead.id);
     await service.startQualification(lead.id);
@@ -43,7 +43,7 @@ describe("lifecycle timestamps", () => {
 
   it("sets both booked_at and meeting_at (= appointment.startsAt) on the lead after a successful booking", async () => {
     const leads = new InMemoryLeadRepository();
-    const leadService = new LeadService(leads, new InMemoryLeadScoreRepository());
+    const leadService = new LeadService(leads, new InMemoryLeadScoreRepository(), new InMemoryLeadStatusHistoryRepository(), new FakeLogger());
     const lead = await leadService.createLead({ firstName: "Test", productVertical: "PATRIMONIAL" });
     expect(lead.bookedAt).toBeUndefined();
     expect(lead.meetingAt).toBeUndefined();

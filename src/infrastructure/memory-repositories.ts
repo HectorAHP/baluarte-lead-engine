@@ -1,5 +1,5 @@
 import {randomUUID} from "node:crypto";
-import type {LeadRepository,AppointmentRepository,BookingAttemptRepository,ConversationRepository,MessageRepository,QualificationAnswerRepository,LeadScoreRepository,OfferedSlotRepository,SlotOfferClaimRepository} from "../application/ports.js";
+import type {LeadRepository,AppointmentRepository,BookingAttemptRepository,ConversationRepository,MessageRepository,QualificationAnswerRepository,LeadScoreRepository,OfferedSlotRepository,SlotOfferClaimRepository,LeadStatusHistoryRepository,AppointmentStatusHistoryRepository,AppointmentMessageDeliveryRepository} from "../application/ports.js";
 import type {Lead,LeadDedupKey} from "../domain/lead.js";
 import type {Appointment} from "../domain/appointment.js";
 import type {BookingAttempt,BookingAttemptStatus} from "../domain/booking-attempt.js";
@@ -9,6 +9,9 @@ import type {QualificationAnswer} from "../domain/qualification-answer.js";
 import type {LeadScoreRecord} from "../domain/lead-score-record.js";
 import type {OfferedSlot} from "../domain/offered-slot.js";
 import type {SlotOfferClaim} from "../domain/slot-offer-claim.js";
+import type {LeadStatusHistoryEntry} from "../domain/lead-status-history.js";
+import type {AppointmentStatusHistoryEntry} from "../domain/appointment-status-history.js";
+import type {AppointmentMessageDelivery} from "../domain/appointment-message-delivery.js";
 import {SlotUnavailableError,DuplicateMessageError,BookingAttemptKeyConflictError} from "../domain/errors.js";
 import {messageDedupKey} from "../domain/message-dedup-key.js";
 
@@ -268,5 +271,67 @@ export class InMemorySlotOfferClaimRepository implements SlotOfferClaimRepositor
     if(!current||current.ownerToken!==ownerToken) return false;
     this.store.data.delete(conversationId);
     return true;
+  }
+}
+
+// -------------------------------------------------------------------------------------------
+// Phase 4A -- lifecycle audit foundation (see docs/PHASE4-DESIGN.md). Not wired into any
+// user-visible flow yet.
+// -------------------------------------------------------------------------------------------
+
+export class InMemoryLeadStatusHistoryRepository implements LeadStatusHistoryRepository{
+  private data:LeadStatusHistoryEntry[]=[];
+  async create(input:Omit<LeadStatusHistoryEntry,"id"|"createdAt">){
+    const row={...input,id:randomUUID(),createdAt:new Date()};
+    this.data.push(row);
+    return row;
+  }
+  async listByLeadId(leadId:string){
+    return this.data.filter(r=>r.leadId===leadId).sort((a,b)=>a.createdAt.getTime()-b.createdAt.getTime());
+  }
+}
+
+export class InMemoryAppointmentStatusHistoryRepository implements AppointmentStatusHistoryRepository{
+  private data:AppointmentStatusHistoryEntry[]=[];
+  async create(input:Omit<AppointmentStatusHistoryEntry,"id"|"createdAt">){
+    const row={...input,id:randomUUID(),createdAt:new Date()};
+    this.data.push(row);
+    return row;
+  }
+  async listByAppointmentId(appointmentId:string){
+    return this.data.filter(r=>r.appointmentId===appointmentId).sort((a,b)=>a.createdAt.getTime()-b.createdAt.getTime());
+  }
+}
+
+/**
+ * Mirrors the real table's `unique (idempotency_key)` constraint, so tests exercise the same
+ * "two equivalent deliveries for the same appointment can never coexist" guarantee the database
+ * enforces. No `await` before any Map mutation -- same reasoning as
+ * InMemoryBookingAttemptRepository/InMemorySlotOfferClaimRepository.
+ */
+export class InMemoryAppointmentMessageDeliveryRepository implements AppointmentMessageDeliveryRepository{
+  private data=new Map<string,AppointmentMessageDelivery>();
+  private byIdempotencyKey=new Map<string,string>();
+
+  async tryCreate(input:Omit<AppointmentMessageDelivery,"id"|"createdAt"|"updatedAt"|"attemptCount"|"status">&{status?:AppointmentMessageDelivery["status"]}):Promise<AppointmentMessageDelivery|null>{
+    if(this.byIdempotencyKey.has(input.idempotencyKey)) return null;
+    const now=new Date();
+    const row:AppointmentMessageDelivery={...input,status:input.status??"PENDING",attemptCount:0,id:randomUUID(),createdAt:now,updatedAt:now};
+    this.data.set(row.id,row);
+    this.byIdempotencyKey.set(input.idempotencyKey,row.id);
+    return row;
+  }
+
+  async findByIdempotencyKey(idempotencyKey:string):Promise<AppointmentMessageDelivery|null>{
+    const id=this.byIdempotencyKey.get(idempotencyKey);
+    return id?this.data.get(id)??null:null;
+  }
+
+  async update(id:string,patch:Partial<AppointmentMessageDelivery>):Promise<AppointmentMessageDelivery>{
+    const c=this.data.get(id);
+    if(!c)throw new Error("APPOINTMENT_MESSAGE_DELIVERY_NOT_FOUND");
+    const n={...c,...patch,id,updatedAt:new Date()};
+    this.data.set(id,n);
+    return n;
   }
 }

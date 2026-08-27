@@ -3,7 +3,7 @@ import { WhatsAppQualificationHandler } from "../src/application/whatsapp-qualif
 import { LeadService } from "../src/application/services.js";
 import {
   InMemoryLeadRepository, InMemoryConversationRepository, InMemoryMessageRepository,
-  InMemoryQualificationAnswerRepository, InMemoryLeadScoreRepository,
+  InMemoryQualificationAnswerRepository, InMemoryLeadScoreRepository, InMemoryLeadStatusHistoryRepository,
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeMessagingProvider } from "../src/infrastructure/fake-messaging-provider.js";
 import { NURTURE_C_MESSAGE, QUALIFICATION_COMPLETE_AB_MESSAGE } from "../src/domain/message-templates.js";
@@ -25,9 +25,10 @@ function buildHarness() {
   const qualificationAnswers = new InMemoryQualificationAnswerRepository();
   const leadScores = new InMemoryLeadScoreRepository();
   const messaging = new FakeMessagingProvider();
-  const leadService = new LeadService(leads, leadScores);
-  const handler = new WhatsAppQualificationHandler({ leads, conversations, messages, qualificationAnswers, leadScores, leadService, messaging, logger: noopLogger });
-  return { leads, conversations, messages, qualificationAnswers, leadScores, messaging, leadService, handler };
+  const leadStatusHistory = new InMemoryLeadStatusHistoryRepository();
+  const leadService = new LeadService(leads, leadScores, leadStatusHistory, noopLogger);
+  const handler = new WhatsAppQualificationHandler({ leads, conversations, messages, qualificationAnswers, leadScores, leadService, messaging, leadStatusHistory, logger: noopLogger });
+  return { leads, conversations, messages, qualificationAnswers, leadScores, messaging, leadService, leadStatusHistory, handler };
 }
 
 /** Mirrors what persistInboundMessage() in whatsapp-inbound-service.ts does for every real

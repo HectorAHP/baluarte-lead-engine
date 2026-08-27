@@ -1,9 +1,10 @@
-import type { LeadRepository, ConversationRepository, MessagingProvider, MessageRepository, Logger } from "./ports.js";
+import type { LeadRepository, ConversationRepository, MessagingProvider, MessageRepository, LeadStatusHistoryRepository, Logger } from "./ports.js";
 import type { Lead, LeadStatus } from "../domain/lead.js";
 import type { Appointment } from "../domain/appointment.js";
 import { assertTransition } from "../domain/state-machine.js";
 import { sendAndPersistReply } from "./whatsapp-inbound-service.js";
 import type { SlotOfferOutcome } from "./slot-offering-service.js";
+import { recordLeadStatusTransition } from "./lead-status-audit.js";
 import {
   buildSlotOfferMessage, SLOT_UNAVAILABLE_INTRO, buildExistingBookingMessage, formatSlotForDisplay,
   BOOKING_NO_AVAILABILITY_MESSAGE, QUALIFIER_HUMAN_HANDOFF_MESSAGE,
@@ -14,6 +15,7 @@ export interface BookingOutcomeDeps {
   conversations: ConversationRepository;
   messaging: MessagingProvider;
   messages: MessageRepository;
+  leadStatusHistory: LeadStatusHistoryRepository;
   logger: Logger;
 }
 
@@ -33,17 +35,35 @@ export interface BookingOutcomeDeps {
  * exact drift a live appointment can be found to have (e.g. completeBooking's own best-effort
  * leads.update failed after the appointment was already durably created -- see its TODO comment)
  * without ever overwriting a value that's already correctly set.
+ *
+ * Phase 4A: records exactly one lead_status_history row when this call actually performs the
+ * BOOKED transition (never on a pure bookedAt/meetingAt backfill with no status change, and never
+ * on the fully-idempotent no-op below).
  */
-export async function markLeadBooked(leads: LeadRepository, lead: Lead, appointment: Appointment): Promise<Lead> {
+export async function markLeadBooked(
+  deps: Pick<BookingOutcomeDeps, "leads" | "leadStatusHistory" | "logger">,
+  lead: Lead,
+  appointment: Appointment,
+): Promise<Lead> {
   const patch: Partial<Lead> = {};
-  if (lead.status !== "BOOKED") {
+  const wasBooked = lead.status === "BOOKED";
+  if (!wasBooked) {
     assertTransition(lead.status, "BOOKED");
     patch.status = "BOOKED";
   }
   if (!lead.bookedAt) patch.bookedAt = new Date();
   if (!lead.meetingAt) patch.meetingAt = appointment.startsAt;
   if (Object.keys(patch).length === 0) return lead; // fully idempotent no-op -- nothing missing to backfill
-  return leads.update(lead.id, patch);
+  const updated = await deps.leads.update(lead.id, patch);
+  if (!wasBooked) {
+    await recordLeadStatusTransition(deps.leadStatusHistory, deps.logger, {
+      leadId: lead.id,
+      fromStatus: lead.status,
+      toStatus: "BOOKED",
+      eventType: "BOOKING_CONFIRMED",
+    });
+  }
+  return updated;
 }
 
 /**
@@ -60,6 +80,12 @@ export async function escalateToHuman(deps: BookingOutcomeDeps, lead: Lead, conv
   if (lead.status !== target) {
     assertTransition(lead.status, target);
     await deps.leads.update(lead.id, { status: target });
+    await recordLeadStatusTransition(deps.leadStatusHistory, deps.logger, {
+      leadId: lead.id,
+      fromStatus: lead.status,
+      toStatus: target,
+      eventType: "BOOKING_INCONSISTENCY_HANDOFF",
+    });
   }
   await deps.conversations.update(conversationId, { status: "HUMAN_HANDOFF" });
   await sendAndPersistReply(deps, lead.id, conversationId, whatsappUserId, QUALIFIER_HUMAN_HANDOFF_MESSAGE);
@@ -92,7 +118,7 @@ export async function dispatchSlotOfferOutcome(
       return;
     }
     case "ALREADY_BOOKED": {
-      await markLeadBooked(deps.leads, lead, outcome.appointment);
+      await markLeadBooked(deps, lead, outcome.appointment);
       const when = formatSlotForDisplay(outcome.appointment.startsAt, advisorTimezone);
       await sendAndPersistReply(deps, lead.id, conversationId, whatsappUserId, buildExistingBookingMessage(when, outcome.appointment.meetingUrl));
       return;

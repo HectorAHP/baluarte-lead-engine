@@ -1,5 +1,5 @@
 import {createHash} from "node:crypto";
-import type { LeadRepository,CalendarProvider,AppointmentRepository,BookingAttemptRepository,LeadScoreRepository,Logger } from "./ports.js";
+import type { LeadRepository,CalendarProvider,AppointmentRepository,BookingAttemptRepository,LeadScoreRepository,LeadStatusHistoryRepository,Logger } from "./ports.js";
 import type { Vertical,Lead,LeadStatus } from "../domain/lead.js";
 import type { Appointment } from "../domain/appointment.js";
 import type { BookingAttempt } from "../domain/booking-attempt.js";
@@ -8,11 +8,17 @@ import type {QualificationVertical} from "../domain/qualification-fields.js";
 import {assertTransition} from "../domain/state-machine.js";
 import {normalizePhoneToE164} from "../domain/phone.js";
 import {LeadNotFoundError,SlotUnavailableError,IdempotencyConflictError,BookingAttemptKeyConflictError,BookingInProgressError,BookingAttemptInconsistentError} from "../domain/errors.js";
+import {recordLeadStatusTransition} from "./lead-status-audit.js";
 
 function targetStatusForScore(scoreClass:ScoreClass):LeadStatus{return scoreClass==="A"?"QUALIFIED_A":scoreClass==="B"?"QUALIFIED_B":"NURTURE_C";}
 
 export class LeadService{
-  constructor(private readonly leads:LeadRepository,private readonly leadScores:LeadScoreRepository){}
+  constructor(
+    private readonly leads:LeadRepository,
+    private readonly leadScores:LeadScoreRepository,
+    private readonly leadStatusHistory:LeadStatusHistoryRepository,
+    private readonly logger:Logger,
+  ){}
 
   async createLead(input:{firstName?:string;lastName?:string;phone?:string;email?:string;source?:string;sourceDetail?:string;productVertical?:Vertical;productInterest?:string;metaLeadId?:string;whatsappUserId?:string;consentContact?:boolean;}):Promise<Lead>{
     const {phone,consentContact,...rest}=input;
@@ -36,18 +42,27 @@ export class LeadService{
     return lead;
   }
 
-  private async transitionTo(id:string,target:LeadStatus,buildPatch:(lead:Lead)=>Partial<Lead> = ()=>({})):Promise<Lead>{
+  /**
+   * The single choke point for every state-machine-validated leads.status write in this class.
+   * Phase 4A: after the real write succeeds, records exactly one lead_status_history row via the
+   * shared recordLeadStatusTransition helper (never duplicated per public method below) --
+   * best-effort, never affects the transition itself if the audit write fails (see that helper's
+   * doc comment).
+   */
+  private async transitionTo(id:string,target:LeadStatus,eventType:string,buildPatch:(lead:Lead)=>Partial<Lead> = ()=>({})):Promise<Lead>{
     const lead=await this.requireLead(id);
     assertTransition(lead.status,target);
-    return this.leads.update(id,{...buildPatch(lead),status:target});
+    const updated=await this.leads.update(id,{...buildPatch(lead),status:target});
+    await recordLeadStatusTransition(this.leadStatusHistory,this.logger,{leadId:id,fromStatus:lead.status,toStatus:target,eventType});
+    return updated;
   }
 
   async markContacted(id:string):Promise<Lead>{
-    return this.transitionTo(id,"CONTACTED",(lead)=>lead.firstContactAt?{}:{firstContactAt:new Date()});
+    return this.transitionTo(id,"CONTACTED","LEAD_CONTACTED",(lead)=>lead.firstContactAt?{}:{firstContactAt:new Date()});
   }
 
   async startQualification(id:string):Promise<Lead>{
-    return this.transitionTo(id,"QUALIFYING");
+    return this.transitionTo(id,"QUALIFYING","QUALIFICATION_STARTED");
   }
 
   /**
@@ -62,7 +77,7 @@ export class LeadService{
   async recordInboundContact(id:string):Promise<Lead>{
     const lead=await this.requireLead(id);
     if(lead.status==="NEW"){
-      return this.transitionTo(id,"CONTACTED",(current)=>({
+      return this.transitionTo(id,"CONTACTED","LEAD_CONTACTED",(current)=>({
         ...(current.firstContactAt?{}:{firstContactAt:new Date()}),
         ...(current.firstResponseAt?{}:{firstResponseAt:new Date()}),
       }));
@@ -74,11 +89,11 @@ export class LeadService{
   }
 
   async requestHumanHandoff(id:string):Promise<Lead>{
-    return this.transitionTo(id,"HUMAN_HANDOFF");
+    return this.transitionTo(id,"HUMAN_HANDOFF","HUMAN_HANDOFF_REQUESTED");
   }
 
   async requestDoNotContact(id:string):Promise<Lead>{
-    return this.transitionTo(id,"DO_NOT_CONTACT");
+    return this.transitionTo(id,"DO_NOT_CONTACT","DO_NOT_CONTACT_REQUESTED");
   }
 
   async scorePatrimonialLead(id:string,input:PatrimonialScoreInput):Promise<Lead>{
@@ -86,7 +101,7 @@ export class LeadService{
     const target=targetStatusForScore(r.scoreClass);
     // qualifiedAt means "became commercially qualified" (see Lead.qualifiedAt), not "finished
     // the questionnaire" -- so it is set only for QUALIFIED_A/QUALIFIED_B, never NURTURE_C.
-    const lead=await this.transitionTo(id,target,(current)=>({
+    const lead=await this.transitionTo(id,target,"QUALIFICATION_SCORED",(current)=>({
       score:r.total,
       scoreClass:r.scoreClass,
       ...(target!=="NURTURE_C"&&!current.qualifiedAt?{qualifiedAt:new Date()}:{}),
@@ -98,7 +113,7 @@ export class LeadService{
   async scoreGmmLead(id:string,input:GmmScoreInput):Promise<Lead>{
     const r=scoreGmm(input);
     const target=targetStatusForScore(r.scoreClass);
-    const lead=await this.transitionTo(id,target,(current)=>({
+    const lead=await this.transitionTo(id,target,"QUALIFICATION_SCORED",(current)=>({
       score:r.total,
       scoreClass:r.scoreClass,
       ...(target!=="NURTURE_C"&&!current.qualifiedAt?{qualifiedAt:new Date()}:{}),
@@ -115,7 +130,7 @@ export class LeadService{
    */
   async applyQualificationScore(id:string,input:{vertical:QualificationVertical;total:number;scoreClass:ScoreClass;breakdown:Record<string,number|string>;rulesVersion:string}):Promise<Lead>{
     const target=targetStatusForScore(input.scoreClass);
-    const lead=await this.transitionTo(id,target,(current)=>({
+    const lead=await this.transitionTo(id,target,"QUALIFICATION_SCORED",(current)=>({
       score:input.total,
       scoreClass:input.scoreClass,
       ...(target!=="NURTURE_C"&&!current.qualifiedAt?{qualifiedAt:new Date()}:{}),
