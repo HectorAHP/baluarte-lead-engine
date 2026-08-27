@@ -1,3 +1,6 @@
+import { zonedTimeParts } from "./timezone.js";
+import type { OfferedSlot } from "./offered-slot.js";
+
 /**
  * Deterministic, non-AI-generated copy for Phase 2 (transport + persistence only -- no
  * conversational qualifier yet). Every message here is sent with aiGenerated=false.
@@ -25,3 +28,113 @@ export const QUALIFICATION_COMPLETE_AB_MESSAGE =
 
 export const NURTURE_C_MESSAGE =
   "Gracias. Por ahora puedo dejar registrada tu información para que tengas un punto de referencia cuando quieras retomarlo. Si quieres, también puedo explicarte brevemente qué factores conviene comparar.";
+
+// ---------------------------------------------------------------------------------------------
+// Phase 3C -- booking copy. Deterministic, professional, no marketing language. Every date/time
+// shown to a lead goes through formatSlotForDisplay, which formats in the given IANA timezone
+// (the caller passes config.ADVISOR_TIMEZONE / America/Mexico_City) -- never raw UTC.
+// ---------------------------------------------------------------------------------------------
+
+const WEEKDAY_ES: Record<string, string> = {
+  Sun: "Domingo",
+  Mon: "Lunes",
+  Tue: "Martes",
+  Wed: "Miércoles",
+  Thu: "Jueves",
+  Fri: "Viernes",
+  Sat: "Sábado",
+};
+
+/**
+ * "Martes 27, 10:00 a.m." -- built from numeric zoned parts (zonedTimeParts), not from an ICU
+ * locale-formatted string, so the exact wording/spacing is deterministic across Node/ICU
+ * versions. The weekday name is resolved via a stable "en-US" short-weekday lookup (Sun/Mon/...)
+ * mapped to Spanish here, rather than trusting an "es-MX" locale string whose exact punctuation
+ * (e.g. "a. m." vs "a.m.") can vary by ICU data version.
+ */
+export function formatSlotForDisplay(date: Date, timezone: string): string {
+  const parts = zonedTimeParts(date, timezone);
+  const weekdayShort = new Intl.DateTimeFormat("en-US", { timeZone: timezone, weekday: "short" }).format(date);
+  const weekday = WEEKDAY_ES[weekdayShort] ?? weekdayShort;
+  const hour12 = parts.hour % 12 === 0 ? 12 : parts.hour % 12;
+  const period = parts.hour < 12 ? "a.m." : "p.m.";
+  const minute = String(parts.minute).padStart(2, "0");
+  return `${weekday} ${parts.day}, ${hour12}:${minute} ${period}`;
+}
+
+function positionList(slots: OfferedSlot[]): string {
+  const positions = [...slots].map((s) => s.position).sort((a, b) => a - b);
+  if (positions.length <= 1) return String(positions[0] ?? "");
+  return `${positions.slice(0, -1).join(", ")} o ${positions[positions.length - 1]}`;
+}
+
+function formatSlotList(slots: OfferedSlot[], timezone: string): string {
+  return [...slots]
+    .sort((a, b) => a.position - b.position)
+    .map((s) => `${s.position}. ${formatSlotForDisplay(s.slotStart, timezone)}`)
+    .join("\n");
+}
+
+/** A. Slot offer -- also reused (with a different `intro`) for the "your slot just got taken,
+ * here are new options" message (C) so the list-formatting logic is never duplicated. */
+export function buildSlotOfferMessage(
+  slots: OfferedSlot[],
+  timezone: string,
+  intro = "Tengo estas opciones disponibles para tu cita con Héctor:",
+): string {
+  return `${intro}\n\n${formatSlotList(slots, timezone)}\n\nResponde con el número de la opción que prefieras.`;
+}
+
+/** C. Sent after SlotUnavailableError triggers a replaceOffer() that produced a new round. */
+export const SLOT_UNAVAILABLE_INTRO = "Ese horario acaba de ocuparse. Te muestro otras opciones:";
+
+/** B. Invalid selection -- resends the SAME active slots (never a new round), with the exact
+ * currently-valid position numbers spelled out (never hardcoded "1, 2 o 3": a round can have
+ * fewer than 3 slots if Calendar returned fewer). */
+export function buildInvalidSelectionMessage(slots: OfferedSlot[], timezone: string): string {
+  return `Por favor responde ${positionList(slots)} para elegir uno de estos horarios:\n\n${formatSlotList(slots, timezone)}`;
+}
+
+/** D. Booking confirmed. No meetingUrl is ever invented -- when the provider didn't return one,
+ * a safe alternative message is used instead (see below). */
+export function buildBookingConfirmedMessage(when: string, meetingUrl?: string): string {
+  if (meetingUrl) {
+    return `Listo, tu cita quedó agendada con Héctor para el ${when}. Aquí está el enlace de la videollamada: ${meetingUrl}`;
+  }
+  return `Listo, tu cita quedó agendada con Héctor para el ${when}. Te compartiremos el enlace de la videollamada antes de la cita.`;
+}
+
+/** Idempotent-success / appointment-guard confirmation -- the lead already has a BOOKED
+ * appointment (from this turn or an earlier one); same "no invented URL" rule as D. */
+export function buildExistingBookingMessage(when: string, meetingUrl?: string): string {
+  if (meetingUrl) {
+    return `Ya tienes una cita agendada con Héctor para el ${when}. Aquí está el enlace de la videollamada: ${meetingUrl}`;
+  }
+  return `Ya tienes una cita agendada con Héctor para el ${when}. Te compartiremos el enlace de la videollamada antes de la cita.`;
+}
+
+/** E. AppointmentService.book() found a genuinely in-progress (not-yet-stale) booking attempt
+ * for this same idempotency key -- never create anything additional, just ask the lead to wait. */
+export const BOOKING_IN_PROGRESS_MESSAGE = "Estoy confirmando ese horario. Dame un momento e inténtalo nuevamente.";
+
+/** F. Recoverable technical/infra failure (Calendar or otherwise) -- no state change, no new
+ * round; the lead stays BOOKING_PENDING and can simply try again. */
+export const BOOKING_TECHNICAL_ERROR_MESSAGE =
+  "Tuve un problema técnico al consultar o confirmar el horario. Puedes intentarlo nuevamente en un momento.";
+
+/** G. SlotOfferingService returned NO_AVAILABILITY -- no round was created, nothing to select. */
+export const BOOKING_NO_AVAILABILITY_MESSAGE =
+  "Por ahora no tengo horarios disponibles para ofrecerte. En cuanto haya opciones te aviso, o si lo prefieres, un asesor puede contactarte directamente.";
+
+/**
+ * SlotOfferClaimInProgressError -- a concurrent request is actively creating (or just finished
+ * creating) this conversation's offer right now, or a legitimately-in-progress claim simply
+ * hasn't finished within the bounded polling window. Purely a timing/concurrency signal, never a
+ * data-consistency problem -- deliberately distinct copy from BOOKING_TECHNICAL_ERROR_MESSAGE so
+ * this specific, expected condition is never conflated with a genuinely unexpected failure. No
+ * state change accompanies this message in either caller (WhatsAppBookingHandler,
+ * WhatsAppQualificationHandler) -- retrying shortly resolves it on its own once the winning
+ * request's offer becomes visible.
+ */
+export const SLOT_OFFER_CLAIM_IN_PROGRESS_MESSAGE =
+  "Estoy preparando los horarios disponibles. Inténtalo nuevamente en unos segundos.";

@@ -120,7 +120,7 @@ describe("supabase lead score mapping", () => {
 
 describe("supabase offered slot mapping", () => {
   const row: OfferedSlotRow = {
-    id: "o1", conversation_id: "c1", lead_id: "l1",
+    id: "o1", conversation_id: "c1", lead_id: "l1", round_id: "r1",
     slot_start: "2026-03-02T15:00:00.000Z", slot_end: "2026-03-02T15:30:00.000Z",
     position: 1, expires_at: "2026-03-02T14:55:00.000Z", selected: false, created_at: "2026-03-02T14:00:00.000Z",
   };
@@ -130,17 +130,19 @@ describe("supabase offered slot mapping", () => {
     expect(s.position).toBe(1);
     expect(s.selected).toBe(false);
     expect(s.slotStart).toBeInstanceOf(Date);
+    expect(s.roundId).toBe("r1");
   });
 
   it("maps insert input to snake_case", () => {
     const input: Omit<OfferedSlot, "id" | "createdAt"> = {
-      conversationId: "c1", leadId: "l1",
+      conversationId: "c1", leadId: "l1", roundId: "r1",
       slotStart: new Date("2026-03-02T15:00:00.000Z"), slotEnd: new Date("2026-03-02T15:30:00.000Z"),
       position: 2, expiresAt: new Date("2026-03-02T14:55:00.000Z"), selected: false,
     };
     const r = mapOfferedSlotToInsertRow(input);
     expect(r.position).toBe(2);
     expect(r.slot_start).toBe("2026-03-02T15:00:00.000Z");
+    expect(r.round_id).toBe("r1");
   });
 
   it("maps a selection patch", () => {

@@ -1,14 +1,15 @@
 import {randomUUID} from "node:crypto";
-import type {LeadRepository,AppointmentRepository,BookingAttemptRepository,ConversationRepository,MessageRepository,QualificationAnswerRepository,LeadScoreRepository,OfferedSlotRepository} from "../application/ports.js";
+import type {LeadRepository,AppointmentRepository,BookingAttemptRepository,ConversationRepository,MessageRepository,QualificationAnswerRepository,LeadScoreRepository,OfferedSlotRepository,SlotOfferClaimRepository} from "../application/ports.js";
 import type {Lead,LeadDedupKey} from "../domain/lead.js";
 import type {Appointment} from "../domain/appointment.js";
-import type {BookingAttempt} from "../domain/booking-attempt.js";
+import type {BookingAttempt,BookingAttemptStatus} from "../domain/booking-attempt.js";
 import type {Conversation} from "../domain/conversation.js";
 import type {Message} from "../domain/message.js";
 import type {QualificationAnswer} from "../domain/qualification-answer.js";
 import type {LeadScoreRecord} from "../domain/lead-score-record.js";
 import type {OfferedSlot} from "../domain/offered-slot.js";
-import {SlotUnavailableError,DuplicateMessageError} from "../domain/errors.js";
+import type {SlotOfferClaim} from "../domain/slot-offer-claim.js";
+import {SlotUnavailableError,DuplicateMessageError,BookingAttemptKeyConflictError} from "../domain/errors.js";
 import {messageDedupKey} from "../domain/message-dedup-key.js";
 
 export class InMemoryLeadRepository implements LeadRepository{
@@ -37,8 +38,22 @@ export class InMemoryAppointmentRepository implements AppointmentRepository{
   }
   async findById(id:string){return this.data.get(id)??null;}
   async update(id:string,patch:Partial<Appointment>){const c=this.data.get(id);if(!c)throw new Error("APPOINTMENT_NOT_FOUND");const n={...c,...patch,id};this.data.set(id,n);return n;}
+  async findActiveByLeadId(leadId:string):Promise<Appointment|null>{
+    // Map iteration order is insertion order, so the last match is the most recently created --
+    // no separate createdAt field needed on the domain type for this in-memory implementation.
+    const matches=[...this.data.values()].filter(a=>a.leadId===leadId&&a.status==="BOOKED");
+    return matches.length>0?matches[matches.length-1]:null;
+  }
 }
 
+/**
+ * Mirrors SupabaseBookingAttemptRepository's ownership contract exactly (same errors, same
+ * claimTransition compare-and-set semantics) so tests exercise the same behavior the real
+ * repository provides. Every method here runs with no `await` before its Map mutation, so two
+ * "concurrent" calls issued via Promise.all() never interleave mid-check -- each completes
+ * atomically before the next one's body runs, the same mutual-exclusion guarantee Postgres row
+ * locking gives claimTransition's WHERE clause in production.
+ */
 export class InMemoryBookingAttemptRepository implements BookingAttemptRepository{
   private data=new Map<string,BookingAttempt>();
   private byKey=new Map<string,string>();
@@ -46,9 +61,10 @@ export class InMemoryBookingAttemptRepository implements BookingAttemptRepositor
     const id=this.byKey.get(idempotencyKey);
     return id?this.data.get(id)??null:null;
   }
-  async create(input:Omit<BookingAttempt,"id"|"createdAt">){
-    if(this.byKey.has(input.idempotencyKey)) throw new Error("IDEMPOTENCY_KEY_ALREADY_EXISTS");
-    const attempt={...input,id:randomUUID(),createdAt:new Date()};
+  async create(input:Omit<BookingAttempt,"id"|"createdAt"|"updatedAt">){
+    if(this.byKey.has(input.idempotencyKey)) throw new BookingAttemptKeyConflictError(input.idempotencyKey);
+    const now=new Date();
+    const attempt={...input,id:randomUUID(),createdAt:now,updatedAt:now};
     this.data.set(attempt.id,attempt);
     this.byKey.set(input.idempotencyKey,attempt.id);
     return attempt;
@@ -56,9 +72,18 @@ export class InMemoryBookingAttemptRepository implements BookingAttemptRepositor
   async update(id:string,patch:Partial<BookingAttempt>){
     const c=this.data.get(id);
     if(!c)throw new Error("BOOKING_ATTEMPT_NOT_FOUND");
-    const n={...c,...patch,id};
+    const n={...c,...patch,id,updatedAt:new Date()};
     this.data.set(id,n);
     return n;
+  }
+  async claimTransition(id:string,expectedStatus:BookingAttemptStatus,nextStatus:BookingAttemptStatus,options?:{updatedBefore:Date}){
+    const current=this.data.get(id);
+    if(!current) return null;
+    if(current.status!==expectedStatus) return null;
+    if(options?.updatedBefore && !(current.updatedAt<options.updatedBefore)) return null;
+    const claimed={...current,status:nextStatus,updatedAt:new Date()};
+    this.data.set(id,claimed);
+    return claimed;
   }
 }
 
@@ -132,21 +157,113 @@ export class InMemoryLeadScoreRepository implements LeadScoreRepository{
 
 export class InMemoryOfferedSlotRepository implements OfferedSlotRepository{
   private data=new Map<string,OfferedSlot>();
+  // Mirrors migration 010's `unique (round_id, position)` constraint, so tests exercise the same
+  // "duplicate position within a round is rejected" behavior the real database enforces.
+  private roundPositionKeys=new Set<string>();
+
   async create(input:Omit<OfferedSlot,"id"|"createdAt">){
+    const key=`${input.roundId}:${input.position}`;
+    if(this.roundPositionKeys.has(key)) throw new Error(`OFFERED_SLOT_DUPLICATE_ROUND_POSITION: ${key}`);
     const s={...input,id:randomUUID(),createdAt:new Date()};
     this.data.set(s.id,s);
+    this.roundPositionKeys.add(key);
     return s;
   }
+
+  /**
+   * All rows or none -- mirrors a single multi-row Postgres INSERT's atomicity. Validates the
+   * ENTIRE batch (including (roundId, position) duplicates, both against already-persisted rows
+   * and within the batch itself) before writing anything; only then commits every row.
+   */
+  async createMany(inputs:Array<Omit<OfferedSlot,"id"|"createdAt">>):Promise<OfferedSlot[]>{
+    const keys=inputs.map((input)=>`${input.roundId}:${input.position}`);
+    const seenInBatch=new Set<string>();
+    for(const key of keys){
+      if(this.roundPositionKeys.has(key)||seenInBatch.has(key)){
+        throw new Error(`OFFERED_SLOT_DUPLICATE_ROUND_POSITION: ${key}`);
+      }
+      seenInBatch.add(key);
+    }
+    const now=new Date();
+    const rows=inputs.map((input)=>({...input,id:randomUUID(),createdAt:now}));
+    for(let i=0;i<rows.length;i++){
+      this.data.set(rows[i].id,rows[i]);
+      this.roundPositionKeys.add(keys[i]);
+    }
+    return rows;
+  }
+
   async listActiveByConversationId(conversationId:string,now:Date){
     return [...this.data.values()]
       .filter(s=>s.conversationId===conversationId&&!s.selected&&s.expiresAt>now)
       .sort((a,b)=>a.position-b.position);
   }
+
+  async listRoundIdsByConversationId(conversationId:string):Promise<string[]>{
+    const ids=new Set<string>();
+    for(const s of this.data.values()){
+      if(s.conversationId===conversationId) ids.add(s.roundId);
+    }
+    return [...ids];
+  }
+
   async update(id:string,patch:Partial<OfferedSlot>){
     const c=this.data.get(id);
     if(!c)throw new Error("OFFERED_SLOT_NOT_FOUND");
     const n={...c,...patch,id};
     this.data.set(id,n);
     return n;
+  }
+}
+
+/**
+ * Shared backing state for InMemorySlotOfferClaimRepository -- exists as its own object
+ * (separate from the repository class) so tests simulating "two app instances hitting the same
+ * Postgres table" can construct two InMemorySlotOfferClaimRepository wrappers around ONE shared
+ * store, rather than two independent in-memory tables that would trivially never conflict. A
+ * repository built with no store argument gets its own private one (the normal single-instance
+ * case, same convention as every other InMemory* repository in this file).
+ */
+export class InMemorySlotOfferClaimStore {
+  data=new Map<string,SlotOfferClaim>();
+}
+
+/**
+ * Mirrors SupabaseSlotOfferClaimRepository's exact contract: tryCreate/tryReclaim never throw
+ * for "lost the race" (return null), release never throws for "no longer the owner" (return
+ * false). Every method runs with no `await` before its Map mutation -- same reasoning as
+ * InMemoryBookingAttemptRepository -- so concurrent calls issued via Promise.all() never
+ * interleave mid-check.
+ */
+export class InMemorySlotOfferClaimRepository implements SlotOfferClaimRepository{
+  constructor(private readonly store:InMemorySlotOfferClaimStore=new InMemorySlotOfferClaimStore()){}
+
+  async tryCreate(input:{conversationId:string;ownerToken:string;intendedRoundId:string}):Promise<SlotOfferClaim|null>{
+    if(this.store.data.has(input.conversationId)) return null;
+    const now=new Date();
+    const claim:SlotOfferClaim={conversationId:input.conversationId,ownerToken:input.ownerToken,intendedRoundId:input.intendedRoundId,claimedAt:now,updatedAt:now};
+    this.store.data.set(input.conversationId,claim);
+    return claim;
+  }
+
+  async findByConversationId(conversationId:string):Promise<SlotOfferClaim|null>{
+    return this.store.data.get(conversationId)??null;
+  }
+
+  async tryReclaim(params:{conversationId:string;expectedOwnerToken:string;newOwnerToken:string;intendedRoundId:string;staleBefore:Date;now:Date}):Promise<SlotOfferClaim|null>{
+    const current=this.store.data.get(params.conversationId);
+    if(!current) return null;
+    if(current.ownerToken!==params.expectedOwnerToken) return null;
+    if(!(current.updatedAt<params.staleBefore)) return null;
+    const reclaimed:SlotOfferClaim={conversationId:params.conversationId,ownerToken:params.newOwnerToken,intendedRoundId:params.intendedRoundId,claimedAt:params.now,updatedAt:params.now};
+    this.store.data.set(params.conversationId,reclaimed);
+    return reclaimed;
+  }
+
+  async release(conversationId:string,ownerToken:string):Promise<boolean>{
+    const current=this.store.data.get(conversationId);
+    if(!current||current.ownerToken!==ownerToken) return false;
+    this.store.data.delete(conversationId);
+    return true;
   }
 }

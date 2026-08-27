@@ -6,6 +6,7 @@ export interface OfferedSlotRow {
   id: string;
   conversation_id: string;
   lead_id: string;
+  round_id: string;
   slot_start: string;
   slot_end: string;
   position: number;
@@ -19,6 +20,7 @@ export function mapRowToOfferedSlot(row: OfferedSlotRow): OfferedSlot {
     id: row.id,
     conversationId: row.conversation_id,
     leadId: row.lead_id,
+    roundId: row.round_id,
     slotStart: new Date(row.slot_start),
     slotEnd: new Date(row.slot_end),
     position: row.position,
@@ -32,6 +34,7 @@ export function mapOfferedSlotToInsertRow(input: Omit<OfferedSlot, "id" | "creat
   return {
     conversation_id: input.conversationId,
     lead_id: input.leadId,
+    round_id: input.roundId,
     slot_start: input.slotStart.toISOString(),
     slot_end: input.slotEnd.toISOString(),
     position: input.position,
@@ -60,6 +63,21 @@ export class SupabaseOfferedSlotRepository implements OfferedSlotRepository {
     return mapRowToOfferedSlot(data as OfferedSlotRow);
   }
 
+  /**
+   * One multi-row INSERT statement -- never a loop of individual create() calls. Postgres runs a
+   * single statement as one implicit transaction: if any row violates a constraint (e.g. the
+   * migration 010 `unique (round_id, position)`), the entire statement rolls back and zero rows
+   * are persisted, matching InMemoryOfferedSlotRepository's simulated semantics.
+   */
+  async createMany(inputs: Array<Omit<OfferedSlot, "id" | "createdAt">>): Promise<OfferedSlot[]> {
+    const { data, error } = await this.client
+      .from("offered_slots")
+      .insert(inputs.map(mapOfferedSlotToInsertRow))
+      .select();
+    if (error) throw new Error(`SUPABASE_OFFERED_SLOT_CREATE_MANY_FAILED: ${error.message}`);
+    return (data as OfferedSlotRow[]).map(mapRowToOfferedSlot);
+  }
+
   async listActiveByConversationId(conversationId: string, now: Date): Promise<OfferedSlot[]> {
     const { data, error } = await this.client
       .from("offered_slots")
@@ -70,6 +88,22 @@ export class SupabaseOfferedSlotRepository implements OfferedSlotRepository {
       .order("position", { ascending: true });
     if (error) throw new Error(`SUPABASE_OFFERED_SLOT_LIST_FAILED: ${error.message}`);
     return (data as OfferedSlotRow[]).map(mapRowToOfferedSlot);
+  }
+
+  /**
+   * PostgREST has no clean way to express `COUNT(DISTINCT round_id)` through the supabase-js
+   * query builder without a custom RPC function -- `.select(..., {count:'exact'})` counts
+   * matching ROWS, not distinct values of a column. So this fetches round_id for every row
+   * belonging to the conversation and dedupes here, in application code. Correct (if it fetches
+   * a few more values than strictly needed) beats a plausible-looking but wrong pseudo-aggregate.
+   */
+  async listRoundIdsByConversationId(conversationId: string): Promise<string[]> {
+    const { data, error } = await this.client
+      .from("offered_slots")
+      .select("round_id")
+      .eq("conversation_id", conversationId);
+    if (error) throw new Error(`SUPABASE_OFFERED_SLOT_LIST_ROUNDS_FAILED: ${error.message}`);
+    return [...new Set((data as Array<{ round_id: string }>).map((row) => row.round_id))];
   }
 
   async update(id: string, patch: Partial<OfferedSlot>): Promise<OfferedSlot> {

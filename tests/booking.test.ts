@@ -156,3 +156,49 @@ describe("InMemoryAppointmentRepository double-booking guard", () => {
     expect(second.id).toBeTruthy();
   });
 });
+
+describe("InMemoryAppointmentRepository.findActiveByLeadId", () => {
+  it("A: a lead with no BOOKED appointment -> null", async () => {
+    const repo = new InMemoryAppointmentRepository();
+    expect(await repo.findActiveByLeadId("lead-none")).toBeNull();
+  });
+
+  it("B: a lead with a BOOKED appointment -> returns it", async () => {
+    const repo = new InMemoryAppointmentRepository();
+    const appt = await repo.create({
+      leadId: "lead-a", status: "BOOKED",
+      startsAt: new Date("2026-03-02T15:00:00.000Z"), endsAt: new Date("2026-03-02T15:30:00.000Z"),
+      timezone: "America/Mexico_City",
+    });
+    const found = await repo.findActiveByLeadId("lead-a");
+    expect(found?.id).toBe(appt.id);
+  });
+
+  it("C: a lead with multiple appointments -> returns the most recently created BOOKED one", async () => {
+    const repo = new InMemoryAppointmentRepository();
+    const older = await repo.create({
+      leadId: "lead-a", status: "BOOKED",
+      startsAt: new Date("2026-03-02T15:00:00.000Z"), endsAt: new Date("2026-03-02T15:30:00.000Z"),
+      timezone: "America/Mexico_City",
+    });
+    await repo.update(older.id, { status: "CANCELLED" });
+    const newer = await repo.create({
+      leadId: "lead-a", status: "BOOKED",
+      startsAt: new Date("2026-03-03T15:00:00.000Z"), endsAt: new Date("2026-03-03T15:30:00.000Z"),
+      timezone: "America/Mexico_City",
+    });
+    const found = await repo.findActiveByLeadId("lead-a");
+    expect(found?.id).toBe(newer.id);
+  });
+
+  it("D: a lead with only non-BOOKED appointments -> null", async () => {
+    const repo = new InMemoryAppointmentRepository();
+    const appt = await repo.create({
+      leadId: "lead-a", status: "BOOKED",
+      startsAt: new Date("2026-03-02T15:00:00.000Z"), endsAt: new Date("2026-03-02T15:30:00.000Z"),
+      timezone: "America/Mexico_City",
+    });
+    await repo.update(appt.id, { status: "CANCELLED" });
+    expect(await repo.findActiveByLeadId("lead-a")).toBeNull();
+  });
+});

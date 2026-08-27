@@ -5,7 +5,7 @@ import { config, hasGoogleCalendarCredentials, hasWhatsAppCredentials } from "./
 import {
   InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository,
   InMemoryLeadScoreRepository, InMemoryConversationRepository, InMemoryMessageRepository,
-  InMemoryQualificationAnswerRepository,
+  InMemoryQualificationAnswerRepository, InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
 } from "./infrastructure/memory-repositories.js";
 import { SupabaseLeadRepository } from "./infrastructure/supabase-lead-repository.js";
 import { SupabaseAppointmentRepository } from "./infrastructure/supabase-appointment-repository.js";
@@ -14,14 +14,18 @@ import { SupabaseLeadScoreRepository } from "./infrastructure/supabase-lead-scor
 import { SupabaseConversationRepository } from "./infrastructure/supabase-conversation-repository.js";
 import { SupabaseMessageRepository } from "./infrastructure/supabase-message-repository.js";
 import { SupabaseQualificationAnswerRepository } from "./infrastructure/supabase-qualification-answer-repository.js";
+import { SupabaseOfferedSlotRepository } from "./infrastructure/supabase-offered-slot-repository.js";
+import { SupabaseSlotOfferClaimRepository } from "./infrastructure/supabase-slot-offer-claim-repository.js";
 import { createSupabaseClient } from "./infrastructure/supabase-client.js";
 import { FakeCalendarProvider } from "./infrastructure/fake-calendar.js";
 import { GoogleCalendarProvider } from "./infrastructure/google-calendar-provider.js";
 import { FakeMessagingProvider } from "./infrastructure/fake-messaging-provider.js";
 import { MetaWhatsAppProvider } from "./infrastructure/meta-whatsapp-provider.js";
 import { LeadService, AppointmentService } from "./application/services.js";
+import { SlotOfferingService } from "./application/slot-offering-service.js";
 import { handleInboundWhatsAppText } from "./application/whatsapp-inbound-service.js";
 import { WhatsAppQualificationHandler } from "./application/whatsapp-qualification-handler.js";
+import { WhatsAppBookingHandler } from "./application/whatsapp-booking-handler.js";
 import { extractWhatsAppMessages } from "./domain/whatsapp-webhook-payload.js";
 import { verifyMetaSignature } from "./domain/meta-signature.js";
 import { timingSafeEqualStrings } from "./domain/timing-safe-compare.js";
@@ -31,7 +35,8 @@ import {
 } from "./domain/errors.js";
 import type {
   LeadRepository, AppointmentRepository, BookingAttemptRepository, LeadScoreRepository,
-  ConversationRepository, MessageRepository, QualificationAnswerRepository, CalendarProvider, MessagingProvider,
+  ConversationRepository, MessageRepository, QualificationAnswerRepository, OfferedSlotRepository,
+  SlotOfferClaimRepository, CalendarProvider, MessagingProvider,
 } from "./application/ports.js";
 
 declare module "fastify" {
@@ -48,6 +53,12 @@ export interface AppDependencies {
   conversationsRepo?: ConversationRepository;
   messagesRepo?: MessageRepository;
   qualificationAnswersRepo?: QualificationAnswerRepository;
+  /** Phase 3C: the offered_slots repository. Wired here so SlotOfferingService is constructible
+   * and injectable -- no route or handler consumes it yet in this block. */
+  offeredSlotsRepo?: OfferedSlotRepository;
+  /** Phase 3C concurrency hardening: protects SlotOfferingService's round-creation critical
+   * section against two concurrent callers for the same conversation (see migration 011). */
+  slotOfferClaimsRepo?: SlotOfferClaimRepository;
   calendar?: CalendarProvider;
   messaging?: MessagingProvider;
   /** Override for config.WHATSAPP_VERIFY_TOKEN -- exists so webhook verification is testable
@@ -66,6 +77,11 @@ export interface AppDependencies {
    * Phase 3B qualifier flow without setting a real env var. Production defaults to the config
    * value (itself defaulting to false). */
   qualificationEngineEnabled?: boolean;
+  /** Override for config.WHATSAPP_BOOKING_ENABLED -- same rationale and precedence as
+   * qualificationEngineEnabled above, kept as a fully independent flag. As of this block, no
+   * code reads this for anything beyond the boot-time log line: no booking handler exists yet,
+   * so this flag cannot change behavior no matter its value. */
+  whatsappBookingEnabled?: boolean;
 }
 
 export async function buildApp(overrides: AppDependencies = {}): Promise<FastifyInstance> {
@@ -99,11 +115,17 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   const conversationsRepo = overrides.conversationsRepo ?? (supabaseClient ? new SupabaseConversationRepository(supabaseClient) : new InMemoryConversationRepository());
   const messagesRepo = overrides.messagesRepo ?? (supabaseClient ? new SupabaseMessageRepository(supabaseClient) : new InMemoryMessageRepository());
   const qualificationAnswersRepo = overrides.qualificationAnswersRepo ?? (supabaseClient ? new SupabaseQualificationAnswerRepository(supabaseClient) : new InMemoryQualificationAnswerRepository());
+  const slotOfferClaimsRepo = overrides.slotOfferClaimsRepo ?? (supabaseClient ? new SupabaseSlotOfferClaimRepository(supabaseClient) : new InMemorySlotOfferClaimRepository());
+  const offeredSlotsRepo = overrides.offeredSlotsRepo ?? (supabaseClient ? new SupabaseOfferedSlotRepository(supabaseClient) : new InMemoryOfferedSlotRepository());
   const calendar = overrides.calendar ?? (hasGoogleCalendarCredentials ? new GoogleCalendarProvider() : new FakeCalendarProvider());
   const messaging = overrides.messaging ?? (hasWhatsAppCredentials ? new MetaWhatsAppProvider() : new FakeMessagingProvider());
 
   const leadService = new LeadService(leadsRepo, leadScoresRepo);
   const appointmentService = new AppointmentService(calendar, appointmentsRepo, bookingAttemptsRepo, leadsRepo, app.log);
+  // Always constructed -- cheap, stateless, and needed by both qualificationHandler (to offer
+  // slots right after QUALIFIED_A/B) and bookingHandler below, each gated independently by its
+  // own flag.
+  const slotOfferingService = new SlotOfferingService(calendar, offeredSlotsRepo, appointmentsRepo, leadsRepo, slotOfferClaimsRepo, app.log);
 
   // "fake" only when a test/dev caller explicitly passed a FakeMessagingProvider override --
   // NOT whenever the resolved `messaging` instance happens to be one, since the normal
@@ -118,6 +140,13 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // conditional branches are simply never taken. Enable with QUALIFICATION_ENGINE_ENABLED=true
   // in .env for a controlled test (see the Phase 3B report for the exact steps).
   const qualificationEngineEnabled = overrides.qualificationEngineEnabled ?? config.QUALIFICATION_ENGINE_ENABLED;
+
+  // Phase 3C feature flag. Deliberately independent of qualificationEngineEnabled: booking never
+  // replaces or bypasses qualification -- a lead only ever reaches BOOKING_PENDING by first
+  // completing qualification (QUALIFIED_A/B), so this flag alone can never activate booking
+  // behavior for a lead that hasn't gone through the qualifier.
+  const whatsappBookingEnabled = overrides.whatsappBookingEnabled ?? config.WHATSAPP_BOOKING_ENABLED;
+
   const qualificationHandler = qualificationEngineEnabled
     ? new WhatsAppQualificationHandler({
         leads: leadsRepo,
@@ -128,11 +157,34 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
         leadService,
         messaging,
         logger: app.log,
+        // Present only when booking is ALSO enabled -- with it undefined, applyOutcome's
+        // QUALIFICATION_COMPLETE branch behaves exactly as Phase 3B (message only, no offer).
+        slotOffering: whatsappBookingEnabled ? slotOfferingService : undefined,
       })
     : undefined;
-  if (qualificationEngineEnabled) {
-    app.log.info({ qualificationEngineEnabled }, "Phase 3B qualification engine is ENABLED for WhatsApp inbound");
-  }
+
+  // Phase 3C: only constructed when the flag is on. undefined keeps handleInboundWhatsAppText's
+  // new booking-routing branch (see whatsapp-inbound-service.ts) untaken -- Phase 3B/2 behavior
+  // is unchanged with this flag off, exactly like qualificationHandler above.
+  const bookingHandler = whatsappBookingEnabled
+    ? new WhatsAppBookingHandler(
+        {
+          leads: leadsRepo,
+          conversations: conversationsRepo,
+          appointments: appointmentsRepo,
+          offeredSlots: offeredSlotsRepo,
+          slotOffering: slotOfferingService,
+          appointmentService,
+          messaging,
+          messages: messagesRepo,
+          logger: app.log,
+        },
+        config.ADVISOR_TIMEZONE,
+      )
+    : undefined;
+
+  // Sanitized: both flags are plain booleans, never secrets/tokens/message bodies.
+  app.log.info({ qualificationEngineEnabled, whatsappBookingEnabled }, "Phase 3B/3C WhatsApp feature flags");
 
   // Sanitized boot-time fingerprint of the loaded WhatsApp config -- only the last 4 characters
   // of the Phone Number ID, never the token/secret. Node only reads .env once at process start,
@@ -211,7 +263,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
         continue;
       }
       await handleInboundWhatsAppText(
-        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler },
+        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler },
         message,
       );
     }

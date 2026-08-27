@@ -2,6 +2,7 @@ import { buildApp, type AppDependencies } from "../../src/app.js";
 import {
   InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository,
   InMemoryLeadScoreRepository, InMemoryConversationRepository, InMemoryMessageRepository,
+  InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
 } from "../../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../../src/infrastructure/fake-calendar.js";
 import { FakeMessagingProvider } from "../../src/infrastructure/fake-messaging-provider.js";
@@ -25,10 +26,19 @@ export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
     leadScoresRepo: new InMemoryLeadScoreRepository(),
     conversationsRepo: new InMemoryConversationRepository(),
     messagesRepo: new InMemoryMessageRepository(),
+    offeredSlotsRepo: new InMemoryOfferedSlotRepository(),
+    slotOfferClaimsRepo: new InMemorySlotOfferClaimRepository(),
     calendar: new FakeCalendarProvider(),
     messaging: new FakeMessagingProvider(),
     whatsappVerifyToken: TEST_WHATSAPP_VERIFY_TOKEN,
     metaAppSecret: TEST_META_APP_SECRET,
+    // Explicit false defaults, not left to buildApp()'s own config fallback: this repo's .env
+    // can (and during real Phase 3B/3C validation, does) set these to true. Every test must get
+    // a deterministic false unless it explicitly asks for true -- the exact bug this project hit
+    // once already with QUALIFICATION_ENGINE_ENABLED, now guarded here for both flags so no
+    // future test can reintroduce it by omission.
+    qualificationEngineEnabled: false,
+    whatsappBookingEnabled: false,
     ...overrides,
   });
 }

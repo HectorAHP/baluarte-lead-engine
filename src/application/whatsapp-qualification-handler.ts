@@ -17,7 +17,14 @@ import {
   type Urgency,
   type MonthlyCapacity,
 } from "../domain/qualification-scoring.js";
-import { QUALIFICATION_COMPLETE_AB_MESSAGE, NURTURE_C_MESSAGE, QUALIFIER_HUMAN_HANDOFF_MESSAGE } from "../domain/message-templates.js";
+import {
+  QUALIFICATION_COMPLETE_AB_MESSAGE, NURTURE_C_MESSAGE, QUALIFIER_HUMAN_HANDOFF_MESSAGE,
+  SLOT_OFFER_CLAIM_IN_PROGRESS_MESSAGE,
+} from "../domain/message-templates.js";
+import type { SlotOfferingService } from "./slot-offering-service.js";
+import { dispatchSlotOfferOutcome, escalateToHuman } from "./booking-outcome-dispatch.js";
+import { ActiveOfferInconsistentError, SlotOfferClaimInProgressError } from "../domain/errors.js";
+import { config } from "../config.js";
 
 export interface WhatsAppQualificationHandlerDeps {
   leads: LeadRepository;
@@ -28,6 +35,12 @@ export interface WhatsAppQualificationHandlerDeps {
   leadService: LeadService;
   messaging: MessagingProvider;
   logger: Logger;
+  /** Phase 3C: present only when WHATSAPP_BOOKING_ENABLED is true (see app.ts). When absent,
+   * applyOutcome's QUALIFICATION_COMPLETE branch behaves exactly as Phase 3B -- the completion
+   * message only, no offer attempted. Booking never activates on its own: a lead only ever
+   * reaches this branch by first completing qualification, so this dependency alone can never
+   * bypass qualification for a lead that hasn't gone through it. */
+  slotOffering?: SlotOfferingService;
 }
 
 /**
@@ -194,6 +207,51 @@ export class WhatsAppQualificationHandler implements QualificationTurnHandler {
 
         const message = updatedLead.scoreClass === "C" ? NURTURE_C_MESSAGE : QUALIFICATION_COMPLETE_AB_MESSAGE;
         await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, message);
+
+        // Phase 3C: only for a genuinely qualified A/B outcome (never NURTURE_C -- that's a
+        // nurture classification, not a booking-eligible one), and only when booking integration
+        // is enabled (this.deps.slotOffering present). Two separate outbound messages by design
+        // (never merged): the completion message above, then this offer as its own message.
+        if (updatedLead.scoreClass !== "C" && this.deps.slotOffering) {
+          const now = new Date();
+          try {
+            const offerOutcome = await this.deps.slotOffering.getOrCreateOffer({ lead: updatedLead, conversationId, now });
+            await dispatchSlotOfferOutcome(this.deps, offerOutcome, updatedLead, conversationId, whatsappUserId, config.ADVISOR_TIMEZONE);
+          } catch (err) {
+            if (err instanceof SlotOfferClaimInProgressError) {
+              // A concurrency signal, not a problem: another concurrent request is (or just was)
+              // legitimately creating this conversation's offer. The qualification outcome
+              // (score, scoreClass, updatedLead.status) computed above is ALREADY saved and is
+              // never reverted here -- this catch only decides what to do about the offer step
+              // that didn't complete. No HUMAN_HANDOFF, no forcing another round: the lead simply
+              // stays whatever applyQualificationScore already set it to (QUALIFIED_A/B -- this
+              // branch never reaches ensureBookingPending, so it is NOT moved to BOOKING_PENDING
+              // either). A later turn (once the lead reaches BOOKING_PENDING through some other
+              // path, or a future retry mechanism) can successfully create the offer once the
+              // winning request's claim is no longer in the way.
+              this.deps.logger.warn(
+                { leadId: lead.id, conversationId, errorName: err.name },
+                "Slot-offering claim in progress right after qualification completed -- qualification stays saved; asking the lead to retry shortly.",
+              );
+              await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, SLOT_OFFER_CLAIM_IN_PROGRESS_MESSAGE);
+              return;
+            }
+            if (err instanceof ActiveOfferInconsistentError) {
+              this.deps.logger.warn(
+                { leadId: lead.id, conversationId, errorName: err.name },
+                "Booking data-consistency error while offering slots right after qualification -- escalating to human handoff.",
+              );
+              await escalateToHuman(this.deps, updatedLead, conversationId, whatsappUserId);
+              return;
+            }
+            // Any other failure (DB error, etc.) here is NOT silently invented a recovery path
+            // for -- it propagates to runProcessingBoundary's existing catch-all (logs, never
+            // rethrown). Documented as an open risk in the Phase 3C block report: unlike a
+            // send-only failure (sendAndPersistReply already swallows those internally), a
+            // getOrCreateOffer failure here has no automatic retry trigger yet.
+            throw err;
+          }
+        }
         return;
       }
     }

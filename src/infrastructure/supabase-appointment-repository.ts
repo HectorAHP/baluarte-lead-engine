@@ -88,4 +88,17 @@ export class SupabaseAppointmentRepository implements AppointmentRepository {
     if (error) throw new Error(`SUPABASE_APPOINTMENT_UPDATE_FAILED: ${error.message}`);
     return mapRowToAppointment(data as AppointmentRow);
   }
+
+  async findActiveByLeadId(leadId: string): Promise<Appointment | null> {
+    const { data, error } = await this.client
+      .from("appointments")
+      .select()
+      .eq("lead_id", leadId)
+      .eq("status", "BOOKED")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw new Error(`SUPABASE_APPOINTMENT_FIND_ACTIVE_FAILED: ${error.message}`);
+    return data ? mapRowToAppointment(data as AppointmentRow) : null;
+  }
 }

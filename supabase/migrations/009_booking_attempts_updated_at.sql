@@ -1,0 +1,17 @@
+-- Phase 3C booking foundation: booking_attempts needs a mutable "last touched" timestamp for
+-- correct stale-PENDING detection. created_at is immutable (set once at INSERT) and does NOT
+-- reflect when a FAILED attempt was last reclaimed via claimTransition() -- using created_at
+-- alone for staleness would treat a just-reclaimed, actively-in-progress retry as "abandoned"
+-- again within seconds on any row that has ever been retried more than once, which could let a
+-- third concurrent request force it back to FAILED while the current owner is still mid-flight
+-- (a real double-Google-event risk). updated_at is written explicitly by
+-- BookingAttemptRepository on every state-changing operation (create, update, claimTransition)
+-- -- deliberately no trigger; see AppointmentService/BookingAttemptRepository for the single
+-- place this is set, kept visible and testable from application code rather than hidden in the
+-- database.
+--
+-- Backfill: `now()` is volatile, so Postgres computes it at ALTER TABLE execution time and
+-- writes that same value into every existing row's new column (a full rewrite of this small
+-- table, not a metadata-only change, but functionally correct and immediate). No existing
+-- column is touched or removed.
+alter table booking_attempts add column if not exists updated_at timestamptz not null default now();

@@ -19,6 +19,15 @@ export interface QualificationTurnHandler {
   handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string }): Promise<void>;
 }
 
+/**
+ * Phase 3C booking orchestrator, injected only when config.WHATSAPP_BOOKING_ENABLED is true (see
+ * app.ts). Kept as a narrow interface here (not an import of the concrete class) for the same
+ * decoupling reason as QualificationTurnHandler above -- WhatsAppBookingHandler implements this.
+ */
+export interface BookingTurnHandler {
+  handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
+}
+
 export interface InboundWhatsAppText {
   whatsappUserId: string;
   phoneRaw: string;
@@ -37,6 +46,10 @@ export interface WhatsAppInboundDeps {
   /** Present only when the Phase 3B feature flag is on. Absent (the default), behavior here is
    * byte-for-byte identical to Phase 2 -- welcome message only, no qualification routing. */
   qualificationHandler?: QualificationTurnHandler;
+  /** Present only when the Phase 3C feature flag (WHATSAPP_BOOKING_ENABLED) is on. Absent (the
+   * default), the BOOKING_PENDING routing branch below is never taken -- behavior is unchanged
+   * from Phase 3B. */
+  bookingHandler?: BookingTurnHandler;
 }
 
 export type WhatsAppInboundOutcome = "DUPLICATE" | "PROCESSED";
@@ -147,9 +160,23 @@ export async function handleInboundWhatsAppText(
         await deps.qualificationHandler.handleTurn({ lead: recoveredLead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text });
         return;
       }
-      // No qualifier configured (flag off), or an existing lead outside an active
-      // qualification round (e.g. already QUALIFIED_A/B/NURTURE_C, or a CONTACTED lead that
-      // still carries a product from a prior round): no automated reply, same as Phase 2.
+      // Phase 3C: a lead in BOOKING_PENDING is picking a slot, declining, or otherwise replying
+      // to the booking flow -- routed here, after every earlier guard (opt-out, medical-sensitive
+      // handoff, welcome/new-lead, QUALIFYING, CONTACTED recovery) has already had first chance
+      // to claim this inbound; none of those conditions can ever be true for a BOOKING_PENDING
+      // lead anyway, so this ordering is not load-bearing for correctness, only for readability.
+      // bookingHandler is present only when WHATSAPP_BOOKING_ENABLED is true (see app.ts) --
+      // absent, this branch is never taken and behavior is unchanged from Phase 3B. A lead
+      // already BOOKED never matches this condition, so it falls through to the no-reply
+      // fallback below, same as today -- no rebooking, no re-offering.
+      if (deps.bookingHandler && lead.status === "BOOKING_PENDING") {
+        await deps.bookingHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
+        return;
+      }
+      // No qualifier/booking handler configured (flags off), or an existing lead outside an
+      // active qualification/booking round (e.g. already QUALIFIED_A/B/NURTURE_C/BOOKED, or a
+      // CONTACTED lead that still carries a product from a prior round): no automated reply,
+      // same as Phase 2.
     },
     deps.logger,
     { leadId, conversationId },

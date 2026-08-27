@@ -27,6 +27,10 @@ const schema=z.object({
   // Deliberately NOT z.coerce.boolean(): that coerces the *string* "false" to `true` (any
   // non-empty string is truthy in JS), which would silently invert this flag's default.
   QUALIFICATION_ENGINE_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Phase 3C feature flag, independent of QUALIFICATION_ENGINE_ENABLED -- flipping this one
+  // alone must not change behavior until a Phase 3C booking handler actually exists to read it.
+  // Same safe-parsing rationale as above: never z.coerce.boolean().
+  WHATSAPP_BOOKING_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
 }).superRefine((cfg,ctx)=>{
   const googleFields=[cfg.GOOGLE_CLIENT_ID,cfg.GOOGLE_CLIENT_SECRET,cfg.GOOGLE_REFRESH_TOKEN];
   const setCount=googleFields.filter(Boolean).length;

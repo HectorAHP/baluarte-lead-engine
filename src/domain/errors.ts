@@ -33,6 +33,96 @@ export class IdempotencyConflictError extends Error {
   }
 }
 
+/**
+ * Thrown by BookingAttemptRepository.create() when a Postgres unique-violation (23505) on
+ * idempotency_key means another request already won the race to create this booking_attempts
+ * row. AppointmentService.book() is the one that decides what to do next (re-fetch and dispatch
+ * on the existing row's status) -- this error only reports what happened, deliberately not
+ * swallowed or silently converted to a generic error.
+ */
+export class BookingAttemptKeyConflictError extends Error {
+  constructor(public readonly idempotencyKey: string) {
+    super(`booking_attempts.idempotency_key ${idempotencyKey} was created concurrently by another request`);
+    this.name = "BookingAttemptKeyConflictError";
+  }
+}
+
+/**
+ * Thrown when a booking_attempts row is genuinely owned by another request right now (a fresh
+ * PENDING, or the loser of a claimTransition CAS). The caller never calls Google or creates an
+ * appointment in this case -- it's a "someone else is handling this, back off" signal, not an
+ * error condition to retry blindly.
+ */
+export class BookingInProgressError extends Error {
+  constructor(public readonly idempotencyKey: string) {
+    super(`A booking attempt for idempotency key ${idempotencyKey} is already in progress`);
+    this.name = "BookingInProgressError";
+  }
+}
+
+/**
+ * Thrown when a booking_attempts row is COMPLETED with an appointmentId that no longer resolves
+ * to a real appointment (data corruption / manual deletion, not a normal runtime condition).
+ * Deliberately never auto-recovered -- recreating an appointment or re-calling Google here could
+ * produce a duplicate; this needs human reconciliation.
+ */
+export class BookingAttemptInconsistentError extends Error {
+  constructor(public readonly bookingAttemptId: string) {
+    super(`booking_attempts ${bookingAttemptId} is COMPLETED but its appointment could not be found`);
+    this.name = "BookingAttemptInconsistentError";
+  }
+}
+
+/**
+ * Thrown by SlotOfferingService.getOrCreateOffer/replaceOffer when called for a lead whose
+ * current status is not eligible for slot offering (must be QUALIFIED_A, QUALIFIED_B, or
+ * BOOKING_PENDING). This is a caller precondition violation, not a normal business outcome --
+ * unlike ALREADY_BOOKED/NO_AVAILABILITY/MAX_ROUNDS_REACHED (modeled as SlotOfferOutcome values
+ * because a caller must handle them as expected, non-exceptional branches), a lead in
+ * HUMAN_HANDOFF/DO_NOT_CONTACT/NURTURE_C/BOOKED (or any earlier pre-qualification status) should
+ * never reach this service at all -- the caller already knows the lead's status from whatever
+ * triggered it.
+ */
+export class LeadNotOfferableError extends Error {
+  constructor(public readonly leadId: string, public readonly status: string) {
+    super(`Lead ${leadId} is not in an offerable status for slot offering (status=${status})`);
+    this.name = "LeadNotOfferableError";
+  }
+}
+
+/**
+ * Thrown by SlotOfferingService when listActiveByConversationId returns active offered_slots
+ * spanning more than one round_id for the same conversation -- a data-consistency violation that
+ * should never happen through this service's own successful code paths, but could arise if e.g.
+ * replaceOffer persisted a new round and then failed to expire the previous one (see
+ * replaceOffer's documented residual risk), or from direct manual data manipulation. Never
+ * silently picks one round and discards/ignores the other -- that risks presenting or booking
+ * against slots the caller no longer intends to be valid. Requires manual reconciliation
+ * (explicitly expiring the stale round) before offering can resume for this conversation.
+ */
+export class ActiveOfferInconsistentError extends Error {
+  constructor(public readonly conversationId: string, public readonly roundIds: string[]) {
+    super(`conversation ${conversationId} has active offered_slots spanning multiple rounds: ${roundIds.join(", ")}`);
+    this.name = "ActiveOfferInconsistentError";
+  }
+}
+
+/**
+ * Thrown by SlotOfferingService when a caller loses the race to create a new round AND the
+ * winner (a) hasn't finished within the bounded polling window and (b) still holds a genuinely
+ * fresh slot_offer_claims row -- i.e. someone else is legitimately working on it right now. This
+ * is a concurrency signal, never a data-consistency problem (contrast with
+ * ActiveOfferInconsistentError) -- the caller should treat it as a recoverable technical
+ * condition (the existing generic "unexpected error" handling in WhatsAppBookingHandler /
+ * WhatsAppQualificationHandler already does this correctly with no changes needed there).
+ */
+export class SlotOfferClaimInProgressError extends Error {
+  constructor(public readonly conversationId: string) {
+    super(`A slot-offering claim for conversation ${conversationId} is already in progress`);
+    this.name = "SlotOfferClaimInProgressError";
+  }
+}
+
 export class InvalidQualificationFieldError extends Error {
   constructor(public readonly vertical: string, public readonly fieldName: string) {
     super(`Field "${fieldName}" is not in the allowed qualification whitelist for ${vertical}`);

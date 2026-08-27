@@ -50,9 +50,10 @@ describe("InMemoryOfferedSlotRepository", () => {
   it("excludes expired and already-selected slots from listActiveByConversationId", async () => {
     const repo = new InMemoryOfferedSlotRepository();
     const now = new Date("2026-03-02T14:00:00.000Z");
-    const valid = await repo.create({ conversationId: "c1", leadId: "l1", slotStart: new Date(), slotEnd: new Date(), position: 1, expiresAt: new Date("2026-03-02T15:00:00.000Z"), selected: false });
-    await repo.create({ conversationId: "c1", leadId: "l1", slotStart: new Date(), slotEnd: new Date(), position: 2, expiresAt: new Date("2026-03-02T13:00:00.000Z"), selected: false });
-    const alreadySelected = await repo.create({ conversationId: "c1", leadId: "l1", slotStart: new Date(), slotEnd: new Date(), position: 3, expiresAt: new Date("2026-03-02T15:00:00.000Z"), selected: false });
+    const roundId = "11111111-1111-1111-1111-111111111111";
+    const valid = await repo.create({ conversationId: "c1", leadId: "l1", roundId, slotStart: new Date(), slotEnd: new Date(), position: 1, expiresAt: new Date("2026-03-02T15:00:00.000Z"), selected: false });
+    await repo.create({ conversationId: "c1", leadId: "l1", roundId, slotStart: new Date(), slotEnd: new Date(), position: 2, expiresAt: new Date("2026-03-02T13:00:00.000Z"), selected: false });
+    const alreadySelected = await repo.create({ conversationId: "c1", leadId: "l1", roundId, slotStart: new Date(), slotEnd: new Date(), position: 3, expiresAt: new Date("2026-03-02T15:00:00.000Z"), selected: false });
     await repo.update(alreadySelected.id, { selected: true });
 
     const active = await repo.listActiveByConversationId("c1", now);

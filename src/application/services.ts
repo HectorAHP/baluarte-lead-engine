@@ -7,7 +7,7 @@ import {scorePatrimonial,scoreGmm,LEGACY_MANUAL_SCORING_RULES_VERSION,type Patri
 import type {QualificationVertical} from "../domain/qualification-fields.js";
 import {assertTransition} from "../domain/state-machine.js";
 import {normalizePhoneToE164} from "../domain/phone.js";
-import {LeadNotFoundError,SlotUnavailableError,IdempotencyConflictError} from "../domain/errors.js";
+import {LeadNotFoundError,SlotUnavailableError,IdempotencyConflictError,BookingAttemptKeyConflictError,BookingInProgressError,BookingAttemptInconsistentError} from "../domain/errors.js";
 
 function targetStatusForScore(scoreClass:ScoreClass):LeadStatus{return scoreClass==="A"?"QUALIFIED_A":scoreClass==="B"?"QUALIFIED_B":"NURTURE_C";}
 
@@ -127,10 +127,23 @@ export class LeadService{
 
 export interface BookInput{leadId:string;title:string;description:string;start:Date;end:Date;attendeeEmail?:string;timezone:string;}
 
-function fingerprintBooking(input:BookInput):string{
+/** Exported for tests only, so ownership/concurrency tests can pre-seed a booking_attempts row
+ * with a fingerprint that matches what book() itself would compute for a given input. */
+export function fingerprintBooking(input:BookInput):string{
   const payload=JSON.stringify({leadId:input.leadId,title:input.title,description:input.description,start:input.start.toISOString(),end:input.end.toISOString(),attendeeEmail:input.attendeeEmail??null});
   return createHash("sha256").update(payload).digest("hex");
 }
+
+/**
+ * How long a PENDING booking_attempts row can sit untouched before it's treated as abandoned
+ * (the owning process died before reaching COMPLETED or FAILED) rather than genuinely in
+ * progress. A full completeBooking cycle (Google freebusy/insert + Supabase insert) normally
+ * finishes in low single-digit seconds; 2 minutes is a generous multiple of that to rule out
+ * ordinary latency/GC pauses as false positives, while staying far shorter than an offered
+ * slot's own validity window (so stale-booking recovery kicks in long before a user would need
+ * to wait for a whole new round of offered slots).
+ */
+export const PENDING_STALE_THRESHOLD_MS = 2 * 60 * 1000;
 
 export class AppointmentService{
   constructor(private readonly calendar:CalendarProvider,private readonly appointments:AppointmentRepository,private readonly bookingAttempts:BookingAttemptRepository,private readonly leads:LeadRepository,private readonly logger:Logger){}
@@ -140,23 +153,74 @@ export class AppointmentService{
   }
 
   /**
-   * Idempotent booking: the same Idempotency-Key + identical payload always returns the same
-   * appointment; the same key with a different payload is rejected. See docs/ARCHITECTURE.md
-   * for the full idempotency/double-booking design and its known limitations.
+   * Idempotent, ownership-safe booking. Only the request that WINS the right to move a
+   * booking_attempts row into (or create it as) PENDING ever calls Google/creates an
+   * appointment -- every other concurrent caller for the same idempotency key is turned away
+   * with a typed error before touching either. See docs/ARCHITECTURE.md for the full
+   * idempotency/double-booking design.
+   *
+   * Ownership is established one of two ways:
+   *  - create() wins outright (brand-new key): the creator owns it, full stop.
+   *  - create() loses to a concurrent creator (BookingAttemptKeyConflictError, Postgres 23505 on
+   *    idempotency_key): re-fetch and fall through to the same existing-row handling below.
+   *  - an existing row is COMPLETED: return its appointment idempotently, or flag inconsistency.
+   *  - an existing row is PENDING and fresh (updatedAt within PENDING_STALE_THRESHOLD_MS):
+   *    someone else is genuinely working on it right now -- BookingInProgressError.
+   *  - an existing row is PENDING and stale: reclaim it via a two-step compare-and-set
+   *    (PENDING -> FAILED -> PENDING). Two-step, not a direct "PENDING -> PENDING", because a
+   *    CAS only serializes concurrent callers when the WHERE-matched value actually changes --
+   *    two concurrent `WHERE status='PENDING'` updates would otherwise both succeed. Losing
+   *    either step means someone else already reclaimed it -- BookingInProgressError.
+   *  - an existing row is FAILED: reclaim via the same FAILED -> PENDING compare-and-set the
+   *    stale-PENDING path's second step already uses. Losing it -- BookingInProgressError.
    */
   async book(input:BookInput,idempotencyKey:string):Promise<Appointment>{
     const fingerprint=fingerprintBooking(input);
-    const existing=await this.bookingAttempts.findByKey(idempotencyKey);
-    if(existing){
-      if(existing.requestFingerprint!==fingerprint) throw new IdempotencyConflictError(idempotencyKey);
-      if(existing.status==="COMPLETED"&&existing.appointmentId){
+    let existing=await this.bookingAttempts.findByKey(idempotencyKey);
+
+    if(!existing){
+      try{
+        const attempt=await this.bookingAttempts.create({leadId:input.leadId,idempotencyKey,requestFingerprint:fingerprint,status:"PENDING"});
+        return this.completeBooking(attempt,input); // won outright -- sole owner, no further check needed
+      }catch(err){
+        if(!(err instanceof BookingAttemptKeyConflictError)) throw err;
+        existing=await this.bookingAttempts.findByKey(idempotencyKey);
+        if(!existing) throw err; // shouldn't happen; never hang the caller on a phantom conflict
+      }
+    }
+
+    if(existing.requestFingerprint!==fingerprint) throw new IdempotencyConflictError(idempotencyKey);
+    return this.claimExistingAttempt(existing,input);
+  }
+
+  private async claimExistingAttempt(existing:BookingAttempt,input:BookInput):Promise<Appointment>{
+    if(existing.status==="COMPLETED"){
+      if(existing.appointmentId){
         const appt=await this.appointments.findById(existing.appointmentId);
         if(appt) return appt;
       }
-      return this.completeBooking(existing,input);
+      // COMPLETED with no resolvable appointment is data corruption, not a retryable condition --
+      // recreating the appointment or re-calling Google here could produce a duplicate. This
+      // needs human reconciliation, never a silent automatic retry.
+      throw new BookingAttemptInconsistentError(existing.id);
     }
-    const attempt=await this.bookingAttempts.create({leadId:input.leadId,idempotencyKey,requestFingerprint:fingerprint,status:"PENDING"});
-    return this.completeBooking(attempt,input);
+
+    if(existing.status==="PENDING"){
+      const staleCutoff=new Date(Date.now()-PENDING_STALE_THRESHOLD_MS);
+      if(existing.updatedAt>staleCutoff){
+        throw new BookingInProgressError(existing.idempotencyKey); // genuinely fresh -- someone else owns it
+      }
+      const forcedFailed=await this.bookingAttempts.claimTransition(existing.id,"PENDING","FAILED",{updatedBefore:staleCutoff});
+      if(!forcedFailed) throw new BookingInProgressError(existing.idempotencyKey); // lost step 1
+      const claimed=await this.bookingAttempts.claimTransition(forcedFailed.id,"FAILED","PENDING");
+      if(!claimed) throw new BookingInProgressError(existing.idempotencyKey); // lost step 2
+      return this.completeBooking(claimed,input);
+    }
+
+    // FAILED
+    const claimed=await this.bookingAttempts.claimTransition(existing.id,"FAILED","PENDING");
+    if(!claimed) throw new BookingInProgressError(existing.idempotencyKey);
+    return this.completeBooking(claimed,input);
   }
 
   private async completeBooking(attempt:BookingAttempt,input:BookInput):Promise<Appointment>{
