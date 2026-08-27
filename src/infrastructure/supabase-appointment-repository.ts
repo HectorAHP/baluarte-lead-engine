@@ -15,6 +15,7 @@ export interface AppointmentRow {
   calendar_event_id: string | null;
   meeting_provider: string | null;
   meeting_url: string | null;
+  rescheduled_from: string | null;
 }
 
 export function mapRowToAppointment(row: AppointmentRow): Appointment {
@@ -28,6 +29,7 @@ export function mapRowToAppointment(row: AppointmentRow): Appointment {
     calendarEventId: row.calendar_event_id ?? undefined,
     meetingProvider: (row.meeting_provider as Appointment["meetingProvider"]) ?? undefined,
     meetingUrl: row.meeting_url ?? undefined,
+    rescheduledFrom: row.rescheduled_from ?? undefined,
   };
 }
 
@@ -41,6 +43,7 @@ export function mapAppointmentToInsertRow(input: Omit<Appointment, "id">) {
     calendar_event_id: input.calendarEventId ?? null,
     meeting_provider: input.meetingProvider ?? null,
     meeting_url: input.meetingUrl ?? null,
+    rescheduled_from: input.rescheduledFrom ?? null,
   };
 }
 
@@ -53,6 +56,7 @@ export function mapAppointmentPatchToRow(patch: Partial<Appointment>): Record<st
   if (patch.calendarEventId !== undefined) row.calendar_event_id = patch.calendarEventId;
   if (patch.meetingProvider !== undefined) row.meeting_provider = patch.meetingProvider;
   if (patch.meetingUrl !== undefined) row.meeting_url = patch.meetingUrl;
+  if (patch.rescheduledFrom !== undefined) row.rescheduled_from = patch.rescheduledFrom;
   return row;
 }
 

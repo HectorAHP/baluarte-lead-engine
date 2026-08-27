@@ -1,5 +1,5 @@
 import {randomUUID} from "node:crypto";
-import type {LeadRepository,AppointmentRepository,BookingAttemptRepository,ConversationRepository,MessageRepository,QualificationAnswerRepository,LeadScoreRepository,OfferedSlotRepository,SlotOfferClaimRepository,LeadStatusHistoryRepository,AppointmentStatusHistoryRepository,AppointmentMessageDeliveryRepository,AppointmentCancellationRepository} from "../application/ports.js";
+import type {LeadRepository,AppointmentRepository,BookingAttemptRepository,ConversationRepository,MessageRepository,QualificationAnswerRepository,LeadScoreRepository,OfferedSlotRepository,SlotOfferClaimRepository,LeadStatusHistoryRepository,AppointmentStatusHistoryRepository,AppointmentMessageDeliveryRepository,AppointmentCancellationRepository,AppointmentRescheduleRepository} from "../application/ports.js";
 import type {Lead,LeadDedupKey} from "../domain/lead.js";
 import type {Appointment,AppointmentStatus} from "../domain/appointment.js";
 import type {BookingAttempt,BookingAttemptStatus} from "../domain/booking-attempt.js";
@@ -13,6 +13,7 @@ import type {LeadStatusHistoryEntry} from "../domain/lead-status-history.js";
 import type {AppointmentStatusHistoryEntry} from "../domain/appointment-status-history.js";
 import type {AppointmentMessageDelivery} from "../domain/appointment-message-delivery.js";
 import type {AppointmentCancellation} from "../domain/appointment-cancellation.js";
+import type {AppointmentReschedule} from "../domain/appointment-reschedule.js";
 import {SlotUnavailableError,DuplicateMessageError,BookingAttemptKeyConflictError} from "../domain/errors.js";
 import {messageDedupKey} from "../domain/message-dedup-key.js";
 
@@ -382,6 +383,40 @@ export class InMemoryAppointmentCancellationRepository implements AppointmentCan
   async update(id:string,patch:Partial<AppointmentCancellation>):Promise<AppointmentCancellation>{
     const c=this.data.get(id);
     if(!c)throw new Error("APPOINTMENT_CANCELLATION_NOT_FOUND");
+    const n={...c,...patch,id,updatedAt:new Date()};
+    this.data.set(id,n);
+    return n;
+  }
+}
+
+// -------------------------------------------------------------------------------------------
+// Phase 4C -- appointment reschedule (see docs/PHASE4-DESIGN.md, migration
+// 015_appointment_reschedules.sql).
+// -------------------------------------------------------------------------------------------
+
+/** Mirrors the real table's `unique (idempotency_key)` constraint, same pattern as
+ * InMemoryAppointmentCancellationRepository. */
+export class InMemoryAppointmentRescheduleRepository implements AppointmentRescheduleRepository{
+  private data=new Map<string,AppointmentReschedule>();
+  private byIdempotencyKey=new Map<string,string>();
+
+  async tryCreate(input:Omit<AppointmentReschedule,"id"|"createdAt"|"updatedAt"|"attemptCount"|"status"|"newAppointmentId">&{status?:AppointmentReschedule["status"]}):Promise<AppointmentReschedule|null>{
+    if(this.byIdempotencyKey.has(input.idempotencyKey)) return null;
+    const now=new Date();
+    const row:AppointmentReschedule={...input,status:input.status??"PENDING",attemptCount:0,id:randomUUID(),createdAt:now,updatedAt:now};
+    this.data.set(row.id,row);
+    this.byIdempotencyKey.set(input.idempotencyKey,row.id);
+    return row;
+  }
+
+  async findByIdempotencyKey(idempotencyKey:string):Promise<AppointmentReschedule|null>{
+    const id=this.byIdempotencyKey.get(idempotencyKey);
+    return id?this.data.get(id)??null:null;
+  }
+
+  async update(id:string,patch:Partial<AppointmentReschedule>):Promise<AppointmentReschedule>{
+    const c=this.data.get(id);
+    if(!c)throw new Error("APPOINTMENT_RESCHEDULE_NOT_FOUND");
     const n={...c,...patch,id,updatedAt:new Date()};
     this.data.set(id,n);
     return n;

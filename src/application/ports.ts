@@ -1,4 +1,4 @@
-import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment, AppointmentStatus } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js"; import type { LeadStatusHistoryEntry } from "../domain/lead-status-history.js"; import type { AppointmentStatusHistoryEntry } from "../domain/appointment-status-history.js"; import type { AppointmentMessageDelivery } from "../domain/appointment-message-delivery.js"; import type { AppointmentCancellation } from "../domain/appointment-cancellation.js";
+import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment, AppointmentStatus } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js"; import type { LeadStatusHistoryEntry } from "../domain/lead-status-history.js"; import type { AppointmentStatusHistoryEntry } from "../domain/appointment-status-history.js"; import type { AppointmentMessageDelivery } from "../domain/appointment-message-delivery.js"; import type { AppointmentCancellation } from "../domain/appointment-cancellation.js"; import type { AppointmentReschedule } from "../domain/appointment-reschedule.js";
 export interface LeadRepository { create(input:Omit<Lead,"id"|"createdAt"|"updatedAt">):Promise<Lead>; findById(id:string):Promise<Lead|null>; update(id:string,patch:Partial<Lead>):Promise<Lead>; findByDedupKey(key:LeadDedupKey):Promise<Lead|null>; }
 export interface AppointmentRepository {
   create(input:Omit<Appointment,"id">):Promise<Appointment>;
@@ -139,6 +139,19 @@ export interface AppointmentCancellationRepository {
   tryCreate(input: Omit<AppointmentCancellation, "id" | "createdAt" | "updatedAt" | "attemptCount" | "status"> & { status?: AppointmentCancellation["status"] }): Promise<AppointmentCancellation | null>;
   findByIdempotencyKey(idempotencyKey: string): Promise<AppointmentCancellation | null>;
   update(id: string, patch: Partial<AppointmentCancellation>): Promise<AppointmentCancellation>;
+}
+
+// Phase 4C -- appointment reschedule (see docs/PHASE4-DESIGN.md, migration
+// 015_appointment_reschedules.sql). Guards "create the new appointment" ownership (Phase A, via
+// idempotencyKey uniqueness) AND tracks old-Calendar-event cleanup (Phase B) in one row -- see
+// domain/appointment-reschedule.ts's doc comment for why this is one table, not a reuse of
+// appointment_cancellations or booking_attempts.
+export interface AppointmentRescheduleRepository {
+  /** Wins outright (INSERT succeeds) or returns null on an idempotency_key conflict -- never
+   * throws for the "already tracked" case, same convention as every other tryCreate here. */
+  tryCreate(input: Omit<AppointmentReschedule, "id" | "createdAt" | "updatedAt" | "attemptCount" | "status" | "newAppointmentId"> & { status?: AppointmentReschedule["status"] }): Promise<AppointmentReschedule | null>;
+  findByIdempotencyKey(idempotencyKey: string): Promise<AppointmentReschedule | null>;
+  update(id: string, patch: Partial<AppointmentReschedule>): Promise<AppointmentReschedule>;
 }
 
 export interface CalendarSlot{start:Date;end:Date;} export interface CalendarEventInput{title:string;description:string;start:Date;end:Date;attendeeEmail?:string;} export interface CalendarEventResult{eventId:string;meetingUrl?:string;}

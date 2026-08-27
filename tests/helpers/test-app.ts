@@ -4,6 +4,7 @@ import {
   InMemoryLeadScoreRepository, InMemoryConversationRepository, InMemoryMessageRepository,
   InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
   InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository, InMemoryAppointmentMessageDeliveryRepository,
+  InMemoryAppointmentCancellationRepository, InMemoryAppointmentRescheduleRepository,
 } from "../../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../../src/infrastructure/fake-calendar.js";
 import { FakeMessagingProvider } from "../../src/infrastructure/fake-messaging-provider.js";
@@ -34,6 +35,15 @@ export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
     leadStatusHistoryRepo: new InMemoryLeadStatusHistoryRepository(),
     appointmentStatusHistoryRepo: new InMemoryAppointmentStatusHistoryRepository(),
     appointmentMessageDeliveryRepo: new InMemoryAppointmentMessageDeliveryRepository(),
+    // Phase 4B/4C -- same "complete set, never a config-driven default" rationale as every repo
+    // above. Their absence here was a real gap: buildApp() always constructs
+    // AppointmentCancellationService/AppointmentRescheduleService regardless of either feature
+    // flag, so with real SUPABASE_URL/SUPABASE_SECRET_KEY set in this repo's .env (which it is),
+    // omitting these would have silently pointed a cancellation/reschedule test's Calendar-cleanup
+    // bookkeeping at the REAL Supabase appointment_cancellations/appointment_reschedules tables --
+    // exactly the failure mode this helper's own doc comment exists to prevent.
+    appointmentCancellationsRepo: new InMemoryAppointmentCancellationRepository(),
+    appointmentReschedulesRepo: new InMemoryAppointmentRescheduleRepository(),
     calendar: new FakeCalendarProvider(),
     messaging: new FakeMessagingProvider(),
     whatsappVerifyToken: TEST_WHATSAPP_VERIFY_TOKEN,
@@ -45,6 +55,8 @@ export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
     // future test can reintroduce it by omission.
     qualificationEngineEnabled: false,
     whatsappBookingEnabled: false,
+    whatsappCancellationEnabled: false,
+    whatsappRescheduleEnabled: false,
     ...overrides,
   });
 }

@@ -20,7 +20,13 @@ const transitions: Record<LeadStatus, readonly LeadStatus[]> = {
   // CANCEL_PENDING.
   BOOKED:["CONFIRMED","RESCHEDULE_REQUESTED","CANCEL_PENDING","NO_SHOW","MEETING_COMPLETED","HUMAN_HANDOFF","DO_NOT_CONTACT"],
   CONFIRMED:["RESCHEDULE_REQUESTED","CANCEL_PENDING","NO_SHOW","MEETING_COMPLETED","HUMAN_HANDOFF","DO_NOT_CONTACT"],
-  RESCHEDULE_REQUESTED:["BOOKED","HUMAN_HANDOFF","DO_NOT_CONTACT"],
+  // Phase 4C addition: RESCHEDULE_REQUESTED -> CANCEL_PENDING. A lead mid-reschedule (offered new
+  // slots, hasn't picked one yet) can type a cancellation-intent message instead of a slot
+  // selection -- WhatsAppRescheduleHandler detects this and hands off into the SAME
+  // confirm/decline CANCEL_PENDING flow WhatsAppCancellationHandler already owns for BOOKED (see
+  // docs/PHASE4-DESIGN.md and the Phase 4C report, item 13), rather than a second, parallel
+  // cancellation UX. RESCHEDULE_REQUESTED -> BOOKED/HUMAN_HANDOFF/DO_NOT_CONTACT already existed.
+  RESCHEDULE_REQUESTED:["BOOKED","CANCEL_PENDING","HUMAN_HANDOFF","DO_NOT_CONTACT"],
   // Phase 4A new states. CANCEL_PENDING always resolves to either CANCELLED (lead confirms) or
   // back to BOOKED (lead declines, or an ambiguous/timed-out reply -- never auto-cancels on an
   // ambiguous answer). CANCELLED can return to BOOKING_PENDING later (a cancelled lead may come

@@ -7,7 +7,7 @@ import {
   InMemoryLeadScoreRepository, InMemoryConversationRepository, InMemoryMessageRepository,
   InMemoryQualificationAnswerRepository, InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
   InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository, InMemoryAppointmentMessageDeliveryRepository,
-  InMemoryAppointmentCancellationRepository,
+  InMemoryAppointmentCancellationRepository, InMemoryAppointmentRescheduleRepository,
 } from "./infrastructure/memory-repositories.js";
 import { SupabaseLeadRepository } from "./infrastructure/supabase-lead-repository.js";
 import { SupabaseAppointmentRepository } from "./infrastructure/supabase-appointment-repository.js";
@@ -22,6 +22,7 @@ import { SupabaseLeadStatusHistoryRepository } from "./infrastructure/supabase-l
 import { SupabaseAppointmentStatusHistoryRepository } from "./infrastructure/supabase-appointment-status-history-repository.js";
 import { SupabaseAppointmentMessageDeliveryRepository } from "./infrastructure/supabase-appointment-message-delivery-repository.js";
 import { SupabaseAppointmentCancellationRepository } from "./infrastructure/supabase-appointment-cancellation-repository.js";
+import { SupabaseAppointmentRescheduleRepository } from "./infrastructure/supabase-appointment-reschedule-repository.js";
 import { createSupabaseClient } from "./infrastructure/supabase-client.js";
 import { FakeCalendarProvider } from "./infrastructure/fake-calendar.js";
 import { GoogleCalendarProvider } from "./infrastructure/google-calendar-provider.js";
@@ -30,10 +31,12 @@ import { MetaWhatsAppProvider } from "./infrastructure/meta-whatsapp-provider.js
 import { LeadService, AppointmentService } from "./application/services.js";
 import { SlotOfferingService } from "./application/slot-offering-service.js";
 import { AppointmentCancellationService } from "./application/appointment-cancellation-service.js";
+import { AppointmentRescheduleService } from "./application/appointment-reschedule-service.js";
 import { handleInboundWhatsAppText } from "./application/whatsapp-inbound-service.js";
 import { WhatsAppQualificationHandler } from "./application/whatsapp-qualification-handler.js";
 import { WhatsAppBookingHandler } from "./application/whatsapp-booking-handler.js";
 import { WhatsAppCancellationHandler } from "./application/whatsapp-cancellation-handler.js";
+import { WhatsAppRescheduleHandler } from "./application/whatsapp-reschedule-handler.js";
 import { extractWhatsAppMessages } from "./domain/whatsapp-webhook-payload.js";
 import { verifyMetaSignature } from "./domain/meta-signature.js";
 import { timingSafeEqualStrings } from "./domain/timing-safe-compare.js";
@@ -46,7 +49,7 @@ import type {
   ConversationRepository, MessageRepository, QualificationAnswerRepository, OfferedSlotRepository,
   SlotOfferClaimRepository, CalendarProvider, MessagingProvider,
   LeadStatusHistoryRepository, AppointmentStatusHistoryRepository, AppointmentMessageDeliveryRepository,
-  AppointmentCancellationRepository,
+  AppointmentCancellationRepository, AppointmentRescheduleRepository,
 } from "./application/ports.js";
 
 declare module "fastify" {
@@ -85,6 +88,11 @@ export interface AppDependencies {
    * AppointmentCancellationService (always constructed) regardless of whether
    * WHATSAPP_CANCELLATION_ENABLED is on -- only the WhatsApp-facing handler is gated by the flag. */
   appointmentCancellationsRepo?: AppointmentCancellationRepository;
+  /** Phase 4C: tracks new-appointment-creation ownership AND old-Calendar-cleanup completion for
+   * a reschedule. Consumed by AppointmentRescheduleService (always constructed) regardless of
+   * whether WHATSAPP_RESCHEDULE_ENABLED is on -- only the WhatsApp-facing handler is gated by the
+   * flag, same convention as appointmentCancellationsRepo above. */
+  appointmentReschedulesRepo?: AppointmentRescheduleRepository;
   calendar?: CalendarProvider;
   messaging?: MessagingProvider;
   /** Override for config.WHATSAPP_VERIFY_TOKEN -- exists so webhook verification is testable
@@ -111,6 +119,9 @@ export interface AppDependencies {
   /** Override for config.WHATSAPP_CANCELLATION_ENABLED -- same rationale and precedence as
    * whatsappBookingEnabled above, kept fully independent. */
   whatsappCancellationEnabled?: boolean;
+  /** Override for config.WHATSAPP_RESCHEDULE_ENABLED -- same rationale and precedence as
+   * whatsappCancellationEnabled above, kept fully independent. */
+  whatsappRescheduleEnabled?: boolean;
 }
 
 export async function buildApp(overrides: AppDependencies = {}): Promise<FastifyInstance> {
@@ -156,6 +167,8 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // Phase 4B: appointment_status_history now HAS a real consumer (AppointmentCancellationService
   // below) -- the earlier "unused in 4A" placeholder no longer applies to this one.
   const appointmentCancellationsRepo = overrides.appointmentCancellationsRepo ?? (supabaseClient ? new SupabaseAppointmentCancellationRepository(supabaseClient) : new InMemoryAppointmentCancellationRepository());
+  // Phase 4C: same "always constructed, only the WhatsApp-facing handler is flag-gated" pattern.
+  const appointmentReschedulesRepo = overrides.appointmentReschedulesRepo ?? (supabaseClient ? new SupabaseAppointmentRescheduleRepository(supabaseClient) : new InMemoryAppointmentRescheduleRepository());
   const calendar = overrides.calendar ?? (hasGoogleCalendarCredentials ? new GoogleCalendarProvider() : new FakeCalendarProvider());
   const messaging = overrides.messaging ?? (hasWhatsAppCredentials ? new MetaWhatsAppProvider() : new FakeMessagingProvider());
 
@@ -168,6 +181,10 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // Phase 4B: always constructed -- cheap, stateless, same rationale as slotOfferingService above.
   // Only the WhatsApp-facing cancellationHandler below is gated by the feature flag.
   const cancellationService = new AppointmentCancellationService(calendar, appointmentsRepo, appointmentCancellationsRepo, appointmentStatusHistoryRepo, app.log);
+  // Phase 4C: always constructed -- cheap, stateless, same rationale as cancellationService above.
+  // Depends on cancellationService itself (reused wholesale for the double-booking-race rollback
+  // path -- see AppointmentRescheduleService's class doc comment).
+  const rescheduleService = new AppointmentRescheduleService(calendar, appointmentsRepo, appointmentReschedulesRepo, appointmentStatusHistoryRepo, cancellationService, app.log);
 
   // "fake" only when a test/dev caller explicitly passed a FakeMessagingProvider override --
   // NOT whenever the resolved `messaging` instance happens to be one, since the normal
@@ -193,6 +210,11 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // a lead already BOOKED/CANCEL_PENDING, a status a lead can only reach via the booking flow --
   // this flag alone can never let a pre-booking lead skip ahead into cancellation.
   const whatsappCancellationEnabled = overrides.whatsappCancellationEnabled ?? config.WHATSAPP_CANCELLATION_ENABLED;
+
+  // Phase 4C feature flag. Independent of the three flags above: reschedule only ever activates
+  // for a lead already BOOKED/RESCHEDULE_REQUESTED, statuses a lead can only reach via the
+  // booking flow -- this flag alone can never let a pre-booking lead skip ahead into reschedule.
+  const whatsappRescheduleEnabled = overrides.whatsappRescheduleEnabled ?? config.WHATSAPP_RESCHEDULE_ENABLED;
 
   const qualificationHandler = qualificationEngineEnabled
     ? new WhatsAppQualificationHandler({
@@ -251,8 +273,29 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
       )
     : undefined;
 
+  // Phase 4C: only constructed when the flag is on. undefined keeps handleInboundWhatsAppText's
+  // new RESCHEDULE_REQUESTED / BOOKED-reschedule-intent routing branches untaken -- Phase 4B
+  // behavior is unchanged with this flag off, exactly like cancellationHandler above.
+  const rescheduleHandler = whatsappRescheduleEnabled
+    ? new WhatsAppRescheduleHandler(
+        {
+          leads: leadsRepo,
+          conversations: conversationsRepo,
+          appointments: appointmentsRepo,
+          offeredSlots: offeredSlotsRepo,
+          slotOffering: slotOfferingService,
+          rescheduleService,
+          messaging,
+          messages: messagesRepo,
+          leadStatusHistory: leadStatusHistoryRepo,
+          logger: app.log,
+        },
+        config.ADVISOR_TIMEZONE,
+      )
+    : undefined;
+
   // Sanitized: all flags are plain booleans, never secrets/tokens/message bodies.
-  app.log.info({ qualificationEngineEnabled, whatsappBookingEnabled, whatsappCancellationEnabled }, "Phase 3B/3C/4B WhatsApp feature flags");
+  app.log.info({ qualificationEngineEnabled, whatsappBookingEnabled, whatsappCancellationEnabled, whatsappRescheduleEnabled }, "Phase 3B/3C/4B/4C WhatsApp feature flags");
 
   // Sanitized boot-time fingerprint of the loaded WhatsApp config -- only the last 4 characters
   // of the Phone Number ID, never the token/secret. Node only reads .env once at process start,
@@ -331,7 +374,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
         continue;
       }
       await handleInboundWhatsAppText(
-        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler },
+        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler },
         message,
       );
     }

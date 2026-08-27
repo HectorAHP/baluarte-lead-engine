@@ -169,3 +169,30 @@ export const CANCELLATION_CONFIRMED_MESSAGE =
  * change, the lead can simply try again. */
 export const CANCELLATION_TECHNICAL_ERROR_MESSAGE =
   "Tuve un problema técnico al procesar tu cancelación. Puedes intentarlo nuevamente en un momento.";
+
+// ---------------------------------------------------------------------------------------------
+// Phase 4C -- reschedule copy. Same deterministic, professional style as booking/cancellation.
+// ---------------------------------------------------------------------------------------------
+
+/** A. First turn: reschedule-intent detected while BOOKED. Reuses buildSlotOfferMessage (via
+ * dispatchSlotOfferOutcome) for the actual slot list -- this is only the lead-in line. */
+export const RESCHEDULE_INTRO_MESSAGE = "Claro, puedo ayudarte a cambiar tu cita.";
+
+/** B. Reschedule confirmed -- new appointment is BOOKED, old is durably RESCHEDULED. No invented
+ * URL -- same rule as buildBookingConfirmedMessage. */
+export function buildRescheduleConfirmedMessage(when: string, meetingUrl?: string): string {
+  if (meetingUrl) {
+    return `Listo, tu cita fue reagendada para el ${when}. Aquí está tu nuevo enlace: ${meetingUrl}`;
+  }
+  return `Listo, tu cita fue reagendada para el ${when}. Te compartiremos el enlace de la videollamada antes de la cita.`;
+}
+
+/** C. Recoverable technical/infra failure (Calendar or otherwise) while rescheduling -- no state
+ * change, the lead stays RESCHEDULE_REQUESTED and can simply try again. */
+export const RESCHEDULE_TECHNICAL_ERROR_MESSAGE =
+  "Estoy actualizando tu cita. Inténtalo nuevamente en unos segundos.";
+
+/** D. RescheduleInProgressError -- a concurrent/duplicate turn already owns this exact selection.
+ * Same "someone else is handling this, wait" semantics as BOOKING_IN_PROGRESS_MESSAGE. */
+export const RESCHEDULE_IN_PROGRESS_MESSAGE =
+  "Estoy actualizando tu cita. Inténtalo nuevamente en unos segundos.";

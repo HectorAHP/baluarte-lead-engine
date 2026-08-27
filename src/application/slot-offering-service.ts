@@ -80,6 +80,19 @@ export interface SlotOfferParams {
   lead: Lead;
   conversationId: string;
   now: Date;
+  /**
+   * Phase 4C: omitted (the default) is the exact, unchanged Phase 3C booking behavior --
+   * assertOfferable requires QUALIFIED_A/QUALIFIED_B/BOOKING_PENDING, an existing active
+   * appointment always short-circuits to ALREADY_BOOKED, and a successful round transitions the
+   * lead to BOOKING_PENDING. "RESCHEDULE" instead requires RESCHEDULE_REQUESTED, never treats the
+   * lead's still-active OLD appointment as a conflict (that's the expected precondition, not a
+   * problem -- WhatsAppRescheduleHandler validates it's exactly one BEFORE calling this), and
+   * never changes the lead's status (it's already RESCHEDULE_REQUESTED, set by the caller before
+   * this call -- see item 3 of the Phase 4C spec, "si ya existe RESCHEDULE_REQUESTED,
+   * reutilízalo"). Every other mechanic (claim/reclaim concurrency, round counting, TTL,
+   * createMany atomicity, assertSingleActiveRound) is fully shared, unmodified, between both modes.
+   */
+  mode?: "RESCHEDULE";
 }
 
 export interface SlotOfferingServiceOptions {
@@ -157,19 +170,25 @@ export class SlotOfferingService {
    * against MAX_OFFER_ROUNDS -- only an actual new round (Calendar query + createMany) does.
    */
   async getOrCreateOffer(params: SlotOfferParams): Promise<SlotOfferOutcome> {
-    const { lead, conversationId, now } = params;
-    this.assertOfferable(lead);
+    const { lead, conversationId, now, mode } = params;
+    this.assertOfferable(lead, mode);
 
-    const activeAppointment = await this.appointments.findActiveByLeadId(lead.id);
-    if (activeAppointment) return { type: "ALREADY_BOOKED", appointment: activeAppointment };
+    if (mode !== "RESCHEDULE") {
+      // RESCHEDULE mode: the lead's old appointment is expected to still be active at this point
+      // (it isn't superseded until AFTER a new slot is selected) -- never a conflict, so this
+      // guard simply does not apply. WhatsAppRescheduleHandler is the one that validates "exactly
+      // one active appointment" before ever calling here.
+      const activeAppointment = await this.appointments.findActiveByLeadId(lead.id);
+      if (activeAppointment) return { type: "ALREADY_BOOKED", appointment: activeAppointment };
+    }
 
     const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
-    if (activeSlots.length > 0) return this.resolveReused(lead, now, conversationId, activeSlots);
+    if (activeSlots.length > 0) return this.resolveReused(lead, now, conversationId, activeSlots, mode);
 
     const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId);
     if (roundIds.length >= MAX_OFFER_ROUNDS) return { type: "MAX_ROUNDS_REACHED" };
 
-    return this.claimAndCreateRound(lead, conversationId, now);
+    return this.claimAndCreateRound(lead, conversationId, now, mode);
   }
 
   /**
@@ -194,11 +213,13 @@ export class SlotOfferingService {
    * requires manually expiring one of the two rounds; no automated reconciliation exists yet.
    */
   async replaceOffer(params: SlotOfferParams): Promise<SlotOfferOutcome> {
-    const { lead, conversationId, now } = params;
-    this.assertOfferable(lead);
+    const { lead, conversationId, now, mode } = params;
+    this.assertOfferable(lead, mode);
 
-    const activeAppointment = await this.appointments.findActiveByLeadId(lead.id);
-    if (activeAppointment) return { type: "ALREADY_BOOKED", appointment: activeAppointment };
+    if (mode !== "RESCHEDULE") {
+      const activeAppointment = await this.appointments.findActiveByLeadId(lead.id);
+      if (activeAppointment) return { type: "ALREADY_BOOKED", appointment: activeAppointment };
+    }
 
     const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
     assertSingleActiveRound(conversationId, activeSlots); // refuse to replace an already-inconsistent offer
@@ -206,7 +227,7 @@ export class SlotOfferingService {
     const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId);
     if (roundIds.length >= MAX_OFFER_ROUNDS) return { type: "MAX_ROUNDS_REACHED" };
 
-    const availabilityResult = await this.claimAndCreateRound(lead, conversationId, now);
+    const availabilityResult = await this.claimAndCreateRound(lead, conversationId, now, mode);
     if (availabilityResult.type !== "CREATED") return availabilityResult; // NO_AVAILABILITY -- old round left untouched
 
     if (activeSlots.length > 0) {
@@ -218,23 +239,34 @@ export class SlotOfferingService {
     return availabilityResult;
   }
 
-  private assertOfferable(lead: Lead): void {
-    if (!OFFERABLE_LEAD_STATUSES.has(lead.status)) {
+  private assertOfferable(lead: Lead, mode?: "RESCHEDULE"): void {
+    const allowed = mode === "RESCHEDULE" ? lead.status === "RESCHEDULE_REQUESTED" : OFFERABLE_LEAD_STATUSES.has(lead.status);
+    if (!allowed) {
       throw new LeadNotOfferableError(lead.id, lead.status);
     }
   }
 
-  private async resolveReused(lead: Lead, now: Date, conversationId: string, activeSlots: OfferedSlot[]): Promise<SlotOfferOutcome> {
+  private async resolveReused(lead: Lead, now: Date, conversationId: string, activeSlots: OfferedSlot[], mode?: "RESCHEDULE"): Promise<SlotOfferOutcome> {
     assertSingleActiveRound(conversationId, activeSlots); // throws if data is inconsistent
-    const updatedLead = await this.ensureBookingPending(lead, now);
+    const updatedLead = await this.ensureOfferableLeadStatus(lead, now, mode);
     return { type: "REUSED", slots: activeSlots, lead: updatedLead };
   }
 
-  /** Set-once semantics for bookingStartedAt; a lead already BOOKING_PENDING is left untouched
-   * entirely (no write at all), so this is safe to call on every reuse. Phase 4A: records exactly
-   * one lead_status_history row for a real transition (never for the already-BOOKING_PENDING
-   * no-op above), via the same shared helper LeadService.transitionTo uses. */
-  private async ensureBookingPending(lead: Lead, now: Date): Promise<Lead> {
+  /**
+   * BOOKING mode (default): set-once semantics for bookingStartedAt; a lead already
+   * BOOKING_PENDING is left untouched entirely (no write at all), so this is safe to call on
+   * every reuse. Phase 4A: records exactly one lead_status_history row for a real transition
+   * (never for the already-BOOKING_PENDING no-op), via the same shared helper
+   * LeadService.transitionTo uses.
+   *
+   * RESCHEDULE mode: no-op, always -- the lead is already RESCHEDULE_REQUESTED by the time
+   * anything in this service is ever called for it (WhatsAppRescheduleHandler sets that
+   * transition itself, on detecting reschedule-intent, before calling getOrCreateOffer). There is
+   * no equivalent "offer started" event to record here; CANCELLATION_REQUESTED-shaped semantics
+   * don't apply to a status the lead already durably holds.
+   */
+  private async ensureOfferableLeadStatus(lead: Lead, now: Date, mode?: "RESCHEDULE"): Promise<Lead> {
+    if (mode === "RESCHEDULE") return lead;
     if (lead.status === "BOOKING_PENDING") return lead;
     assertTransition(lead.status, "BOOKING_PENDING");
     const updated = await this.leads.update(lead.id, {
@@ -255,14 +287,14 @@ export class SlotOfferingService {
    * ownerToken + intendedRoundId, then tries to win the claim outright. Losing means someone
    * else already holds it -- see waitOrReclaim for what happens next.
    */
-  private async claimAndCreateRound(lead: Lead, conversationId: string, now: Date): Promise<SlotOfferOutcome> {
+  private async claimAndCreateRound(lead: Lead, conversationId: string, now: Date, mode?: "RESCHEDULE"): Promise<SlotOfferOutcome> {
     const ownerToken = this.ownerTokenFactory();
     const intendedRoundId = this.roundIdFactory();
 
     const won = await this.slotOfferClaims.tryCreate({ conversationId, ownerToken, intendedRoundId });
-    if (won) return this.runClaimedWork(lead, conversationId, now, ownerToken, intendedRoundId);
+    if (won) return this.runClaimedWork(lead, conversationId, now, ownerToken, intendedRoundId, mode);
 
-    return this.waitOrReclaim(lead, conversationId, now, ownerToken, intendedRoundId);
+    return this.waitOrReclaim(lead, conversationId, now, ownerToken, intendedRoundId, mode);
   }
 
   /**
@@ -283,24 +315,25 @@ export class SlotOfferingService {
     now: Date,
     ownerToken: string,
     intendedRoundId: string,
+    mode?: "RESCHEDULE",
   ): Promise<SlotOfferOutcome> {
     const deadline = this.clock().getTime() + OFFER_CLAIM_POLL_BUDGET_MS;
     while (this.clock().getTime() < deadline) {
       const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
-      if (activeSlots.length > 0) return this.resolveReused(lead, now, conversationId, activeSlots);
+      if (activeSlots.length > 0) return this.resolveReused(lead, now, conversationId, activeSlots, mode);
       await this.sleepFn(OFFER_CLAIM_POLL_INTERVAL_MS);
     }
 
     // Poll budget exhausted -- one last check before deciding anything about the claim itself.
     const finalActiveSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
-    if (finalActiveSlots.length > 0) return this.resolveReused(lead, now, conversationId, finalActiveSlots);
+    if (finalActiveSlots.length > 0) return this.resolveReused(lead, now, conversationId, finalActiveSlots, mode);
 
     const existing = await this.slotOfferClaims.findByConversationId(conversationId);
     if (!existing) {
       // The claim was released (success or handled failure) without ever producing active
       // slots (e.g. NO_AVAILABILITY) -- free to try winning it ourselves now.
       const won = await this.slotOfferClaims.tryCreate({ conversationId, ownerToken, intendedRoundId });
-      if (won) return this.runClaimedWork(lead, conversationId, now, ownerToken, intendedRoundId);
+      if (won) return this.runClaimedWork(lead, conversationId, now, ownerToken, intendedRoundId, mode);
       throw new SlotOfferClaimInProgressError(conversationId); // someone else grabbed it again right as we tried
     }
 
@@ -313,7 +346,7 @@ export class SlotOfferingService {
     // the design: "creates round, dies before releasing"). Check once more before reclaiming so
     // a legitimately-finished round is never discarded in favor of an unnecessary reclaim.
     const preReclaimActiveSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
-    if (preReclaimActiveSlots.length > 0) return this.resolveReused(lead, now, conversationId, preReclaimActiveSlots);
+    if (preReclaimActiveSlots.length > 0) return this.resolveReused(lead, now, conversationId, preReclaimActiveSlots, mode);
 
     const newOwnerToken = this.ownerTokenFactory();
     const newIntendedRoundId = this.roundIdFactory();
@@ -327,16 +360,16 @@ export class SlotOfferingService {
     });
     if (!reclaimed) throw new SlotOfferClaimInProgressError(conversationId); // lost the reclaim race to another reclaimer
 
-    return this.runClaimedWork(lead, conversationId, now, newOwnerToken, newIntendedRoundId);
+    return this.runClaimedWork(lead, conversationId, now, newOwnerToken, newIntendedRoundId, mode);
   }
 
   /** Runs the actual Calendar-query + persist step under an already-won claim, then releases it
    * regardless of outcome (success, NO_AVAILABILITY, or a thrown error) -- best-effort; a failed
    * release just means OFFER_CLAIM_STALE_THRESHOLD_MS is the backstop instead of an immediate
    * retry, never a crash. */
-  private async runClaimedWork(lead: Lead, conversationId: string, now: Date, ownerToken: string, intendedRoundId: string): Promise<SlotOfferOutcome> {
+  private async runClaimedWork(lead: Lead, conversationId: string, now: Date, ownerToken: string, intendedRoundId: string, mode?: "RESCHEDULE"): Promise<SlotOfferOutcome> {
     try {
-      return await this.fetchAndPersistRound(lead, conversationId, now, intendedRoundId);
+      return await this.fetchAndPersistRound(lead, conversationId, now, intendedRoundId, mode);
     } finally {
       await this.slotOfferClaims.release(conversationId, ownerToken).catch((err) => {
         // Sanitized: conversationId + error name only -- never the ownerToken (an opaque
@@ -359,7 +392,7 @@ export class SlotOfferingService {
    * (claimAndCreateRound/waitOrReclaim) -- never generated here, so every offered_slots row this
    * method persists always matches its claim's intended_round_id exactly.
    */
-  private async fetchAndPersistRound(lead: Lead, conversationId: string, now: Date, roundId: string): Promise<SlotOfferOutcome> {
+  private async fetchAndPersistRound(lead: Lead, conversationId: string, now: Date, roundId: string, mode?: "RESCHEDULE"): Promise<SlotOfferOutcome> {
     const to = new Date(now.getTime() + config.BOOKING_MAX_DAYS_AHEAD * 86_400_000);
     const available = await this.calendar.getAvailableSlots(now, to, config.MEETING_DURATION_MINUTES);
     if (available.length === 0) return { type: "NO_AVAILABILITY" };
@@ -380,7 +413,7 @@ export class SlotOfferingService {
       })),
     );
 
-    const updatedLead = await this.ensureBookingPending(lead, now);
+    const updatedLead = await this.ensureOfferableLeadStatus(lead, now, mode);
     return { type: "CREATED", slots: persisted, lead: updatedLead };
   }
 }

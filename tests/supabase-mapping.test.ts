@@ -103,6 +103,7 @@ const appointmentRow: AppointmentRow = {
   calendar_event_id: "evt_1",
   meeting_provider: "GOOGLE_MEET",
   meeting_url: "https://meet.google.com/abc-defg-hij",
+  rescheduled_from: null,
 };
 
 describe("supabase appointment mapping", () => {

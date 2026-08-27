@@ -138,6 +138,39 @@ export class AppointmentCancellationInconsistentError extends Error {
   }
 }
 
+/**
+ * Thrown by AppointmentRescheduleService/WhatsAppRescheduleHandler when the source of truth
+ * (appointments table, never inferred from messages) doesn't match what a reschedule flow
+ * requires: no BOOKED appointment exists for the lead, more than one does (data-consistency
+ * violation, never silently picks one), or the old appointment is neither BOOKED nor already
+ * RESCHEDULED-by-this-exact-operation (e.g. it was CANCELLED by a concurrent request). Always
+ * escalates to HUMAN_HANDOFF -- never auto-retried, never silently ignored.
+ */
+export class AppointmentRescheduleInconsistentError extends Error {
+  constructor(public readonly leadId: string, public readonly reason: "NO_APPOINTMENT" | "MULTIPLE_APPOINTMENTS" | "UNEXPECTED_STATUS") {
+    super(`Appointment reschedule inconsistency for lead ${leadId}: ${reason}`);
+    this.name = "AppointmentRescheduleInconsistentError";
+  }
+}
+
+/**
+ * Thrown when a reschedule operation row (appointment_reschedules, keyed by
+ * `whatsapp-reschedule:{leadId}:{oldAppointmentId}:{offeredSlotId}`) is genuinely owned by another
+ * request right now -- the row exists but its new appointment hasn't been persisted yet. Mirrors
+ * BookingInProgressError's exact "someone else is handling this, back off" semantics. Deliberately
+ * has NO stale-reclaim path (contrast with AppointmentService.claimExistingAttempt): reclaiming an
+ * abandoned Phase A attempt safely would need its own compare-and-set state machine, and the
+ * failure mode without one is bounded and self-healing -- the specific offered_slots row this key
+ * is scoped to expires within OFFERED_SLOT_TTL_MS regardless, after which the lead's next
+ * reschedule attempt gets a fresh round and a fresh idempotency key. See the Phase 4C report.
+ */
+export class RescheduleInProgressError extends Error {
+  constructor(public readonly idempotencyKey: string) {
+    super(`A reschedule attempt for idempotency key ${idempotencyKey} is already in progress`);
+    this.name = "RescheduleInProgressError";
+  }
+}
+
 export class InvalidQualificationFieldError extends Error {
   constructor(public readonly vertical: string, public readonly fieldName: string) {
     super(`Field "${fieldName}" is not in the allowed qualification whitelist for ${vertical}`);

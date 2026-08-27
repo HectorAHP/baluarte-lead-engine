@@ -5,6 +5,7 @@ import { persistInboundMessage } from "./message-ingestion.js";
 import { runProcessingBoundary } from "./processing-boundary.js";
 import { normalizePhoneToE164 } from "../domain/phone.js";
 import { isOptOutMessage } from "../domain/opt-out-detection.js";
+import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { buildWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE } from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
 
@@ -37,6 +38,15 @@ export interface CancellationTurnHandler {
   handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
 }
 
+/**
+ * Phase 4C reschedule orchestrator, injected only when config.WHATSAPP_RESCHEDULE_ENABLED is
+ * true (see app.ts). Same decoupling reason as CancellationTurnHandler above --
+ * WhatsAppRescheduleHandler implements this.
+ */
+export interface RescheduleTurnHandler {
+  handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
+}
+
 export interface InboundWhatsAppText {
   whatsappUserId: string;
   phoneRaw: string;
@@ -63,6 +73,12 @@ export interface WhatsAppInboundDeps {
    * (the default), the BOOKED/CANCEL_PENDING routing branch below is never taken -- a BOOKED lead
    * falls through to the same "no automated reply" fallback as Phase 3C, unchanged. */
   cancellationHandler?: CancellationTurnHandler;
+  /** Present only when the Phase 4C feature flag (WHATSAPP_RESCHEDULE_ENABLED) is on. Absent (the
+   * default), the reschedule-intent check and the RESCHEDULE_REQUESTED routing branch below are
+   * never taken -- a BOOKED lead's free text is checked only against isCancellationRequest, and a
+   * RESCHEDULE_REQUESTED lead can only be reached via that flag anyway, exactly Phase 4B behavior,
+   * unchanged. */
+  rescheduleHandler?: RescheduleTurnHandler;
 }
 
 export type WhatsAppInboundOutcome = "DUPLICATE" | "PROCESSED";
@@ -186,6 +202,25 @@ export async function handleInboundWhatsAppText(
         await deps.bookingHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
+      // Phase 4C: a RESCHEDULE_REQUESTED lead is picking a new slot (or asking to cancel instead
+      // -- see WhatsAppRescheduleHandler, item 13). Only ever reachable via the BOOKED-turn branch
+      // just below, so rescheduleHandler being present here is a precondition, not a coincidence.
+      if (deps.rescheduleHandler && lead.status === "RESCHEDULE_REQUESTED") {
+        await deps.rescheduleHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
+        return;
+      }
+      // Phase 4C: a BOOKED lead's free text is checked for reschedule-intent BEFORE
+      // cancellation-intent -- one explicit, deterministic precedence decision here (mirroring
+      // how isOptOutMessage/sensitiveDetected are already decided directly in this file, not
+      // inside a handler), rather than leaving two independent keyword detectors free to race
+      // undefined on the same turn. rescheduleHandler is present only when
+      // WHATSAPP_RESCHEDULE_ENABLED is true (see app.ts) -- absent, isRescheduleRequest is never
+      // even evaluated and a BOOKED lead's text is checked only against isCancellationRequest
+      // below, byte-for-byte Phase 4B behavior.
+      if (deps.rescheduleHandler && lead.status === "BOOKED" && isRescheduleRequest(input.text)) {
+        await deps.rescheduleHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
+        return;
+      }
       // Phase 4B: a lead in BOOKED (interpreting a cancellation-intent message, or anything else
       // -- the handler itself no-ops on non-cancellation text) or CANCEL_PENDING (interpreting a
       // confirm/decline/ambiguous reply). cancellationHandler is present only when
@@ -196,10 +231,10 @@ export async function handleInboundWhatsAppText(
         await deps.cancellationHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
-      // No qualifier/booking/cancellation handler configured (flags off), or an existing lead
-      // outside an active qualification/booking/cancellation round (e.g. already
-      // QUALIFIED_A/B/NURTURE_C, or a CONTACTED lead that still carries a product from a prior
-      // round): no automated reply, same as Phase 2.
+      // No qualifier/booking/cancellation/reschedule handler configured (flags off), or an
+      // existing lead outside an active qualification/booking/cancellation/reschedule round (e.g.
+      // already QUALIFIED_A/B/NURTURE_C, or a CONTACTED lead that still carries a product from a
+      // prior round): no automated reply, same as Phase 2.
     },
     deps.logger,
     { leadId, conversationId },
