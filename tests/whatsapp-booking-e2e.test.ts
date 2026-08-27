@@ -361,6 +361,11 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     expect(calendar.createEventCalls).toBe(1); // the booking_attempts CAS foundation makes this safe
     const active = await repos.appointmentsRepo.findActiveByLeadId(lead.id);
     expect(active).toBeTruthy();
+    // No inconsistent/racy write on the lead either -- exactly one consistent meetingAt, matching
+    // the single appointment that actually won the race.
+    const reloadedLead = await repos.leadsRepo.findById(lead.id);
+    expect(reloadedLead?.meetingAt).toEqual(active?.startsAt);
+    expect(reloadedLead?.status).toBe("BOOKED");
   });
 
   it("K: the offer outbound fails after persistence -- BOOKING_PENDING and slots persist; the next inbound recovers", async () => {
@@ -429,6 +434,10 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     expect(afterFirst).toBeTruthy();
     const leadAfterFirst = await repos.leadsRepo.findById(lead.id);
     expect(leadAfterFirst?.status).toBe("BOOKED");
+    // The confirmation SEND failing (AlwaysFailingMessaging) never reverts what completeBooking
+    // already durably wrote -- bookedAt/meetingAt are set before the send is ever attempted.
+    expect(leadAfterFirst?.bookedAt).toBeInstanceOf(Date);
+    expect(leadAfterFirst?.meetingAt).toEqual(afterFirst?.startsAt);
 
     // A later inbound with a working provider -- appointment guard catches it immediately,
     // replies idempotently, never books again. Uses a stale BOOKING_PENDING lead snapshot to
@@ -446,6 +455,8 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
 
     const afterRetry = await repos.appointmentsRepo.findActiveByLeadId(lead.id);
     expect(afterRetry?.id).toBe(afterFirst?.id); // same appointment -- never a second one
+    const leadAfterRetry = await repos.leadsRepo.findById(lead.id);
+    expect(leadAfterRetry?.meetingAt).toEqual(afterFirst?.startsAt); // unchanged by the retry -- markLeadBooked's backfill guard is a no-op once already set
     expect(workingMessaging.sentTexts).toHaveLength(1);
     expect(workingMessaging.sentTexts[0].body).toContain("Ya tienes una cita agendada");
   });

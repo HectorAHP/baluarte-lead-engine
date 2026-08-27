@@ -85,6 +85,9 @@ export class InMemoryBookingAttemptRepository implements BookingAttemptRepositor
     this.data.set(id,claimed);
     return claimed;
   }
+  async listByLeadId(leadId:string){
+    return [...this.data.values()].filter(a=>a.leadId===leadId);
+  }
 }
 
 export class InMemoryConversationRepository implements ConversationRepository{

@@ -41,7 +41,7 @@ describe("lifecycle timestamps", () => {
     expect(qualified.qualifiedAt).toBeInstanceOf(Date);
   });
 
-  it("sets booked_at on the lead after a successful booking, and does NOT set meeting_at", async () => {
+  it("sets both booked_at and meeting_at (= appointment.startsAt) on the lead after a successful booking", async () => {
     const leads = new InMemoryLeadRepository();
     const leadService = new LeadService(leads, new InMemoryLeadScoreRepository());
     const lead = await leadService.createLead({ firstName: "Test", productVertical: "PATRIMONIAL" });
@@ -56,12 +56,13 @@ describe("lifecycle timestamps", () => {
       new FakeLogger(),
     );
 
-    await appointmentService.book(
+    const start = new Date("2026-03-02T15:00:00.000Z");
+    const appointment = await appointmentService.book(
       {
         leadId: lead.id,
         title: "Diagnostico",
         description: "test",
-        start: new Date("2026-03-02T15:00:00.000Z"),
+        start,
         end: new Date("2026-03-02T15:30:00.000Z"),
         timezone: "America/Mexico_City",
       },
@@ -70,6 +71,10 @@ describe("lifecycle timestamps", () => {
 
     const reloaded = await leads.findById(lead.id);
     expect(reloaded?.bookedAt).toBeInstanceOf(Date);
-    expect(reloaded?.meetingAt).toBeUndefined();
+    // Hardening fix: meeting_at used to stay NULL indefinitely (found via a real E2E) -- it is
+    // now synced from the appointment's own startsAt in the same completeBooking write that sets
+    // bookedAt (see AppointmentService.completeBooking).
+    expect(reloaded?.meetingAt).toEqual(appointment.startsAt);
+    expect(reloaded?.meetingAt).toEqual(start);
   });
 });

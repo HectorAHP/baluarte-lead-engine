@@ -21,6 +21,11 @@ export interface BookingAttemptRepository {
    * outcome, not an error.
    */
   claimTransition(id:string,expectedStatus:BookingAttemptStatus,nextStatus:BookingAttemptStatus,options?:{updatedBefore:Date}):Promise<BookingAttempt|null>;
+  /** Every booking_attempts row for this lead, in no particular guaranteed order. Not used by
+   * any booking/idempotency logic (that's all keyed by idempotencyKey) -- exists purely for
+   * read-only administrative tooling (see scripts/reset-test-lead.ts) that needs to preview/audit
+   * what exists for a lead before deleting it. */
+  listByLeadId(leadId:string):Promise<BookingAttempt[]>;
 }
 export interface ConversationRepository { create(input:Omit<Conversation,"id"|"createdAt"|"updatedAt">):Promise<Conversation>; findById(id:string):Promise<Conversation|null>; findActiveByLeadId(leadId:string):Promise<Conversation|null>; update(id:string,patch:Partial<Conversation>):Promise<Conversation>; }
 export interface MessageRepository { create(input:Omit<Message,"id"|"createdAt">):Promise<Message>; findByProviderMessageId(channel:Message["channel"],providerMessageId:string):Promise<Message|null>; listByConversationId(conversationId:string):Promise<Message[]>; }

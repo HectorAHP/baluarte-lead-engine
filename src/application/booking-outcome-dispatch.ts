@@ -1,5 +1,6 @@
 import type { LeadRepository, ConversationRepository, MessagingProvider, MessageRepository, Logger } from "./ports.js";
 import type { Lead, LeadStatus } from "../domain/lead.js";
+import type { Appointment } from "../domain/appointment.js";
 import { assertTransition } from "../domain/state-machine.js";
 import { sendAndPersistReply } from "./whatsapp-inbound-service.js";
 import type { SlotOfferOutcome } from "./slot-offering-service.js";
@@ -17,15 +18,32 @@ export interface BookingOutcomeDeps {
 }
 
 /**
- * Idempotent: a lead already BOOKED is left untouched (no write, no assertTransition call).
- * Shared by WhatsAppBookingHandler and WhatsAppQualificationHandler -- both can reach an
- * ALREADY_BOOKED SlotOfferOutcome (a defensive, "appointment already exists" branch of
- * SlotOfferingService) and must transition the lead the exact same way.
+ * Idempotent, self-healing confirmation step. Shared by WhatsAppBookingHandler (every "an
+ * appointment already/just exists" branch) and WhatsAppQualificationHandler's
+ * dispatchSlotOfferOutcome (ALREADY_BOOKED) -- both must reconcile the lead against the real
+ * appointment identically.
+ *
+ * status: set to BOOKED only if not already (no write, no assertTransition call, when it's
+ * already BOOKED -- matches the pre-existing idempotent contract).
+ *
+ * bookedAt / meetingAt: the PRIMARY write for a fresh, successful booking happens inside
+ * AppointmentService.completeBooking (bookedAt=now, meetingAt=appointment.startsAt), in the same
+ * domain-layer call that creates the appointment -- never duplicated here. This function only
+ * BACKFILLS either field when it's still missing on the lead passed in, which self-heals the
+ * exact drift a live appointment can be found to have (e.g. completeBooking's own best-effort
+ * leads.update failed after the appointment was already durably created -- see its TODO comment)
+ * without ever overwriting a value that's already correctly set.
  */
-export async function markLeadBooked(leads: LeadRepository, lead: Lead): Promise<Lead> {
-  if (lead.status === "BOOKED") return lead;
-  assertTransition(lead.status, "BOOKED");
-  return leads.update(lead.id, { status: "BOOKED" });
+export async function markLeadBooked(leads: LeadRepository, lead: Lead, appointment: Appointment): Promise<Lead> {
+  const patch: Partial<Lead> = {};
+  if (lead.status !== "BOOKED") {
+    assertTransition(lead.status, "BOOKED");
+    patch.status = "BOOKED";
+  }
+  if (!lead.bookedAt) patch.bookedAt = new Date();
+  if (!lead.meetingAt) patch.meetingAt = appointment.startsAt;
+  if (Object.keys(patch).length === 0) return lead; // fully idempotent no-op -- nothing missing to backfill
+  return leads.update(lead.id, patch);
 }
 
 /**
@@ -74,7 +92,7 @@ export async function dispatchSlotOfferOutcome(
       return;
     }
     case "ALREADY_BOOKED": {
-      await markLeadBooked(deps.leads, lead);
+      await markLeadBooked(deps.leads, lead, outcome.appointment);
       const when = formatSlotForDisplay(outcome.appointment.startsAt, advisorTimezone);
       await sendAndPersistReply(deps, lead.id, conversationId, whatsappUserId, buildExistingBookingMessage(when, outcome.appointment.meetingUrl));
       return;

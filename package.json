@@ -9,7 +9,8 @@
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "reset:test-lead": "tsx scripts/reset-test-lead.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",

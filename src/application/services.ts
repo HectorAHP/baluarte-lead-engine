@@ -255,17 +255,25 @@ export class AppointmentService{
 
     await this.bookingAttempts.update(attempt.id,{status:"COMPLETED",appointmentId:appointment.id});
     // The appointment row (just persisted above) is the source of truth for "is this lead
-    // booked" -- a failure updating this denormalized convenience timestamp on the lead must
-    // NOT roll back or invalidate an already-successful booking. But it must not be silently
+    // booked" -- a failure updating these denormalized convenience fields on the lead must NOT
+    // roll back or invalidate an already-successful booking. But it must not be silently
     // swallowed either: log a sanitized structured warning (leadId + appointmentId only, never
-    // the underlying error's raw payload) so the failure is observable.
-    // TODO(reconciliation): no background job exists yet to backfill leads.booked_at for
-    // appointments where this write failed. Until one exists, `select a.lead_id, a.id from
-    // appointments a join leads l on l.id = a.lead_id where l.booked_at is null` finds them.
-    await this.leads.update(input.leadId,{bookedAt:new Date()}).catch((err)=>{
+    // the underlying error's raw payload) so the failure is observable. meetingAt is set from
+    // appointment.startsAt (the persisted, authoritative value) in this SAME call, never a
+    // separate write -- this is the one place a successful book() ever sets it, so there is
+    // nothing here for an idempotent retry (claimExistingAttempt returns the existing appointment
+    // directly, never re-entering completeBooking) to duplicate or overwrite incorrectly.
+    // TODO(reconciliation): no background job exists yet to backfill leads.booked_at/meeting_at
+    // for appointments where this write failed. Until one exists, `select a.lead_id, a.id,
+    // a.starts_at from appointments a join leads l on l.id = a.lead_id where l.booked_at is null
+    // or l.meeting_at is null` finds them. WhatsAppBookingHandler's markLeadBooked
+    // (booking-outcome-dispatch.ts) also self-heals both fields defensively, backfilling whichever
+    // is still missing, whenever it later reconfirms an already-BOOKED lead against a real
+    // appointment (e.g. the "already booked" guard) -- see there.
+    await this.leads.update(input.leadId,{bookedAt:new Date(),meetingAt:appointment.startsAt}).catch((err)=>{
       this.logger.warn(
         {leadId:input.leadId,appointmentId:appointment.id,reason:err instanceof Error?err.message:"unknown"},
-        "Failed to record booked_at on lead after a successful appointment booking. The appointment is valid and unaffected; leads.booked_at is stale for this lead until reconciled.",
+        "Failed to record booked_at/meeting_at on lead after a successful appointment booking. The appointment is valid and unaffected; leads.booked_at/meeting_at are stale for this lead until reconciled.",
       );
     });
     return appointment;

@@ -119,4 +119,10 @@ export class SupabaseBookingAttemptRepository implements BookingAttemptRepositor
     if (error) throw new Error(`SUPABASE_BOOKING_ATTEMPT_CLAIM_FAILED: ${error.message}`);
     return data ? mapRowToBookingAttempt(data as BookingAttemptRow) : null;
   }
+
+  async listByLeadId(leadId: string): Promise<BookingAttempt[]> {
+    const { data, error } = await this.client.from("booking_attempts").select().eq("lead_id", leadId);
+    if (error) throw new Error(`SUPABASE_BOOKING_ATTEMPT_LIST_FAILED: ${error.message}`);
+    return (data as BookingAttemptRow[]).map(mapRowToBookingAttempt);
+  }
 }

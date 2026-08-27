@@ -202,3 +202,53 @@ describe("InMemoryAppointmentRepository.findActiveByLeadId", () => {
     expect(await repo.findActiveByLeadId("lead-a")).toBeNull();
   });
 });
+
+describe("AppointmentService.book -- meeting_at sync", () => {
+  it("sets both bookedAt and meetingAt (= appointment.startsAt) on a fresh successful booking", async () => {
+    const { service, leads } = makeService();
+    const lead = await leads.create({
+      country: "MX", productVertical: "PATRIMONIAL", status: "BOOKING_PENDING",
+      score: 80, assignedAdvisor: "Hector Herrera", consentContact: true,
+    });
+    const start = new Date("2026-03-02T15:00:00.000Z");
+    const end = new Date("2026-03-02T15:30:00.000Z");
+
+    const appointment = await service.book(
+      { leadId: lead.id, title: "Cita PPR", description: "Reunion inicial", start, end, attendeeEmail: "lead@example.com", timezone: "America/Mexico_City" },
+      randomUUID(),
+    );
+
+    const reloaded = await leads.findById(lead.id);
+    expect(reloaded?.bookedAt).toBeInstanceOf(Date);
+    expect(reloaded?.meetingAt).toEqual(appointment.startsAt);
+    expect(reloaded?.meetingAt).toEqual(start);
+  });
+
+  it("an idempotent retry (same idempotency key) returns the existing appointment without re-writing bookedAt/meetingAt", async () => {
+    const { service, leads } = makeService();
+    const lead = await leads.create({
+      country: "MX", productVertical: "PATRIMONIAL", status: "BOOKING_PENDING",
+      score: 80, assignedAdvisor: "Hector Herrera", consentContact: true,
+    });
+    const key = randomUUID();
+    const input = {
+      leadId: lead.id, title: "Cita PPR", description: "Reunion inicial",
+      start: new Date("2026-03-02T15:00:00.000Z"), end: new Date("2026-03-02T15:30:00.000Z"),
+      attendeeEmail: "lead@example.com", timezone: "America/Mexico_City",
+    };
+
+    const first = await service.book(input, key);
+    // Deliberately corrupt meetingAt after the first booking: if a retry ever re-touched this
+    // field, this corrupted value would get silently overwritten back to something plausible,
+    // hiding a real bug. Leaving it corrupted after the retry is exactly what proves the retry
+    // never wrote anything.
+    const sentinel = new Date("1999-01-01T00:00:00.000Z");
+    await leads.update(lead.id, { meetingAt: sentinel });
+
+    const second = await service.book(input, key);
+
+    expect(second.id).toBe(first.id); // same appointment, not a duplicate
+    const afterRetry = await leads.findById(lead.id);
+    expect(afterRetry?.meetingAt).toEqual(sentinel); // untouched -- claimExistingAttempt never re-enters completeBooking
+  });
+});

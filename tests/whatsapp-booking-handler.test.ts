@@ -210,10 +210,41 @@ describe("WhatsAppBookingHandler -- existing appointment / idempotency", () => {
 
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKED");
+    // Self-healing backfill (markLeadBooked): the lead had no bookedAt/meetingAt on file at all
+    // for this pre-existing appointment (it never went through completeBooking under THIS
+    // handler's watch) -- confirming both get backfilled from the real appointment here is the
+    // regression test for the exact production drift found in the first real E2E (meeting_at
+    // stayed NULL despite a valid, correctly-dated appointment).
+    expect(reloadedLead?.bookedAt).toBeInstanceOf(Date);
+    expect(reloadedLead?.meetingAt).toEqual(appt.startsAt);
     expect(calendar.calls).toBe(0);
     expect(messaging.sentTexts).toHaveLength(1);
     expect(messaging.sentTexts[0].body).toContain("Ya tienes una cita agendada");
     expect(messaging.sentTexts[0].body).toContain(appt.meetingUrl);
+  });
+
+  it("self-healing regression: an appointment exists but the lead's meetingAt/bookedAt are still NULL (e.g. completeBooking's own write failed earlier) -- backfilled without creating a second appointment", async () => {
+    const calendar = new CountingCalendarProvider(new FakeCalendarProvider());
+    const { handler, leads, conversations, appointments, messaging } = makeHandler({ calendar });
+    const { lead, conversation } = await makeLeadAndConversation(leads, conversations);
+    expect(lead.bookedAt).toBeUndefined();
+    expect(lead.meetingAt).toBeUndefined();
+    const appt = await appointments.create({
+      leadId: lead.id, status: "BOOKED",
+      startsAt: new Date("2026-03-05T16:00:00.000Z"), endsAt: new Date("2026-03-05T16:30:00.000Z"),
+      timezone: "America/Mexico_City", meetingUrl: "https://meet.google.com/self-heal",
+    });
+    const now = new Date("2026-03-02T12:00:00.000Z");
+
+    await handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "hola", now });
+
+    const reloadedLead = await leads.findById(lead.id);
+    expect(reloadedLead?.status).toBe("BOOKED");
+    expect(reloadedLead?.meetingAt).toEqual(appt.startsAt);
+    expect(reloadedLead?.bookedAt).toBeInstanceOf(Date);
+    expect(calendar.calls).toBe(0); // no Calendar call
+    const stillJustOne = await appointments.findActiveByLeadId(lead.id);
+    expect(stillJustOne?.id).toBe(appt.id); // never created a second appointment
   });
 
   it("O/P: a stale BOOKING_PENDING lead snapshot reprocessing the same selection never creates a second appointment or a second round", async () => {
