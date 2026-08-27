@@ -5,8 +5,10 @@
 -- leads.status and appointments.status are plain `text` columns with no CHECK constraint (see
 -- migrations 001/003) -- so the two new lead statuses Phase 4 needs (CANCEL_PENDING, CANCELLED)
 -- and the appointment statuses that already existed unused in the TypeScript AppointmentStatus
--- union (RESCHEDULED, CANCELLED, NO_SHOW, COMPLETED) require no ALTER TABLE at all. Nothing here
--- touches leads or appointments.
+-- union (RESCHEDULED, CANCELLED, NO_SHOW, COMPLETED) require no ALTER TABLE at all. No ALTER
+-- TABLE (and no new column, index, or constraint) touches leads or appointments anywhere below --
+-- the two consistency triggers further down READ appointments.lead_id to validate a row being
+-- inserted here, but never modify either table.
 
 -- Audits every real leads.status transition. Written from the single choke points that already
 -- perform every status-changing leads.update() call (LeadService.transitionTo,
@@ -51,6 +53,42 @@ create index if not exists appointment_status_history_appointment_id_created_at_
 -- appointments" in Phase 4A; add one if/when Phase 4B+ introduces that query.
 alter table appointment_status_history enable row level security;
 
+-- Consistency guard: appointment_id and lead_id are two INDEPENDENT foreign keys above, so
+-- nothing before this trigger stops a caller from inserting appointment_id=A with the lead_id of
+-- a DIFFERENT lead than A actually belongs to (a real, if currently dormant, risk -- no caller
+-- exists yet in Phase 4A, see recordAppointmentStatusTransition's doc comment, but Phase 4B/4C/4E
+-- will add the first ones). Enforced here via a trigger rather than a composite foreign key
+-- (`references appointments(id, lead_id)`) specifically so this fix never requires altering
+-- `appointments` itself (an extra `unique (id, lead_id)` there would be needed for a composite
+-- FK) -- this migration's own stated scope is additive-only, touching neither leads nor
+-- appointments. Cheapest possible time to close this gap: both tables are still empty and unused.
+create or replace function appointment_status_history_lead_id_consistency()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+declare
+  v_actual_lead_id uuid;
+begin
+  select lead_id into v_actual_lead_id from appointments where id = new.appointment_id;
+  if v_actual_lead_id is null then
+    raise exception 'appointment_status_history: no appointment with id %', new.appointment_id;
+  end if;
+  if v_actual_lead_id <> new.lead_id then
+    raise exception 'appointment_status_history: appointment % belongs to lead %, not %', new.appointment_id, v_actual_lead_id, new.lead_id;
+  end if;
+  return new;
+end;
+$$;
+
+-- OF appointment_id, lead_id: appointment_status_history is append-only from application code
+-- (its repository has no update() method at all) so UPDATE never fires this in practice -- scoped
+-- to those two columns anyway, for the same reason as appointment_message_deliveries below (only
+-- matters if a manual SQL UPDATE ever touches this table).
+create trigger appointment_status_history_lead_id_consistency_trigger
+  before insert or update of appointment_id, lead_id on appointment_status_history
+  for each row execute function appointment_status_history_lead_id_consistency();
+
 -- Common delivery-tracking table for every proactive outbound message Phase 4 will ever schedule
 -- against an appointment (24h/2h reminders, post-meeting follow-up, a future no-show nudge) --
 -- one generalized table by delivery_type instead of one table per message kind. Phase 4A creates
@@ -81,6 +119,37 @@ create table if not exists appointment_message_deliveries (
 create index if not exists appointment_message_deliveries_sweep_idx
   on appointment_message_deliveries(delivery_type, status, scheduled_for);
 alter table appointment_message_deliveries enable row level security;
+
+-- Same dual-independent-FK gap as appointment_status_history above, same fix, same rationale --
+-- appointment_id and lead_id must always describe the same real appointment/lead pair. No caller
+-- exists yet (Phase 4D/4E will add the first scheduler), so this closes the gap before it can
+-- ever be exercised incorrectly.
+create or replace function appointment_message_deliveries_lead_id_consistency()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+declare
+  v_actual_lead_id uuid;
+begin
+  select lead_id into v_actual_lead_id from appointments where id = new.appointment_id;
+  if v_actual_lead_id is null then
+    raise exception 'appointment_message_deliveries: no appointment with id %', new.appointment_id;
+  end if;
+  if v_actual_lead_id <> new.lead_id then
+    raise exception 'appointment_message_deliveries: appointment % belongs to lead %, not %', new.appointment_id, v_actual_lead_id, new.lead_id;
+  end if;
+  return new;
+end;
+$$;
+
+-- OF appointment_id, lead_id: the future scheduler's own status/attempt_count/completed_at
+-- updates (high-frequency once it exists) never touch these two columns, so scoping the trigger
+-- to only fire when they DO change avoids an unnecessary extra SELECT on every routine delivery
+-- status update.
+create trigger appointment_message_deliveries_lead_id_consistency_trigger
+  before insert or update of appointment_id, lead_id on appointment_message_deliveries
+  for each row execute function appointment_message_deliveries_lead_id_consistency();
 
 -- No RLS policies on any of the three tables above -- same convention as every existing table in
 -- this project (leads, appointments, offered_slots, slot_offer_claims, ...): access is exclusively
