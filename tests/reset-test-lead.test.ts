@@ -3,7 +3,7 @@ import {
   parseArgs, captureSnapshot, assertConversationBelongsToLead, runDryRun, runConfirmedReset,
   ResetTestLeadUsageError, ResetTestLeadValidationError,
   type ResetTestLeadDeps, type ResetTestLeadRpcCaller,
-} from "../scripts/reset-test-lead.js";
+} from "../scripts/reset-test-lead-lib.js";
 import {
   InMemoryLeadRepository, InMemoryConversationRepository, InMemoryQualificationAnswerRepository,
   InMemoryLeadScoreRepository, InMemoryOfferedSlotRepository, InMemoryAppointmentRepository,
