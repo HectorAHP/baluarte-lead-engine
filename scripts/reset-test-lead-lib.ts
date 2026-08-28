@@ -27,7 +27,7 @@
 import type {
   LeadRepository, ConversationRepository, QualificationAnswerRepository, LeadScoreRepository,
   OfferedSlotRepository, AppointmentRepository, BookingAttemptRepository, SlotOfferClaimRepository,
-  MessageRepository,
+  MessageRepository, AppointmentCancellationRepository, AppointmentRescheduleRepository,
 } from "../src/application/ports.js";
 import type { Lead } from "../src/domain/lead.js";
 import type { Conversation } from "../src/domain/conversation.js";
@@ -94,6 +94,31 @@ export interface ResetTestLeadDeps {
   bookingAttempts: BookingAttemptRepository;
   slotOfferClaims: SlotOfferClaimRepository;
   messages: MessageRepository;
+  appointmentCancellations: AppointmentCancellationRepository;
+  appointmentReschedules: AppointmentRescheduleRepository;
+}
+
+/** Every appointment for a lead, ANY status, broken down -- see
+ * AppointmentRepository.listAllByLeadId. Pre-launch hardening: this replaces the old
+ * "activeAppointment only" view, which silently missed Phase 4B/4C residue like an old
+ * RESCHEDULED row sitting alongside a new BOOKED one. */
+export interface AppointmentStatusBreakdown {
+  total: number;
+  booked: number;
+  rescheduled: number;
+  cancelled: number;
+  other: number;
+}
+
+function summarizeAppointmentsByStatus(appointments: Appointment[]): AppointmentStatusBreakdown {
+  let booked = 0, rescheduled = 0, cancelled = 0, other = 0;
+  for (const a of appointments) {
+    if (a.status === "BOOKED") booked++;
+    else if (a.status === "RESCHEDULED") rescheduled++;
+    else if (a.status === "CANCELLED") cancelled++;
+    else other++;
+  }
+  return { total: appointments.length, booked, rescheduled, cancelled, other };
 }
 
 export interface ResetTestLeadSnapshot {
@@ -107,13 +132,28 @@ export interface ResetTestLeadSnapshot {
    * currently-active count below is the closest accurate signal without inventing one. */
   offeredSlotsRoundCount: number;
   offeredSlotsActiveCount: number;
-  /** Only the lead's currently-BOOKED appointment, if any -- AppointmentRepository has no
-   * "list every historical row" method either. A stray CANCELLED appointment (rare in normal
-   * test usage) would not show here even though the RPC deletes it too. */
+  /** Every appointment for this lead, ANY status (see AppointmentRepository.listAllByLeadId) --
+   * this is what the RPC's own `delete from appointments where lead_id = ...` will remove, in
+   * full, regardless of status. */
+  appointments: Appointment[];
+  appointmentsByStatus: AppointmentStatusBreakdown;
+  /** Convenience accessor, unchanged in meaning from before this hardening pass: the lead's
+   * single currently-BOOKED appointment (most recently created, if more than one -- see
+   * AppointmentRepository.findActiveByLeadId's doc comment on the brief Phase 4C coexistence
+   * window). Kept alongside `appointments`/`appointmentsByStatus` above, which are now the
+   * authoritative full picture -- this field alone was previously the ONLY appointment visibility
+   * the dry-run had, which is exactly what let Phase 4B/4C residue go unnoticed. */
   activeAppointment: Appointment | null;
   bookingAttemptsCount: number;
   slotOfferClaim: SlotOfferClaim | null;
   messagesCount: number;
+  /** Phase 4C reschedule-operation rows for this lead -- see AppointmentRescheduleRepository.
+   * These are cascade-deleted (not directly, via appointment_reschedules.old_appointment_id/
+   * new_appointment_id `on delete cascade`) whenever the appointments they reference are deleted. */
+  appointmentReschedulesCount: number;
+  /** Phase 4B cancellation-operation rows for this lead -- see AppointmentCancellationRepository.
+   * Same cascade-deletion note as appointmentReschedulesCount above. */
+  appointmentCancellationsCount: number;
 }
 
 export async function captureSnapshot(
@@ -122,8 +162,11 @@ export async function captureSnapshot(
   conversationId: string,
   now: Date = new Date(),
 ): Promise<ResetTestLeadSnapshot> {
-  const [lead, conversation, qualificationAnswers, leadScores, offeredSlotsActive, offeredSlotsRounds, activeAppointment, bookingAttempts, slotOfferClaim, messages] =
-    await Promise.all([
+  const [
+    lead, conversation, qualificationAnswers, leadScores, offeredSlotsActive, offeredSlotsRounds,
+    activeAppointment, allAppointments, bookingAttempts, slotOfferClaim, messages,
+    appointmentReschedules, appointmentCancellations,
+  ] = await Promise.all([
       deps.leads.findById(leadId),
       deps.conversations.findById(conversationId),
       deps.qualificationAnswers.listByLeadId(leadId),
@@ -131,9 +174,12 @@ export async function captureSnapshot(
       deps.offeredSlots.listActiveByConversationId(conversationId, now),
       deps.offeredSlots.listRoundIdsByConversationId(conversationId),
       deps.appointments.findActiveByLeadId(leadId),
+      deps.appointments.listAllByLeadId(leadId),
       deps.bookingAttempts.listByLeadId(leadId),
       deps.slotOfferClaims.findByConversationId(conversationId),
       deps.messages.listByConversationId(conversationId),
+      deps.appointmentReschedules.listByLeadId(leadId),
+      deps.appointmentCancellations.listByLeadId(leadId),
     ]);
 
   return {
@@ -143,10 +189,14 @@ export async function captureSnapshot(
     leadScoresCount: leadScores.length,
     offeredSlotsRoundCount: offeredSlotsRounds.length,
     offeredSlotsActiveCount: offeredSlotsActive.length,
+    appointments: allAppointments,
+    appointmentsByStatus: summarizeAppointmentsByStatus(allAppointments),
     activeAppointment,
     bookingAttemptsCount: bookingAttempts.length,
     slotOfferClaim,
     messagesCount: messages.length,
+    appointmentReschedulesCount: appointmentReschedules.length,
+    appointmentCancellationsCount: appointmentCancellations.length,
   };
 }
 
@@ -165,6 +215,7 @@ export function assertConversationBelongsToLead(snapshot: ResetTestLeadSnapshot,
 export function formatSnapshot(snapshot: ResetTestLeadSnapshot): string {
   const lead = snapshot.lead;
   const conversation = snapshot.conversation;
+  const byStatus = snapshot.appointmentsByStatus;
   return [
     `  lead.status            = ${lead?.status ?? "(not found)"}`,
     `  lead.productInterest    = ${lead?.productInterest ?? "null"}`,
@@ -180,7 +231,10 @@ export function formatSnapshot(snapshot: ResetTestLeadSnapshot): string {
     `  qualification_answers   = ${snapshot.qualificationAnswersCount}`,
     `  lead_scores             = ${snapshot.leadScoresCount}`,
     `  offered_slots           = ${snapshot.offeredSlotsRoundCount} round(s), ${snapshot.offeredSlotsActiveCount} currently active`,
+    `  appointments total      = ${byStatus.total} (BOOKED = ${byStatus.booked}, RESCHEDULED = ${byStatus.rescheduled}, CANCELLED = ${byStatus.cancelled}, other = ${byStatus.other})`,
     `  appointments (active)   = ${snapshot.activeAppointment ? `1 (id ${snapshot.activeAppointment.id})` : "0"}`,
+    `  appointment_reschedules = ${snapshot.appointmentReschedulesCount}`,
+    `  appointment_cancellations = ${snapshot.appointmentCancellationsCount}`,
     `  booking_attempts        = ${snapshot.bookingAttemptsCount}`,
     `  slot_offer_claims       = ${snapshot.slotOfferClaim ? `1 (owner ${snapshot.slotOfferClaim.ownerToken})` : "0"}`,
     `  messages (preserved)    = ${snapshot.messagesCount}`,
@@ -190,6 +244,17 @@ export function formatSnapshot(snapshot: ResetTestLeadSnapshot): string {
 export interface ResetTestLeadRpcResult {
   leadId: string;
   conversationId: string;
+  /** Pre-launch hardening: the RPC (migration 016) now reports what it saw BEFORE deleting
+   * anything, mirroring ResetTestLeadSnapshot.appointmentsByStatus/appointmentReschedulesCount/
+   * appointmentCancellationsCount above -- so a completed reset's own return value is a
+   * self-sufficient audit record, not just the TypeScript-side "before" snapshot. */
+  appointmentsBeforeReset: AppointmentStatusBreakdown;
+  phase4OperationsBeforeReset: {
+    appointmentReschedules: number;
+    appointmentCancellations: number;
+    appointmentStatusHistory: number;
+    appointmentMessageDeliveries: number;
+  };
   deleted: {
     leadScores: number;
     qualificationAnswers: number;
@@ -197,6 +262,13 @@ export interface ResetTestLeadRpcResult {
     appointments: number;
     bookingAttempts: number;
     slotOfferClaims: number;
+    /** These four are never deleted by a direct DELETE statement -- they're removed by cascade
+     * off the `appointments` delete above (see migrations 013/014/015's `on delete cascade`
+     * FKs). Counted before the cascade happens, same values as phase4OperationsBeforeReset. */
+    appointmentReschedulesCascaded: number;
+    appointmentCancellationsCascaded: number;
+    appointmentStatusHistoryCascaded: number;
+    appointmentMessageDeliveriesCascaded: number;
   };
 }
 
@@ -251,6 +323,8 @@ export async function main(): Promise<void> {
   const { SupabaseBookingAttemptRepository } = await import("../src/infrastructure/supabase-booking-attempt-repository.js");
   const { SupabaseSlotOfferClaimRepository } = await import("../src/infrastructure/supabase-slot-offer-claim-repository.js");
   const { SupabaseMessageRepository } = await import("../src/infrastructure/supabase-message-repository.js");
+  const { SupabaseAppointmentCancellationRepository } = await import("../src/infrastructure/supabase-appointment-cancellation-repository.js");
+  const { SupabaseAppointmentRescheduleRepository } = await import("../src/infrastructure/supabase-appointment-reschedule-repository.js");
 
   const client = createSupabaseClient();
   const deps: ResetTestLeadDeps = {
@@ -263,6 +337,8 @@ export async function main(): Promise<void> {
     bookingAttempts: new SupabaseBookingAttemptRepository(client),
     slotOfferClaims: new SupabaseSlotOfferClaimRepository(client),
     messages: new SupabaseMessageRepository(client),
+    appointmentCancellations: new SupabaseAppointmentCancellationRepository(client),
+    appointmentReschedules: new SupabaseAppointmentRescheduleRepository(client),
   };
 
   console.log(`lead-id:         ${args.leadId}`);
@@ -274,10 +350,22 @@ export async function main(): Promise<void> {
     const snapshot = await runDryRun(deps, args.leadId, args.conversationId);
     console.log("Current state:");
     console.log(formatSnapshot(snapshot));
+    if (snapshot.appointmentsByStatus.total > 1 || snapshot.appointmentReschedulesCount > 0 || snapshot.appointmentCancellationsCount > 0) {
+      console.log("\n*** Phase 4B/4C residue detected on this lead (more than one appointment and/or");
+      console.log("*** appointment_reschedules/appointment_cancellations rows) -- see the breakdown above.");
+      console.log("*** If the currently-BOOKED appointment (if any) has a real Google Calendar event,");
+      console.log("*** decide what to do with that event BEFORE running --confirm: this tool never calls");
+      console.log("*** Calendar, so --confirm will delete the DB row but leave any live Calendar event");
+      console.log("*** orphaned.");
+    }
     console.log("\nWith --confirm, this tool would DELETE the qualification_answers, lead_scores,");
-    console.log("offered_slots, appointments, booking_attempts, and slot_offer_claims rows listed");
-    console.log("above (scoped to this lead/conversation only), reset the lead to CONTACTED with no");
-    console.log("product/score, and leave conversation.status = ACTIVE. messages are never touched.");
+    console.log("offered_slots, ALL appointments (any status) and their Phase 4B/4C operation rows");
+    console.log("(appointment_reschedules/appointment_cancellations, removed via cascade -- see");
+    console.log("migration 016), booking_attempts, and slot_offer_claims rows for this lead/conversation,");
+    console.log("reset the lead to CONTACTED with no product/score, and leave conversation.status =");
+    console.log("ACTIVE. messages and lead_status_history are never touched. This tool never calls");
+    console.log("Google Calendar -- any live Calendar event for a deleted appointment is NOT cleaned up");
+    console.log("by this reset and must be handled separately, deliberately, beforehand if needed.");
     return;
   }
 
@@ -295,9 +383,11 @@ export async function main(): Promise<void> {
   console.log(`  lead_scores           = ${result.rpcResult.deleted.leadScores}`);
   console.log(`  qualification_answers = ${result.rpcResult.deleted.qualificationAnswers}`);
   console.log(`  offered_slots         = ${result.rpcResult.deleted.offeredSlots}`);
-  console.log(`  appointments          = ${result.rpcResult.deleted.appointments}`);
+  console.log(`  appointments          = ${result.rpcResult.deleted.appointments} (BOOKED = ${result.rpcResult.appointmentsBeforeReset.booked}, RESCHEDULED = ${result.rpcResult.appointmentsBeforeReset.rescheduled}, CANCELLED = ${result.rpcResult.appointmentsBeforeReset.cancelled}, other = ${result.rpcResult.appointmentsBeforeReset.other})`);
   console.log(`  booking_attempts      = ${result.rpcResult.deleted.bookingAttempts}`);
   console.log(`  slot_offer_claims     = ${result.rpcResult.deleted.slotOfferClaims}`);
+  console.log(`  appointment_reschedules (cascaded)    = ${result.rpcResult.deleted.appointmentReschedulesCascaded}`);
+  console.log(`  appointment_cancellations (cascaded)  = ${result.rpcResult.deleted.appointmentCancellationsCascaded}`);
   console.log("\nAfter:");
   console.log(formatSnapshot(result.after));
 }

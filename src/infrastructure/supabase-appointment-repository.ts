@@ -137,4 +137,10 @@ export class SupabaseAppointmentRepository implements AppointmentRepository {
     if (error) throw new Error(`SUPABASE_APPOINTMENT_CLAIM_TRANSITION_FAILED: ${error.message}`);
     return data ? mapRowToAppointment(data as AppointmentRow) : null;
   }
+
+  async listAllByLeadId(leadId: string): Promise<Appointment[]> {
+    const { data, error } = await this.client.from("appointments").select().eq("lead_id", leadId);
+    if (error) throw new Error(`SUPABASE_APPOINTMENT_LIST_ALL_FAILED: ${error.message}`);
+    return (data as AppointmentRow[]).map(mapRowToAppointment);
+  }
 }

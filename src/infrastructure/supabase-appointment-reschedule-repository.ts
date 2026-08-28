@@ -113,4 +113,10 @@ export class SupabaseAppointmentRescheduleRepository implements AppointmentResch
     if (error) throw new Error(`SUPABASE_APPOINTMENT_RESCHEDULE_CLAIM_TRANSITION_FAILED: ${error.message}`);
     return data ? mapRowToAppointmentReschedule(data as AppointmentRescheduleRow) : null;
   }
+
+  async listByLeadId(leadId: string): Promise<AppointmentReschedule[]> {
+    const { data, error } = await this.client.from("appointment_reschedules").select().eq("lead_id", leadId);
+    if (error) throw new Error(`SUPABASE_APPOINTMENT_RESCHEDULE_LIST_FAILED: ${error.message}`);
+    return (data as AppointmentRescheduleRow[]).map(mapRowToAppointmentReschedule);
+  }
 }

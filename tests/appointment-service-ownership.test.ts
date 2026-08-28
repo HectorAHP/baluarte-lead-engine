@@ -244,6 +244,9 @@ describe("AppointmentService.book -- ownership foundation", () => {
       async claimTransition() {
         return null;
       },
+      async listAllByLeadId() {
+        return [];
+      },
     };
     const service = new AppointmentService(calendar, failingAppointments, bookingAttempts, leads, logger);
 

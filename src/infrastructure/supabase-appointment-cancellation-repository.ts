@@ -81,4 +81,10 @@ export class SupabaseAppointmentCancellationRepository implements AppointmentCan
     if (error) throw new Error(`SUPABASE_APPOINTMENT_CANCELLATION_UPDATE_FAILED: ${error.message}`);
     return mapRowToAppointmentCancellation(data as AppointmentCancellationRow);
   }
+
+  async listByLeadId(leadId: string): Promise<AppointmentCancellation[]> {
+    const { data, error } = await this.client.from("appointment_cancellations").select().eq("lead_id", leadId);
+    if (error) throw new Error(`SUPABASE_APPOINTMENT_CANCELLATION_LIST_FAILED: ${error.message}`);
+    return (data as AppointmentCancellationRow[]).map(mapRowToAppointmentCancellation);
+  }
 }

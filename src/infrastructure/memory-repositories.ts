@@ -66,6 +66,9 @@ export class InMemoryAppointmentRepository implements AppointmentRepository{
     this.data.set(id,claimed);
     return claimed;
   }
+  async listAllByLeadId(leadId:string):Promise<Appointment[]>{
+    return [...this.data.values()].filter(a=>a.leadId===leadId);
+  }
 }
 
 /**
@@ -387,6 +390,10 @@ export class InMemoryAppointmentCancellationRepository implements AppointmentCan
     this.data.set(id,n);
     return n;
   }
+
+  async listByLeadId(leadId:string):Promise<AppointmentCancellation[]>{
+    return [...this.data.values()].filter(c=>c.leadId===leadId);
+  }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -432,5 +439,9 @@ export class InMemoryAppointmentRescheduleRepository implements AppointmentResch
     const claimed={...current,phaseAStatus:nextStatus,updatedAt:new Date()};
     this.data.set(id,claimed);
     return claimed;
+  }
+
+  async listByLeadId(leadId:string):Promise<AppointmentReschedule[]>{
+    return [...this.data.values()].filter(r=>r.leadId===leadId);
   }
 }

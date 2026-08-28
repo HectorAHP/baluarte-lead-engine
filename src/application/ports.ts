@@ -46,6 +46,16 @@ export interface AppointmentRepository {
    * intermediate status to ever go stale).
    */
   claimTransition(id:string,expectedStatus:AppointmentStatus,nextStatus:AppointmentStatus):Promise<Appointment|null>;
+  /** Every appointment row for this lead, ANY status (BOOKED, RESCHEDULED, CANCELLED, or any
+   * other) -- unlike every other method on this interface, deliberately not scoped to "active" or
+   * "most recent". Not used by any booking/cancellation/reschedule business logic (those all use
+   * the status-scoped methods above, which is what keeps their concurrency contracts precise) --
+   * exists purely for read-only administrative tooling (see scripts/reset-test-lead.ts), which
+   * needs to see the FULL Phase 4B/4C history for a lead (e.g. an old RESCHEDULED row sitting
+   * alongside a new BOOKED one) before deleting it, not just the single currently-active row
+   * findActiveByLeadId returns. Same rationale/precedent as
+   * BookingAttemptRepository.listByLeadId. */
+  listAllByLeadId(leadId:string):Promise<Appointment[]>;
 }
 export interface BookingAttemptRepository {
   findByKey(idempotencyKey:string):Promise<BookingAttempt|null>;
@@ -173,6 +183,11 @@ export interface AppointmentCancellationRepository {
   tryCreate(input: Omit<AppointmentCancellation, "id" | "createdAt" | "updatedAt" | "attemptCount" | "status"> & { status?: AppointmentCancellation["status"] }): Promise<AppointmentCancellation | null>;
   findByIdempotencyKey(idempotencyKey: string): Promise<AppointmentCancellation | null>;
   update(id: string, patch: Partial<AppointmentCancellation>): Promise<AppointmentCancellation>;
+  /** Every appointment_cancellations row for this lead -- read-only administrative tooling only
+   * (see scripts/reset-test-lead.ts), same rationale as
+   * BookingAttemptRepository.listByLeadId / AppointmentRepository.listAllByLeadId. Not used by
+   * any cancellation business logic, which is all keyed by idempotencyKey/appointmentId. */
+  listByLeadId(leadId: string): Promise<AppointmentCancellation[]>;
 }
 
 // Phase 4C -- appointment reschedule (see docs/PHASE4-DESIGN.md, migration
@@ -197,6 +212,11 @@ export interface AppointmentRescheduleRepository {
    * PENDING -> FAILED -> PENDING stale-reclaim pattern AppointmentRescheduleService uses).
    */
   claimTransition(id: string, expectedStatus: AppointmentReschedule["phaseAStatus"], nextStatus: AppointmentReschedule["phaseAStatus"], options?: { updatedBefore: Date }): Promise<AppointmentReschedule | null>;
+  /** Every appointment_reschedules row for this lead -- read-only administrative tooling only
+   * (see scripts/reset-test-lead.ts), same rationale as
+   * BookingAttemptRepository.listByLeadId / AppointmentRepository.listAllByLeadId. Not used by
+   * any reschedule business logic, which is all keyed by idempotencyKey/oldAppointmentId. */
+  listByLeadId(leadId: string): Promise<AppointmentReschedule[]>;
 }
 
 export interface CalendarSlot{start:Date;end:Date;} export interface CalendarEventInput{title:string;description:string;start:Date;end:Date;attendeeEmail?:string;} export interface CalendarEventResult{eventId:string;meetingUrl?:string;}
