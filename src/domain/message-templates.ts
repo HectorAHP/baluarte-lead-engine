@@ -206,3 +206,24 @@ export const RESCHEDULE_IN_PROGRESS_MESSAGE =
 // ---------------------------------------------------------------------------------------------
 export const BOOKED_GENERIC_INBOUND_MESSAGE =
   "¡Hola! Ya tienes una cita agendada con nosotros. Si quieres cambiarla escribe \"reagendar\", si necesitas cancelarla escribe \"cancelar\". Si tienes alguna otra duda, escríbela aquí y te ayudamos.";
+
+// ---------------------------------------------------------------------------------------------
+// Pre-launch hardening -- reactivating a CANCELLED lead. Same "never silence, never imply a state
+// change that didn't happen" principle as BOOKED_GENERIC_INBOUND_MESSAGE above. See
+// WhatsAppReactivationHandler.
+// ---------------------------------------------------------------------------------------------
+
+/** A. Generic inbound (no clear intent) -- offers reactivation without starting anything. */
+export const CANCELLED_GENERIC_INBOUND_MESSAGE =
+  "¡Hola! Veo que tu cita anterior fue cancelada. Si quieres agendar una nueva cita, escribe \"agendar\". Si prefieres hacer una pregunta primero, escríbela aquí y con gusto te ayudamos.";
+
+/** B. "Quiero reagendar" from a CANCELLED lead -- there is no active appointment to move, so this
+ * is reframed as a new-booking intent, with an explicit acknowledgment before the slot offer
+ * (item 3 of the pre-launch spec) so the lead understands why they're seeing fresh availability
+ * instead of their old appointment. */
+export const CANCELLED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE =
+  "Tu cita anterior ya está cancelada. Puedo ayudarte a agendar una nueva.";
+
+/** C. "Quiero cancelar" from a CANCELLED lead -- idempotent, non-destructive: nothing to cancel
+ * again, no Calendar call, no state change. */
+export const CANCELLED_ALREADY_MESSAGE = "Tu cita anterior ya está cancelada.";

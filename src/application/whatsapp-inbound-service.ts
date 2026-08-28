@@ -48,6 +48,16 @@ export interface RescheduleTurnHandler {
   handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
 }
 
+/**
+ * Pre-launch hardening: reactivates a CANCELLED lead into a brand-new booking. Injected only when
+ * config.WHATSAPP_BOOKING_ENABLED is true (see app.ts) -- the reactivation flow is fundamentally
+ * dependent on the booking flow being fully operational, so it reuses that flag rather than
+ * inventing a new one. WhatsAppReactivationHandler implements this.
+ */
+export interface ReactivationTurnHandler {
+  handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
+}
+
 export interface InboundWhatsAppText {
   whatsappUserId: string;
   phoneRaw: string;
@@ -80,6 +90,10 @@ export interface WhatsAppInboundDeps {
    * RESCHEDULE_REQUESTED lead can only be reached via that flag anyway, exactly Phase 4B behavior,
    * unchanged. */
   rescheduleHandler?: RescheduleTurnHandler;
+  /** Present only when the pre-launch reactivation feature is on (reuses WHATSAPP_BOOKING_ENABLED
+   * -- see app.ts). Absent (the default), the CANCELLED routing branch below is never taken and a
+   * CANCELLED lead falls through to the same "no automated reply" fallback as before, unchanged. */
+  reactivationHandler?: ReactivationTurnHandler;
 }
 
 export type WhatsAppInboundOutcome = "DUPLICATE" | "PROCESSED";
@@ -251,12 +265,21 @@ export async function handleInboundWhatsAppText(
         await deps.cancellationHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
-      // No qualifier/booking/cancellation/reschedule handler configured (flags off), or an
-      // existing lead outside an active qualification/booking/cancellation/reschedule round (e.g.
-      // already QUALIFIED_A/B/NURTURE_C, a CANCELLED lead, or a CONTACTED lead that still carries
-      // a product from a prior round): no automated reply, same as Phase 2. NOTE (pre-launch
-      // smoke test): a CANCELLED lead has this exact same silent-fallback gap today -- explicitly
-      // out of scope for this fix, see the report.
+      // Pre-launch hardening: a CANCELLED lead's free text -- classified internally by
+      // WhatsAppReactivationHandler into cancellation-intent (safe no-op reply), reschedule-intent
+      // (reframed as a new booking, since there's no active appointment to move), explicit
+      // new-booking intent (starts a fresh booking round), or generic (reactivation fallback
+      // only). reactivationHandler is present only when WHATSAPP_BOOKING_ENABLED is true (see
+      // app.ts) -- absent, this branch is never taken and a CANCELLED lead falls through to the
+      // same "no automated reply" fallback as before, unchanged.
+      if (deps.reactivationHandler && lead.status === "CANCELLED") {
+        await deps.reactivationHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
+        return;
+      }
+      // No qualifier/booking/cancellation/reschedule/reactivation handler configured (flags off),
+      // or an existing lead outside an active round (e.g. already QUALIFIED_A/B/NURTURE_C, or a
+      // CONTACTED lead that still carries a product from a prior round): no automated reply, same
+      // as Phase 2.
     },
     deps.logger,
     { leadId, conversationId },

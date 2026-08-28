@@ -13,8 +13,18 @@ import { config } from "../config.js";
  * Lead statuses from which offering booking slots is meaningful. Anything else (HUMAN_HANDOFF,
  * DO_NOT_CONTACT, NURTURE_C, BOOKED, or any earlier pre-qualification status) is a caller
  * precondition violation -- see LeadNotOfferableError.
+ *
+ * "CANCELLED" (pre-launch hardening): reactivating a lead whose appointment was cancelled into a
+ * brand-new booking -- WhatsAppReactivationHandler is the only caller that can ever pass a
+ * CANCELLED lead here, and only after detecting explicit new-booking/reschedule-after-cancel
+ * intent in the inbound text. CANCELLED -> BOOKING_PENDING was already a valid state-machine edge
+ * (Phase 4A) with no handler driving it until now -- ensureOfferableLeadStatus below reuses it via
+ * the EXACT SAME mechanism that already transitions QUALIFIED_A/B leads, no new transition-writing
+ * logic needed. The old (CANCELLED) appointment is never touched, restored, or referenced by this
+ * or the resulting booking in any way -- AppointmentService.book() creates a wholly independent
+ * new appointment, exactly like a lead's very first booking.
  */
-const OFFERABLE_LEAD_STATUSES: ReadonlySet<LeadStatus> = new Set(["QUALIFIED_A", "QUALIFIED_B", "BOOKING_PENDING"]);
+const OFFERABLE_LEAD_STATUSES: ReadonlySet<LeadStatus> = new Set(["QUALIFIED_A", "QUALIFIED_B", "BOOKING_PENDING", "CANCELLED"]);
 
 /**
  * How many slots are ever persisted/shown to a lead in a single round, regardless of how many

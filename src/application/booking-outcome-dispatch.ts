@@ -28,13 +28,23 @@ export interface BookingOutcomeDeps {
  * status: set to BOOKED only if not already (no write, no assertTransition call, when it's
  * already BOOKED -- matches the pre-existing idempotent contract).
  *
- * bookedAt / meetingAt: the PRIMARY write for a fresh, successful booking happens inside
- * AppointmentService.completeBooking (bookedAt=now, meetingAt=appointment.startsAt), in the same
- * domain-layer call that creates the appointment -- never duplicated here. This function only
- * BACKFILLS either field when it's still missing on the lead passed in, which self-heals the
- * exact drift a live appointment can be found to have (e.g. completeBooking's own best-effort
- * leads.update failed after the appointment was already durably created -- see its TODO comment)
- * without ever overwriting a value that's already correctly set.
+ * bookedAt / meetingAt on a genuine NEW transition into BOOKED (`!wasBooked`): ALWAYS set to
+ * `new Date()` / `appointment.startsAt` unconditionally -- never merely backfilled when missing.
+ * This matters since a lead can now reach this call from CANCELLED (pre-launch hardening:
+ * reactivating a cancelled lead into a brand-new booking, see WhatsAppReactivationHandler) or
+ * NO_SHOW, both of which already carry STALE bookedAt/meetingAt from their prior, no-longer-
+ * relevant appointment -- a "backfill only if null" guard would have left those stale values in
+ * place forever, silently misreporting the lead's actual next-meeting time. A genuinely new
+ * BOOKED transition always means the appointment passed in is the sole current source of truth
+ * for both fields, whatever they held before. (For the ORIGINAL "first-ever booking" case --
+ * NEW/QUALIFIED_x/BOOKING_PENDING -> BOOKED -- both fields already start undefined, so this is
+ * byte-for-byte the same result as the old "backfill if missing" logic; only the previously-
+ * stale-data case actually changes.)
+ *
+ * On an IDEMPOTENT retry (`wasBooked` already true, same appointment): still only backfills a
+ * field that's genuinely missing (e.g. a partial-write crash after the status landed but before
+ * these fields were set) -- never overwrites an already-correct value with a fresh timestamp on
+ * every retry.
  *
  * Phase 4A: records exactly one lead_status_history row when this call actually performs the
  * BOOKED transition (never on a pure bookedAt/meetingAt backfill with no status change, and never
@@ -50,9 +60,12 @@ export async function markLeadBooked(
   if (!wasBooked) {
     assertTransition(lead.status, "BOOKED");
     patch.status = "BOOKED";
+    patch.bookedAt = new Date();
+    patch.meetingAt = appointment.startsAt;
+  } else {
+    if (!lead.bookedAt) patch.bookedAt = new Date();
+    if (!lead.meetingAt) patch.meetingAt = appointment.startsAt;
   }
-  if (!lead.bookedAt) patch.bookedAt = new Date();
-  if (!lead.meetingAt) patch.meetingAt = appointment.startsAt;
   if (Object.keys(patch).length === 0) return lead; // fully idempotent no-op -- nothing missing to backfill
   const updated = await deps.leads.update(lead.id, patch);
   if (!wasBooked) {
