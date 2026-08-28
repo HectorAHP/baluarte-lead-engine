@@ -83,7 +83,19 @@ export interface OfferedSlotRepository {
    * seed a single row.
    */
   createMany(inputs:Array<Omit<OfferedSlot,"id"|"createdAt">>):Promise<OfferedSlot[]>;
-  listActiveByConversationId(conversationId:string,now:Date):Promise<OfferedSlot[]>;
+  /**
+   * Active (unselected, unexpired) offered_slots for this conversation, scoped by booking
+   * context -- undefined (the default) returns ONLY reschedule_context_id IS NULL rows (booking
+   * mode); a value returns ONLY rows tagged with that exact reschedule_context_id. Never a mix of
+   * both. THIS is the query that decides REUSED vs CREATE-NEW in SlotOfferingService, so an
+   * unscoped call here is the single most consequential place a booking-context leak could ever
+   * happen -- see the Phase 4C post-mortem: this parameter was originally added ONLY to
+   * listRoundIdsByConversationId below (the round-COUNTING query) and omitted here (the
+   * round-REUSE query) by mistake, which let a reschedule silently reuse an unselected leftover
+   * slot from the conversation's ORIGINAL booking round whenever that round hadn't fully expired
+   * yet. Every caller MUST now pass the correct context explicitly (or omit it for booking mode).
+   */
+  listActiveByConversationId(conversationId:string,now:Date,rescheduleContextId?:string):Promise<OfferedSlot[]>;
   update(id:string,patch:Partial<OfferedSlot>):Promise<OfferedSlot>;
   /**
    * Every distinct round_id offered for this conversation IN THIS BOOKING CONTEXT, across ALL

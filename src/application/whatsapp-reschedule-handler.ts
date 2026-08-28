@@ -111,7 +111,10 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     if (!oldAppointment) throw new AppointmentRescheduleInconsistentError(lead.id, "NO_APPOINTMENT");
     const rescheduleMode = { type: "RESCHEDULE" as const, oldAppointmentId: oldAppointment.id };
 
-    const activeSlots = await this.deps.offeredSlots.listActiveByConversationId(conversationId, now);
+    // Phase 4C post-mortem fix: MUST be scoped by reschedule context -- an unscoped call here was
+    // the actual root cause of a reschedule silently reusing unselected leftover slots from the
+    // conversation's ORIGINAL booking round (whenever that round hadn't fully expired yet).
+    const activeSlots = await this.deps.offeredSlots.listActiveByConversationId(conversationId, now, oldAppointment.id);
 
     if (activeSlots.length === 0) {
       // Nothing to interpret the inbound text against (e.g. the round expired, or this is a
@@ -156,6 +159,25 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     const oldAppointment = await this.findTargetAppointment(lead.id);
     if (oldAppointment === "INCONSISTENT") throw new AppointmentRescheduleInconsistentError(lead.id, "MULTIPLE_APPOINTMENTS");
     if (!oldAppointment) throw new AppointmentRescheduleInconsistentError(lead.id, "NO_APPOINTMENT");
+
+    // MANDATORY invariant (Phase 4C hardening, post-mortem item 9): a selected offered slot for a
+    // RESCHEDULE_REQUESTED turn must belong to THIS exact reschedule episode -- never a booking-
+    // context slot (rescheduleContextId undefined/null) and never a DIFFERENT reschedule episode's
+    // slot (a stale oldAppointmentId from an earlier attempt). Defense-in-depth: with
+    // listActiveByConversationId now correctly scoped by context (see the fix above this class),
+    // `slot` should already be structurally guaranteed to match -- this check exists so a future
+    // regression in that scoping can never again result in creating a Calendar event or an
+    // appointment, or touching the old appointment, from a slot that doesn't genuinely belong
+    // here. Never partially acts: no Calendar call, no appointment, no CAS on old -- treated
+    // exactly like an expired/already-selected slot (see the check just above).
+    if (slot.rescheduleContextId !== oldAppointment.id) {
+      this.deps.logger.warn(
+        { leadId: lead.id, slotId: slot.id, expectedContext: oldAppointment.id, actualContext: slot.rescheduleContextId ?? null },
+        "Selected offered slot's reschedule context does not match the current old appointment -- refusing to reschedule from it (never creating Calendar/appointment side effects), treating as stale/invalid.",
+      );
+      await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildInvalidSelectionMessage(activeSlots, this.advisorTimezone));
+      return;
+    }
 
     let outcome;
     try {

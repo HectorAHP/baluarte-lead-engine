@@ -143,3 +143,74 @@ describe("SlotOfferingService -- MAX_OFFER_ROUNDS scoped per booking context (it
     expect(outcomeB.type).toBe("CREATED");
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Phase 4C post-mortem regression tests. Root cause: listActiveByConversationId (the query that
+// decides REUSED vs CREATE-NEW) was never scoped by reschedule_context_id -- only
+// listRoundIdsByConversationId (round COUNTING) was. A reschedule request landing while the
+// conversation's ORIGINAL booking round still had unselected, unexpired slots silently reused
+// them as if they were fresh reschedule options, and never created a context-tagged round at all.
+// See tests/whatsapp-reschedule-e2e.test.ts for the real-webhook-pipeline version of test A.
+// ---------------------------------------------------------------------------------------------
+describe("Phase 4C post-mortem -- item 12.A: a reschedule request never reuses the original booking round's leftover slots", () => {
+  it("booking round (positions 1,2,3; position 1 selected; context=null) still unexpired when a reschedule starts -- getOrCreateOffer RESCHEDULE creates a BRAND NEW round tagged with the old appointment's id, never reusing positions 2/3", async () => {
+    const { service, offeredSlots, leads } = makeService();
+    const bookingLead = await leads.create({ country: "MX", productVertical: "GMM", status: "QUALIFIED_A", score: 71, assignedAdvisor: "Hector Herrera", consentContact: true });
+    const conversationId = "conv-postmortem-A";
+
+    // The original booking round -- created via booking mode (mode omitted), context=null.
+    const bookingOutcome = await service.getOrCreateOffer({ lead: bookingLead, conversationId, now: NOW });
+    if (bookingOutcome.type !== "CREATED") throw new Error("unreachable");
+    const originalRoundId = bookingOutcome.slots[0].roundId;
+    expect(bookingOutcome.slots).toHaveLength(3);
+    expect(bookingOutcome.slots.every((s) => s.rescheduleContextId === undefined)).toBe(true);
+    // Simulate position 1 being selected (the original booking succeeded) -- positions 2/3 stay
+    // active, unselected, unexpired, exactly as the real bug report described.
+    const position1 = bookingOutcome.slots.find((s) => s.position === 1)!;
+    await offeredSlots.update(position1.id, { selected: true });
+
+    const oldAppointmentId = "old-appt-real-A";
+    const rescheduleLead = await leads.create({ country: "MX", productVertical: "GMM", status: "RESCHEDULE_REQUESTED", score: 71, assignedAdvisor: "Hector Herrera", consentContact: true });
+
+    const rescheduleOutcome = await service.getOrCreateOffer({
+      lead: rescheduleLead, conversationId, now: NOW, mode: { type: "RESCHEDULE", oldAppointmentId },
+    });
+
+    expect(rescheduleOutcome.type).toBe("CREATED"); // NEVER "REUSED" of the booking round
+    if (rescheduleOutcome.type !== "CREATED") throw new Error("unreachable");
+    expect(rescheduleOutcome.slots).toHaveLength(3);
+    // A brand new round_id -- never the original booking's.
+    expect(rescheduleOutcome.slots.every((s) => s.roundId !== originalRoundId)).toBe(true);
+    // Every new slot is tagged with the CURRENT reschedule episode's context.
+    expect(rescheduleOutcome.slots.every((s) => s.rescheduleContextId === oldAppointmentId)).toBe(true);
+    // The original booking round's positions 2/3 are untouched, unselected, and NOT among the
+    // slots just offered.
+    const rescheduleSlotIds = new Set(rescheduleOutcome.slots.map((s) => s.id));
+    const position2 = bookingOutcome.slots.find((s) => s.position === 2)!;
+    const position3 = bookingOutcome.slots.find((s) => s.position === 3)!;
+    expect(rescheduleSlotIds.has(position2.id)).toBe(false);
+    expect(rescheduleSlotIds.has(position3.id)).toBe(false);
+    expect((await offeredSlots.listActiveByConversationId(conversationId, NOW))).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: position2.id }), expect.objectContaining({ id: position3.id })]),
+    ); // still exist, still active, just never offered as a reschedule option
+  });
+});
+
+describe("Phase 4C post-mortem -- item 12.D: booking mode never reuses a reschedule round's slots", () => {
+  it("a reschedule round (context=A) still unexpired never gets reused by a LATER, unrelated booking-mode getOrCreateOffer call on the same conversation", async () => {
+    const { service, leads } = makeService();
+    const conversationId = "conv-postmortem-D";
+    const rescheduleLead = await leads.create({ country: "MX", productVertical: "GMM", status: "RESCHEDULE_REQUESTED", score: 71, assignedAdvisor: "Hector Herrera", consentContact: true });
+    const rescheduleOutcome = await service.getOrCreateOffer({ lead: rescheduleLead, conversationId, now: NOW, mode: { type: "RESCHEDULE", oldAppointmentId: "old-appt-real-D" } });
+    if (rescheduleOutcome.type !== "CREATED") throw new Error("unreachable");
+    const rescheduleRoundId = rescheduleOutcome.slots[0].roundId;
+
+    const bookingLead = await leads.create({ country: "MX", productVertical: "GMM", status: "QUALIFIED_A", score: 71, assignedAdvisor: "Hector Herrera", consentContact: true });
+    const bookingOutcome = await service.getOrCreateOffer({ lead: bookingLead, conversationId, now: NOW }); // mode omitted -- booking
+
+    expect(bookingOutcome.type).toBe("CREATED"); // never "REUSED" of the reschedule round
+    if (bookingOutcome.type !== "CREATED") throw new Error("unreachable");
+    expect(bookingOutcome.slots.every((s) => s.roundId !== rescheduleRoundId)).toBe(true);
+    expect(bookingOutcome.slots.every((s) => s.rescheduleContextId === undefined)).toBe(true);
+  });
+});

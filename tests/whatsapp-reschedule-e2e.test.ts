@@ -203,3 +203,54 @@ describe("Phase 4C -- full in-memory E2E through the real webhook pipeline", () 
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKED");
   });
 });
+
+describe("Phase 4C post-mortem -- item 13: the missing E2E (real booking, then reschedule, on the SAME conversation)", () => {
+  it("real booking flow (offer -> select position 1 -> BOOKED) leaves an unexpired round with positions 2/3 still active; a subsequent reschedule request must NEVER reuse them -- it must create a brand new round tagged with the old appointment's id", async () => {
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappRescheduleEnabled: true, whatsappBookingEnabled: true });
+    const { lead } = await createLeadAtStatus(repos, "5214778890099", "BOOKING_PENDING", { bookingStartedAt: new Date() });
+    const conversation = await repos.conversationsRepo.findActiveByLeadId(lead.id);
+
+    // Real booking flow, through the real webhook pipeline -- no direct repo seeding.
+    await send(app, "5214778890099", "wamid.pm1", "hola");
+    const bookingRound = await repos.offeredSlotsRepo.listActiveByConversationId(conversation!.id, new Date());
+    expect(bookingRound).toHaveLength(3);
+    expect(bookingRound.every((s) => s.rescheduleContextId === undefined)).toBe(true);
+    const originalRoundId = bookingRound[0].roundId;
+    const position2Id = bookingRound.find((s) => s.position === 2)!.id;
+    const position3Id = bookingRound.find((s) => s.position === 3)!.id;
+
+    await send(app, "5214778890099", "wamid.pm2", "1"); // selects position 1 -- real booking
+
+    const bookedLead = await repos.leadsRepo.findById(lead.id);
+    expect(bookedLead?.status).toBe("BOOKED");
+    const oldAppointment = await repos.appointmentsRepo.findActiveByLeadId(lead.id);
+    expect(oldAppointment).not.toBeNull();
+
+    // Positions 2/3 are STILL active (unselected, unexpired) at this point -- exactly the real
+    // bug report's precondition.
+    const stillActive = await repos.offeredSlotsRepo.listActiveByConversationId(conversation!.id, new Date());
+    expect(stillActive.map((s) => s.id).sort()).toEqual([position2Id, position3Id].sort());
+
+    // Now request a reschedule, through the real webhook pipeline, on the SAME conversation.
+    await send(app, "5214778890099", "wamid.pm3", "quiero reagendar");
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
+
+    const rescheduleRound = await repos.offeredSlotsRepo.listActiveByConversationId(conversation!.id, new Date(), oldAppointment!.id);
+    expect(rescheduleRound.length).toBeGreaterThan(0); // a genuinely new round WAS created
+    // NEVER the original booking round.
+    expect(rescheduleRound.every((s) => s.roundId !== originalRoundId)).toBe(true);
+    // NEVER positions 2/3 from the original booking round.
+    const rescheduleSlotIds = new Set(rescheduleRound.map((s) => s.id));
+    expect(rescheduleSlotIds.has(position2Id)).toBe(false);
+    expect(rescheduleSlotIds.has(position3Id)).toBe(false);
+    // Every new slot is tagged with the CURRENT reschedule episode's context.
+    expect(rescheduleRound.every((s) => s.rescheduleContextId === oldAppointment!.id)).toBe(true);
+
+    // The outbound message actually sent to WhatsApp reflects the NEW round's real times, never
+    // the original booking round's leftover options.
+    const messages = await repos.messagesRepo.listByConversationId(conversation!.id);
+    const lastOutbound = messages.filter((m) => m.direction === "OUTBOUND").slice(-1)[0];
+    expect(lastOutbound.body).toContain("Responde con el número");
+  });
+});

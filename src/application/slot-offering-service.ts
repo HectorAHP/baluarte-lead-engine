@@ -196,7 +196,7 @@ export class SlotOfferingService {
       if (activeAppointment) return { type: "ALREADY_BOOKED", appointment: activeAppointment };
     }
 
-    const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
+    const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now, rescheduleContextIdOf(mode));
     if (activeSlots.length > 0) return this.resolveReused(lead, now, conversationId, activeSlots, mode);
 
     const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode));
@@ -235,7 +235,7 @@ export class SlotOfferingService {
       if (activeAppointment) return { type: "ALREADY_BOOKED", appointment: activeAppointment };
     }
 
-    const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
+    const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now, rescheduleContextIdOf(mode));
     assertSingleActiveRound(conversationId, activeSlots); // refuse to replace an already-inconsistent offer
 
     const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode));
@@ -333,13 +333,13 @@ export class SlotOfferingService {
   ): Promise<SlotOfferOutcome> {
     const deadline = this.clock().getTime() + OFFER_CLAIM_POLL_BUDGET_MS;
     while (this.clock().getTime() < deadline) {
-      const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
+      const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now, rescheduleContextIdOf(mode));
       if (activeSlots.length > 0) return this.resolveReused(lead, now, conversationId, activeSlots, mode);
       await this.sleepFn(OFFER_CLAIM_POLL_INTERVAL_MS);
     }
 
     // Poll budget exhausted -- one last check before deciding anything about the claim itself.
-    const finalActiveSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
+    const finalActiveSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now, rescheduleContextIdOf(mode));
     if (finalActiveSlots.length > 0) return this.resolveReused(lead, now, conversationId, finalActiveSlots, mode);
 
     const existing = await this.slotOfferClaims.findByConversationId(conversationId);
@@ -359,7 +359,7 @@ export class SlotOfferingService {
     // Stale -- but the dead owner might have actually persisted a round before dying (case E in
     // the design: "creates round, dies before releasing"). Check once more before reclaiming so
     // a legitimately-finished round is never discarded in favor of an unnecessary reclaim.
-    const preReclaimActiveSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now);
+    const preReclaimActiveSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now, rescheduleContextIdOf(mode));
     if (preReclaimActiveSlots.length > 0) return this.resolveReused(lead, now, conversationId, preReclaimActiveSlots, mode);
 
     const newOwnerToken = this.ownerTokenFactory();

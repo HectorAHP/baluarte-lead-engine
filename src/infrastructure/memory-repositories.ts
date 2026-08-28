@@ -218,9 +218,9 @@ export class InMemoryOfferedSlotRepository implements OfferedSlotRepository{
     return rows;
   }
 
-  async listActiveByConversationId(conversationId:string,now:Date){
+  async listActiveByConversationId(conversationId:string,now:Date,rescheduleContextId?:string){
     return [...this.data.values()]
-      .filter(s=>s.conversationId===conversationId&&!s.selected&&s.expiresAt>now)
+      .filter(s=>s.conversationId===conversationId&&!s.selected&&s.expiresAt>now&&s.rescheduleContextId===rescheduleContextId)
       .sort((a,b)=>a.position-b.position);
   }
 

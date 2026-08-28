@@ -81,14 +81,18 @@ export class SupabaseOfferedSlotRepository implements OfferedSlotRepository {
     return (data as OfferedSlotRow[]).map(mapRowToOfferedSlot);
   }
 
-  async listActiveByConversationId(conversationId: string, now: Date): Promise<OfferedSlot[]> {
-    const { data, error } = await this.client
+  async listActiveByConversationId(conversationId: string, now: Date, rescheduleContextId?: string): Promise<OfferedSlot[]> {
+    let query = this.client
       .from("offered_slots")
       .select()
       .eq("conversation_id", conversationId)
       .eq("selected", false)
-      .gt("expires_at", now.toISOString())
-      .order("position", { ascending: true });
+      .gt("expires_at", now.toISOString());
+    // Scoped by booking context (Phase 4C hardening -- this was the actual root cause of a
+    // reschedule silently reusing the original booking round's leftover slots: this filter was
+    // missing entirely). Same convention as listRoundIdsByConversationId below.
+    query = rescheduleContextId === undefined ? query.is("reschedule_context_id", null) : query.eq("reschedule_context_id", rescheduleContextId);
+    const { data, error } = await query.order("position", { ascending: true });
     if (error) throw new Error(`SUPABASE_OFFERED_SLOT_LIST_FAILED: ${error.message}`);
     return (data as OfferedSlotRow[]).map(mapRowToOfferedSlot);
   }

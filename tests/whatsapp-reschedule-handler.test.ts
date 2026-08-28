@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { WhatsAppRescheduleHandler } from "../src/application/whatsapp-reschedule-handler.js";
 import { AppointmentRescheduleService } from "../src/application/appointment-reschedule-service.js";
 import { AppointmentCancellationService } from "../src/application/appointment-cancellation-service.js";
@@ -228,6 +228,42 @@ describe("WhatsAppRescheduleHandler -- item 13: cancellation-vs-reschedule race"
     const history = await h.leadStatusHistory.listByLeadId(pendingLead.id);
     expect(history.some((r) => r.toStatus === "CANCEL_PENDING")).toBe(false);
     expect((await h.appointments.findById(appointment.id))?.status).toBe("RESCHEDULED"); // untouched by the race
+  });
+});
+
+describe("WhatsAppRescheduleHandler -- item 9/12.B/12.C: mandatory reschedule-context invariant (defense-in-depth)", () => {
+  it("item 12.B: never accepts a selected slot whose rescheduleContextId is undefined (a leaked booking-context slot) -- no Calendar call, no appointment created, old untouched", async () => {
+    const h = makeHandler();
+    const { pendingLead, conversation, appointment } = await toRescheduleRequested(h);
+    // Simulate a filtering bug (or data corruption) by injecting a booking-context slot into what
+    // listActiveByConversationId returns for THIS turn -- the real, fixed repository can never
+    // produce this on its own now (see the root-cause fix), so this directly exercises the
+    // handler's OWN defense-in-depth check rather than the repository's filter.
+    const leakedSlot = { id: "leaked-booking-slot", conversationId: conversation.id, leadId: pendingLead.id, roundId: "leaked-round", slotStart: new Date("2026-03-02T18:00:00.000Z"), slotEnd: new Date("2026-03-02T18:30:00.000Z"), position: 1, expiresAt: new Date("2026-03-01T10:00:00.000Z"), selected: false, createdAt: NOW, rescheduleContextId: undefined };
+    vi.spyOn(h.offeredSlots, "listActiveByConversationId").mockResolvedValueOnce([leakedSlot]);
+    const createEventSpy = vi.spyOn(h.calendar, "createEvent");
+
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+
+    expect(createEventSpy).not.toHaveBeenCalled();
+    expect((await h.appointments.findById(appointment.id))?.status).toBe("BOOKED"); // untouched
+    expect((await h.leads.findById(pendingLead.id))?.status).toBe("RESCHEDULE_REQUESTED"); // untouched
+    const lastMessage = h.messaging.sentTexts[h.messaging.sentTexts.length - 1];
+    expect(lastMessage.body).toContain("Por favor responde");
+  });
+
+  it("item 12.C: never accepts a selected slot whose rescheduleContextId belongs to a DIFFERENT reschedule episode (old=B when the current old appointment is A) -- no Calendar call, no appointment created, old untouched", async () => {
+    const h = makeHandler();
+    const { pendingLead, conversation, appointment } = await toRescheduleRequested(h);
+    const wrongContextSlot = { id: "wrong-context-slot", conversationId: conversation.id, leadId: pendingLead.id, roundId: "other-episode-round", slotStart: new Date("2026-03-02T18:00:00.000Z"), slotEnd: new Date("2026-03-02T18:30:00.000Z"), position: 1, expiresAt: new Date("2026-03-01T10:00:00.000Z"), selected: false, createdAt: NOW, rescheduleContextId: "some-other-old-appointment-id" };
+    vi.spyOn(h.offeredSlots, "listActiveByConversationId").mockResolvedValueOnce([wrongContextSlot]);
+    const createEventSpy = vi.spyOn(h.calendar, "createEvent");
+
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+
+    expect(createEventSpy).not.toHaveBeenCalled();
+    expect((await h.appointments.findById(appointment.id))?.status).toBe("BOOKED"); // untouched
+    expect((await h.leads.findById(pendingLead.id))?.status).toBe("RESCHEDULE_REQUESTED"); // untouched
   });
 });
 
