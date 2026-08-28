@@ -6,7 +6,8 @@ import { runProcessingBoundary } from "./processing-boundary.js";
 import { normalizePhoneToE164 } from "../domain/phone.js";
 import { isOptOutMessage } from "../domain/opt-out-detection.js";
 import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
-import { buildWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE } from "../domain/message-templates.js";
+import { isCancellationRequest } from "../domain/cancellation-intent-detection.js";
+import { buildWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE, BOOKED_GENERIC_INBOUND_MESSAGE } from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
 
 /**
@@ -221,11 +222,30 @@ export async function handleInboundWhatsAppText(
         await deps.rescheduleHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
-      // Phase 4B: a lead in BOOKED (interpreting a cancellation-intent message, or anything else
-      // -- the handler itself no-ops on non-cancellation text) or CANCEL_PENDING (interpreting a
-      // confirm/decline/ambiguous reply). cancellationHandler is present only when
-      // WHATSAPP_CANCELLATION_ENABLED is true (see app.ts) -- absent, this branch is never taken
-      // and a BOOKED lead falls through to the same "no automated reply" fallback Phase 3C
+      // Pre-launch hardening: a BOOKED lead's free text that matched neither reschedule-intent
+      // (checked above) nor cancellation-intent must still get a safe, deterministic reply --
+      // never silence -- while NEVER changing status/score/meetingAt/appointment, never calling
+      // Calendar, never creating offered_slots, never recording a qualification answer (this
+      // branch does exactly one thing: send a message). This is the sole owner of "BOOKED +
+      // generic inbound" -- previously a genuine gap: WhatsAppCancellationHandler only ever acts
+      // on an explicit cancellation-intent match and silently no-ops otherwise (by design, for
+      // ITS OWN concern), and nothing downstream ever got a chance to reply once its routing
+      // condition matched and unconditionally returned. Gated on BOTH rescheduleHandler AND
+      // cancellationHandler being present -- the copy references both actions ("reagendar" /
+      // "cancelar"), so it is only ever sent when both are genuinely available; with either (or
+      // both) flags off, this branch is never taken and behavior is byte-for-byte the prior
+      // silent fallback, unchanged -- same "flag off -> unchanged behavior" guarantee as every
+      // other flag in this project. Placed BEFORE the cancellationHandler dispatch below so
+      // genuinely non-actionable text never even reaches that handler's internal no-op.
+      if (deps.rescheduleHandler && deps.cancellationHandler && lead.status === "BOOKED" && !isCancellationRequest(input.text)) {
+        await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, BOOKED_GENERIC_INBOUND_MESSAGE);
+        return;
+      }
+      // Phase 4B: a lead in BOOKED (interpreting a cancellation-intent message -- generic text
+      // never reaches here anymore, see the fallback immediately above) or CANCEL_PENDING
+      // (interpreting a confirm/decline/ambiguous reply). cancellationHandler is present only
+      // when WHATSAPP_CANCELLATION_ENABLED is true (see app.ts) -- absent, this branch is never
+      // taken and a BOOKED lead falls through to the same "no automated reply" fallback Phase 3C
       // already has today, unchanged.
       if (deps.cancellationHandler && (lead.status === "BOOKED" || lead.status === "CANCEL_PENDING")) {
         await deps.cancellationHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
@@ -233,8 +253,10 @@ export async function handleInboundWhatsAppText(
       }
       // No qualifier/booking/cancellation/reschedule handler configured (flags off), or an
       // existing lead outside an active qualification/booking/cancellation/reschedule round (e.g.
-      // already QUALIFIED_A/B/NURTURE_C, or a CONTACTED lead that still carries a product from a
-      // prior round): no automated reply, same as Phase 2.
+      // already QUALIFIED_A/B/NURTURE_C, a CANCELLED lead, or a CONTACTED lead that still carries
+      // a product from a prior round): no automated reply, same as Phase 2. NOTE (pre-launch
+      // smoke test): a CANCELLED lead has this exact same silent-fallback gap today -- explicitly
+      // out of scope for this fix, see the report.
     },
     deps.logger,
     { leadId, conversationId },

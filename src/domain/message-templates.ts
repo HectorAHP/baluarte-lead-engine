@@ -196,3 +196,13 @@ export const RESCHEDULE_TECHNICAL_ERROR_MESSAGE =
  * Same "someone else is handling this, wait" semantics as BOOKING_IN_PROGRESS_MESSAGE. */
 export const RESCHEDULE_IN_PROGRESS_MESSAGE =
   "Estoy actualizando tu cita. Inténtalo nuevamente en unos segundos.";
+
+// ---------------------------------------------------------------------------------------------
+// Pre-launch hardening -- a BOOKED lead's free text that is neither a reschedule nor a
+// cancellation request must never be met with silence, but must also never imply any state
+// change happened. See whatsapp-inbound-service.ts's routing (gated on both
+// WHATSAPP_RESCHEDULE_ENABLED and WHATSAPP_CANCELLATION_ENABLED -- the copy below only mentions
+// actions that are genuinely available when both are on).
+// ---------------------------------------------------------------------------------------------
+export const BOOKED_GENERIC_INBOUND_MESSAGE =
+  "¡Hola! Ya tienes una cita agendada con nosotros. Si quieres cambiarla escribe \"reagendar\", si necesitas cancelarla escribe \"cancelar\". Si tienes alguna otra duda, escríbela aquí y te ayudamos.";
