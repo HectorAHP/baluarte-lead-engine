@@ -203,7 +203,7 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     if (outcome.type === "INCONSISTENT") throw new AppointmentRescheduleInconsistentError(lead.id, "UNEXPECTED_STATUS");
 
     await this.deps.offeredSlots.update(slot.id, { selected: true });
-    const updatedLead = await this.ensureLeadBookedAfterReschedule(lead);
+    const updatedLead = await this.ensureLeadBookedAfterReschedule(lead, outcome.newAppointment);
     await this.replyRescheduleConfirmed(updatedLead.id, conversationId, whatsappUserId, outcome.newAppointment);
   }
 
@@ -223,9 +223,12 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     return null;
   }
 
-  private async transitionLead(lead: Lead, target: Lead["status"], eventType: string): Promise<Lead> {
+  /** `extraPatch` merges into the SAME write as the status change (never a second update call) --
+   * used only by ensureLeadBookedAfterReschedule below to sync meetingAt atomically with the
+   * RESCHEDULE_REQUESTED -> BOOKED transition. Every other caller omits it, unchanged. */
+  private async transitionLead(lead: Lead, target: Lead["status"], eventType: string, extraPatch: Partial<Lead> = {}): Promise<Lead> {
     assertTransition(lead.status, target);
-    const updated = await this.deps.leads.update(lead.id, { status: target });
+    const updated = await this.deps.leads.update(lead.id, { ...extraPatch, status: target });
     await recordLeadStatusTransition(this.deps.leadStatusHistory, this.deps.logger, {
       leadId: lead.id, fromStatus: lead.status, toStatus: target, eventType,
     });
@@ -238,20 +241,40 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
    * for the general stale-snapshot race this guards against).
    *
    * Item 13 hardening: ONLY forces BOOKED when the current status is still RESCHEDULE_REQUESTED
-   * (the expected precondition) or already BOOKED (idempotent no-op). Any OTHER current status --
-   * concretely, CANCEL_PENDING, reached via a concurrent "cancelar cita" turn (handOffToCancellation
-   * below) racing this exact reschedule selection -- is left completely untouched. Without this
-   * check, a reschedule that finishes AFTER a concurrent cancellation-handoff already moved the
-   * lead to CANCEL_PENDING would silently force it back to BOOKED, discarding the user's pending
-   * cancellation question with a misleading "RESCHEDULE_CONFIRMED" history row that looks like a
-   * normal confirmation but actually overwrote an unrelated, still-open user request. The
+   * (the expected precondition). Any OTHER current status -- concretely, CANCEL_PENDING, reached
+   * via a concurrent "cancelar cita" turn (handOffToCancellation below) racing this exact
+   * reschedule selection -- is left COMPLETELY untouched, status AND meetingAt both: without this
+   * check, a reschedule finishing AFTER a concurrent cancellation-handoff already moved the lead
+   * to CANCEL_PENDING would silently force it back to BOOKED (and now, with the fix below, ALSO
+   * silently rewrite meetingAt), discarding the user's pending cancellation question. The
    * reschedule's own DB-side effects (new appointment BOOKED, old RESCHEDULED) are NEVER rolled
-   * back here regardless -- they already durably happened and are correct; only the LEAD's status
-   * is left alone.
+   * back here regardless -- they already durably happened and are correct; only the LEAD's fields
+   * are left alone in that race.
+   *
+   * meetingAt sync (this hardening pass): a lead's meetingAt means "the date/time of the next
+   * appointment" -- after a successful reschedule that must be `newAppointment.startsAt`, not the
+   * OLD appointment's time it was set to at the original booking. bookedAt is a DIFFERENT field
+   * ("when the original booking was first confirmed") and is deliberately NEVER touched here --
+   * the reschedule event itself is already fully audited in lead_status_history,
+   * appointment_status_history, and appointment_reschedules, so there is no need for a separate
+   * "rescheduled_at" derived field.
+   *
+   * Idempotency/self-heal: if the lead is ALREADY BOOKED (a duplicate/retry turn for the same
+   * reschedule, or a crash previously left meetingAt stale/null after the status write landed),
+   * meetingAt is corrected to `newAppointment.startsAt` -- the appointment THIS call's caller just
+   * had confirmed as active by AppointmentRescheduleService (never inferred from messages, never
+   * the OLD appointment). No-ops (no write at all) when meetingAt already matches, so a plain
+   * retry never produces a redundant write or a history row (status unchanged -> unchanged is
+   * already a no-op for recordLeadStatusTransition, and this self-heal path never calls it).
    */
-  private async ensureLeadBookedAfterReschedule(lead: Lead): Promise<Lead> {
+  private async ensureLeadBookedAfterReschedule(lead: Lead, newAppointment: Appointment): Promise<Lead> {
     const current = (await this.deps.leads.findById(lead.id)) ?? lead;
-    if (current.status === "BOOKED") return current;
+
+    if (current.status === "BOOKED") {
+      if (current.meetingAt?.getTime() === newAppointment.startsAt.getTime()) return current; // already correct -- true no-op
+      return this.deps.leads.update(lead.id, { meetingAt: newAppointment.startsAt });
+    }
+
     if (current.status !== "RESCHEDULE_REQUESTED") {
       this.deps.logger.warn(
         { leadId: lead.id, expectedStatus: "RESCHEDULE_REQUESTED", actualStatus: current.status },
@@ -259,7 +282,8 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
       );
       return current;
     }
-    return this.transitionLead(current, "BOOKED", "RESCHEDULE_CONFIRMED");
+
+    return this.transitionLead(current, "BOOKED", "RESCHEDULE_CONFIRMED", { meetingAt: newAppointment.startsAt });
   }
 
   /** Item 13: hands off to the SAME CANCEL_PENDING confirm/decline flow BOOKED already uses --

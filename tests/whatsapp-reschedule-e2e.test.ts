@@ -114,6 +114,50 @@ describe("Phase 4C -- WHATSAPP_RESCHEDULE_ENABLED flag matrix", () => {
   });
 });
 
+describe("Phase 4C post-mortem -- item F: meeting-time sync, full E2E through the real booking + reschedule webhook pipeline", () => {
+  it("real booking (09:00) -> real reschedule (09:30) -> lead BOOKED with meetingAt=09:30, bookedAt preserved from the ORIGINAL booking", async () => {
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappRescheduleEnabled: true, whatsappBookingEnabled: true });
+    const { lead } = await createLeadAtStatus(repos, "5214778890199", "BOOKING_PENDING", { bookingStartedAt: new Date() });
+    const conversation = await repos.conversationsRepo.findActiveByLeadId(lead.id);
+
+    // Real booking flow -- offer, select position 1 (09:00).
+    await send(app, "5214778890199", "wamid.f1", "hola");
+    const bookingRound = await repos.offeredSlotsRepo.listActiveByConversationId(conversation!.id, new Date());
+    const position1 = bookingRound.find((s) => s.position === 1)!;
+    await send(app, "5214778890199", "wamid.f2", "1");
+
+    const bookedLead = await repos.leadsRepo.findById(lead.id);
+    expect(bookedLead?.status).toBe("BOOKED");
+    const originalBookedAt = bookedLead!.bookedAt;
+    expect(originalBookedAt).toBeTruthy();
+    expect(bookedLead!.meetingAt?.getTime()).toBe(position1.slotStart.getTime());
+    const oldAppointment = await repos.appointmentsRepo.findActiveByLeadId(lead.id);
+    expect(oldAppointment!.startsAt.getTime()).toBe(position1.slotStart.getTime());
+
+    // Real reschedule flow -- request, then select the new offer's position 1 (the calendar's
+    // next available slot, distinct from the original -- the original time is now Calendar-busy).
+    await send(app, "5214778890199", "wamid.f3", "quiero reagendar");
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
+    const rescheduleRound = await repos.offeredSlotsRepo.listActiveByConversationId(conversation!.id, new Date(), oldAppointment!.id);
+    expect(rescheduleRound.length).toBeGreaterThan(0);
+    const newPosition1 = rescheduleRound.find((s) => s.position === 1)!;
+    expect(newPosition1.slotStart.getTime()).not.toBe(position1.slotStart.getTime()); // genuinely a different, fresh time
+
+    await send(app, "5214778890199", "wamid.f4", "1");
+
+    const finalLead = await repos.leadsRepo.findById(lead.id);
+    expect(finalLead?.status).toBe("BOOKED");
+    const newAppointment = await repos.appointmentsRepo.findActiveByLeadId(lead.id);
+    expect(newAppointment?.rescheduledFrom).toBe(oldAppointment!.id);
+
+    // The two properties under test, per the real production bug report:
+    expect(finalLead?.meetingAt?.getTime()).toBe(newAppointment!.startsAt.getTime()); // synced to the NEW appointment
+    expect(finalLead?.meetingAt?.getTime()).not.toBe(oldAppointment!.startsAt.getTime()); // never left at the OLD time
+    expect(finalLead?.bookedAt?.getTime()).toBe(originalBookedAt!.getTime()); // preserved from the ORIGINAL booking, untouched by the reschedule
+  });
+});
+
 describe("Phase 4C -- full in-memory E2E through the real webhook pipeline", () => {
   it("BOOKED -> quiero reagendar -> RESCHEDULE_REQUESTED -> 1 -> BOOKED with a NEW appointment, old RESCHEDULED, both history tables correct", async () => {
     const repos = buildRepos();

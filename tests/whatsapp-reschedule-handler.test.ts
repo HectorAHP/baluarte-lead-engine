@@ -42,6 +42,10 @@ async function makeBookedLeadWithAppointment(h: ReturnType<typeof makeHandler>) 
   const lead = await h.leads.create({
     country: "MX", productVertical: "GMM", status: "BOOKED", score: 71,
     assignedAdvisor: "Hector Herrera", consentContact: true, whatsappUserId: "5214771234567",
+    // Realistic original-booking data: bookedAt is set once, at the original booking, and must
+    // NEVER change on a later reschedule -- meetingAt starts at the original appointment's time.
+    bookedAt: new Date("2026-02-20T10:00:00.000Z"),
+    meetingAt: new Date("2026-03-02T15:00:00.000Z"),
   });
   const conversation = await h.conversations.create({ leadId: lead.id, channel: "WHATSAPP", status: "ACTIVE" });
   const appointment = await h.appointments.create({
@@ -102,6 +106,8 @@ describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
   it("valid slot selection -> new appointment BOOKED (rescheduledFrom = old.id), old -> RESCHEDULED, lead -> BOOKED, confirmation message with the new date", async () => {
     const h = makeHandler();
     const { pendingLead, conversation, appointment } = await toRescheduleRequested(h);
+    const originalBookedAt = pendingLead.bookedAt;
+    expect(originalBookedAt).toBeTruthy();
 
     await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
 
@@ -112,6 +118,12 @@ describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
     const newAppt = await h.appointments.findActiveByLeadId(pendingLead.id);
     expect(newAppt?.rescheduledFrom).toBe(appointment.id);
     expect(newAppt?.id).not.toBe(appointment.id);
+
+    // A: meetingAt syncs to the NEW appointment's time, never the old one.
+    expect(finalLead?.meetingAt?.getTime()).toBe(newAppt!.startsAt.getTime());
+    expect(finalLead?.meetingAt?.getTime()).not.toBe(appointment.startsAt.getTime());
+    // B: bookedAt is preserved from the original booking -- never overwritten by a reschedule.
+    expect(finalLead?.bookedAt?.getTime()).toBe(originalBookedAt!.getTime());
 
     const lastMessage = h.messaging.sentTexts[h.messaging.sentTexts.length - 1];
     expect(lastMessage.body).toContain("tu cita fue reagendada");
@@ -124,6 +136,62 @@ describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
     const apptHistory = await h.appointmentStatusHistory.listByAppointmentId(appointment.id);
     expect(apptHistory).toHaveLength(1);
     expect(apptHistory[0]).toMatchObject({ fromStatus: "BOOKED", toStatus: "RESCHEDULED" });
+  });
+
+  it("C: a stale-snapshot retry AFTER a completed reschedule never corrupts the already-correct meetingAt/status, and never duplicates history -- findTargetAppointment re-resolves against the NOW-active new appointment (old is RESCHEDULED, no longer 'active'), so this retry is harmlessly absorbed as a fresh (spurious but inert) offer round rather than re-entering the confirmation path -- see the D test below for the genuinely concurrent case that DOES re-enter it", async () => {
+    const h = makeHandler();
+    const { pendingLead, conversation } = await toRescheduleRequested(h);
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+    const afterFirst = (await h.leads.findById(pendingLead.id))!;
+    const newAppt = await h.appointments.findActiveByLeadId(pendingLead.id);
+    expect(afterFirst.meetingAt?.getTime()).toBe(newAppt!.startsAt.getTime());
+    const historyCountAfterFirst = (await h.leadStatusHistory.listByLeadId(pendingLead.id)).length;
+
+    // A retry turn holding the SAME stale RESCHEDULE_REQUESTED snapshot as before the first call.
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+
+    const afterRetry = await h.leads.findById(pendingLead.id);
+    expect(afterRetry?.status).toBe("BOOKED");
+    expect(afterRetry?.meetingAt?.getTime()).toBe(newAppt!.startsAt.getTime()); // never reverted to old, never corrupted
+    const historyCountAfterRetry = (await h.leadStatusHistory.listByLeadId(pendingLead.id)).length;
+    expect(historyCountAfterRetry).toBe(historyCountAfterFirst); // no duplicate row
+  });
+
+  it("C2: TWO genuinely concurrent selections of the SAME slot (both reading the old appointment as still-active before either's CAS lands) converge through ensureLeadBookedAfterReschedule's idempotent/self-heal branch -- meetingAt is set exactly once, to the new appointment's time, never duplicated or reverted", async () => {
+    const h = makeHandler();
+    const { pendingLead, conversation } = await toRescheduleRequested(h);
+
+    await Promise.all([
+      h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW }),
+      h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW }),
+    ]);
+
+    const finalLead = await h.leads.findById(pendingLead.id);
+    const newAppt = await h.appointments.findActiveByLeadId(pendingLead.id);
+    expect(finalLead?.status).toBe("BOOKED");
+    expect(finalLead?.meetingAt?.getTime()).toBe(newAppt!.startsAt.getTime());
+    const leadHistory = await h.leadStatusHistory.listByLeadId(pendingLead.id);
+    expect(leadHistory.filter((r) => r.toStatus === "BOOKED")).toHaveLength(1); // one winner, one write
+  });
+
+  it("D: self-heal -- a lead already BOOKED with a STALE meetingAt (e.g. legacy data from before this fix, or any future bug) is corrected to newAppointment.startsAt the next time ensureLeadBookedAfterReschedule runs for it, with no history row for the pure field correction. This exact branch (current.status already 'BOOKED' when re-read) is unreachable through the public handleTurn API once a reschedule has genuinely completed -- findTargetAppointment always re-resolves against listActiveByLeadId, and the OLD appointment is no longer active once RESCHEDULED, so a later turn can never re-target it. It exists as defense-in-depth insurance (the genuinely-concurrent C2 case above also passes through it, as a no-op) and as the mechanism that would self-heal a lead like this if it were ever reprocessed -- exercised directly here since the public API cannot reach it after the fact.", async () => {
+    const h = makeHandler();
+    const { pendingLead, conversation, appointment } = await toRescheduleRequested(h);
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+    const newAppt = (await h.appointments.findActiveByLeadId(pendingLead.id))!;
+    // Simulate the exact legacy artifact the real production lead had: lead BOOKED, meetingAt
+    // still the OLD appointment's time.
+    await h.leads.update(pendingLead.id, { meetingAt: appointment.startsAt });
+    const staleLead = (await h.leads.findById(pendingLead.id))!;
+    expect(staleLead.meetingAt?.getTime()).toBe(appointment.startsAt.getTime());
+    const historyCountBeforeHeal = (await h.leadStatusHistory.listByLeadId(pendingLead.id)).length;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const healed: typeof staleLead = await (h.handler as any).ensureLeadBookedAfterReschedule(staleLead, newAppt);
+
+    expect(healed.status).toBe("BOOKED");
+    expect(healed.meetingAt?.getTime()).toBe(newAppt.startsAt.getTime()); // healed to the NEW appointment, never old
+    expect((await h.leadStatusHistory.listByLeadId(pendingLead.id)).length).toBe(historyCountBeforeHeal); // no history row for a pure field self-heal
   });
 
   it("invalid text never reschedules -- resends the same active slots", async () => {
