@@ -167,7 +167,13 @@ describe("Pre-launch hardening -- BOOKED lead + generic inbound (post-mortem ite
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214778890305", "BOOKED");
-    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-08-28T15:30:00.000Z"), endsAt: new Date("2026-08-28T16:00:00.000Z"), timezone: "America/Mexico_City" });
+    // Pre-existing test-date fragility (unrelated to this turn's fix, discovered while making
+    // this suite pass): the old appointment must sit far enough in the future that the real
+    // reschedule-slot search this test triggers (which starts from actual wall-clock "now") can
+    // never generate a candidate slot that coincides with it -- every OTHER test in this file
+    // uses "today" safely because none of them actually complete a live slot selection against a
+    // freshly generated offer the way this one does.
+    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2030-06-15T15:30:00.000Z"), endsAt: new Date("2030-06-15T16:00:00.000Z"), timezone: "America/Mexico_City" });
     await send(app, "5214778890305", "wamid.d1", "Quiero reagendar");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
 

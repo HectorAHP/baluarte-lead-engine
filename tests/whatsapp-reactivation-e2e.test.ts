@@ -219,7 +219,11 @@ describe("Pre-launch hardening -- reactivating a CANCELLED lead", () => {
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true });
     const { lead } = await createLeadAtStatus(repos, "5214778890408", "BOOKED");
-    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-08-28T15:30:00.000Z"), endsAt: new Date("2026-08-28T16:00:00.000Z"), timezone: "America/Mexico_City" });
+    // Pre-existing test-date fragility (unrelated to this turn's fix, discovered while making
+    // this suite pass): must sit far enough in the future that the live reschedule-slot search
+    // this test triggers (starting from actual wall-clock "now") can never coincide with it -- see
+    // the identical note in whatsapp-booked-generic-fallback-e2e.test.ts's test D.
+    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2030-06-15T15:30:00.000Z"), endsAt: new Date("2030-06-15T16:00:00.000Z"), timezone: "America/Mexico_City" });
 
     await send(app, "5214778890408", "wamid.h1", "Quiero reagendar");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
