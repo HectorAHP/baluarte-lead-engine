@@ -27,7 +27,11 @@ const transitions: Record<LeadStatus, readonly LeadStatus[]> = {
   // AppointmentCancellationInconsistentError (no BOOKED appointment found / more than one) to
   // escalate from the very first cancellation-intent turn, before the lead ever reaches
   // CANCEL_PENDING.
-  BOOKED:["CONFIRMED","RESCHEDULE_REQUESTED","CANCEL_PENDING","NO_SHOW","MEETING_COMPLETED","HUMAN_HANDOFF","DO_NOT_CONTACT"],
+  // Pre-launch hardening: BOOKED -> BOOKING_PENDING lets a lead whose BOOKED appointment is
+  // stale/past (status still BOOKED but endsAt already elapsed -- see isUpcomingBooked and
+  // WhatsAppPastBookedRecoveryHandler) start a genuinely NEW booking round without ever touching
+  // the old appointment row. Same mechanism/precedent as CANCELLED -> BOOKING_PENDING (Phase 4A).
+  BOOKED:["CONFIRMED","RESCHEDULE_REQUESTED","CANCEL_PENDING","NO_SHOW","MEETING_COMPLETED","BOOKING_PENDING","HUMAN_HANDOFF","DO_NOT_CONTACT"],
   CONFIRMED:["RESCHEDULE_REQUESTED","CANCEL_PENDING","NO_SHOW","MEETING_COMPLETED","HUMAN_HANDOFF","DO_NOT_CONTACT"],
   // Phase 4C addition: RESCHEDULE_REQUESTED -> CANCEL_PENDING. A lead mid-reschedule (offered new
   // slots, hasn't picked one yet) can type a cancellation-intent message instead of a slot

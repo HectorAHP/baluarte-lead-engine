@@ -16,6 +16,7 @@ import { parseSlotSelection } from "../domain/slot-selection-parser.js";
 import { markLeadBooked, escalateToHuman, dispatchSlotOfferOutcome } from "./booking-outcome-dispatch.js";
 import { isBookingAbandonRequest } from "../domain/booking-abandon-intent-detection.js";
 import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
+import { isUpcomingBooked } from "../domain/appointment-timing.js";
 import { assertTransition } from "../domain/state-machine.js";
 import { recordLeadStatusTransition } from "./lead-status-audit.js";
 import {
@@ -98,11 +99,15 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
   }
 
   private async handleTurnInner(lead: Lead, conversationId: string, whatsappUserId: string, inboundText: string, now: Date): Promise<void> {
-    // Appointment guard, ahead of everything else: a BOOKED appointment for this lead already
-    // existing (from this turn's own earlier attempt, or any other path) always wins -- never
-    // re-run Calendar/booking logic once a real appointment exists.
+    // Appointment guard, ahead of everything else: a genuinely UPCOMING BOOKED appointment for
+    // this lead already existing (from this turn's own earlier attempt, or any other path)
+    // always wins -- never re-run Calendar/booking logic once a real appointment exists. A stale
+    // PAST BOOKED row (see isUpcomingBooked) is deliberately never treated as blocking here: a
+    // lead can only reach BOOKING_PENDING with such a row still lying around via
+    // WhatsAppPastBookedRecoveryHandler.startNewBooking, which exists specifically so a past
+    // appointment never permanently traps a lead into a false "already booked" reply.
     const existingAppointment = await this.deps.appointments.findActiveByLeadId(lead.id);
-    if (existingAppointment) {
+    if (existingAppointment && isUpcomingBooked(existingAppointment, now)) {
       await markLeadBooked(this.deps, lead, existingAppointment);
       await this.replyExistingBooking(lead.id, conversationId, whatsappUserId, existingAppointment);
       return;
@@ -169,9 +174,10 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
       return;
     }
 
-    // B. Appointment guard, once more, immediately before booking.
+    // B. Appointment guard, once more, immediately before booking -- same isUpcomingBooked
+    // reasoning as handleTurnInner's guard above (a stale PAST row never blocks this).
     const existingAppointment = await this.deps.appointments.findActiveByLeadId(lead.id);
-    if (existingAppointment) {
+    if (existingAppointment && isUpcomingBooked(existingAppointment, now)) {
       await markLeadBooked(this.deps, lead, existingAppointment);
       await this.replyExistingBooking(lead.id, conversationId, whatsappUserId, existingAppointment);
       return;

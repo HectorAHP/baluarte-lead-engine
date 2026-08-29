@@ -373,7 +373,7 @@ describe("SlotOfferingService.getOrCreateOffer", () => {
     expect(await offeredSlots.listRoundIdsByConversationId(conversationId)).toHaveLength(0);
   });
 
-  it.each<LeadStatus>(["HUMAN_HANDOFF", "DO_NOT_CONTACT", "BOOKED"])(
+  it.each<LeadStatus>(["HUMAN_HANDOFF", "DO_NOT_CONTACT"])(
     "a lead with status %s is never offered slots -- throws LeadNotOfferableError, no Calendar call, no offered_slots",
     async (status) => {
       const calendar = new CountingCalendarProvider(new FakeCalendarProvider());
@@ -399,6 +399,49 @@ describe("SlotOfferingService.getOrCreateOffer", () => {
     expect(outcome.type).toBe("CREATED");
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKING_PENDING");
+  });
+
+  it("pre-launch hardening: a BOOKED lead with NO existing appointment IS now offerable -- lets a stale-BOOKED lead (see WhatsAppPastBookedRecoveryHandler) start a brand-new booking", async () => {
+    const { service, leads } = makeService({ calendar: new FakeCalendarProvider() });
+    const lead = await makeLead(leads, { status: "BOOKED" });
+    const conversationId = randomUUID();
+    const now = new Date("2026-03-02T12:00:00.000Z");
+
+    const outcome = await service.getOrCreateOffer({ lead, conversationId, now });
+
+    expect(outcome.type).toBe("CREATED");
+    const reloadedLead = await leads.findById(lead.id);
+    expect(reloadedLead?.status).toBe("BOOKING_PENDING");
+  });
+
+  it("pre-launch hardening: a BOOKED lead whose appointment is PAST (endsAt <= now) is also offerable -- the stale appointment never blocks a new offer", async () => {
+    const { service, leads, appointments } = makeService({ calendar: new FakeCalendarProvider() });
+    const lead = await makeLead(leads, { status: "BOOKED" });
+    const conversationId = randomUUID();
+    const now = new Date("2026-03-02T12:00:00.000Z");
+    await appointments.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-03-01T15:00:00.000Z"), endsAt: new Date("2026-03-01T15:30:00.000Z"), timezone: "America/Mexico_City" });
+
+    const outcome = await service.getOrCreateOffer({ lead, conversationId, now });
+
+    expect(outcome.type).toBe("CREATED");
+    const reloadedLead = await leads.findById(lead.id);
+    expect(reloadedLead?.status).toBe("BOOKING_PENDING");
+  });
+
+  it("pre-launch hardening: a BOOKED lead whose appointment is genuinely UPCOMING (endsAt > now) is NEVER offered a second, competing future booking -- ALREADY_BOOKED, no Calendar call, no new offered_slots", async () => {
+    const calendar = new CountingCalendarProvider(new FakeCalendarProvider());
+    const { service, leads, appointments, offeredSlots } = makeService({ calendar });
+    const lead = await makeLead(leads, { status: "BOOKED" });
+    const conversationId = randomUUID();
+    const now = new Date("2026-03-02T12:00:00.000Z");
+    const upcoming = await appointments.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-03-05T15:00:00.000Z"), endsAt: new Date("2026-03-05T15:30:00.000Z"), timezone: "America/Mexico_City" });
+
+    const outcome = await service.getOrCreateOffer({ lead, conversationId, now });
+
+    expect(outcome).toEqual({ type: "ALREADY_BOOKED", appointment: upcoming });
+    expect(calendar.calls).toBe(0);
+    expect(await offeredSlots.listActiveByConversationId(conversationId, now)).toHaveLength(0);
+    expect((await leads.findById(lead.id))?.status).toBe("BOOKED"); // never touched
   });
 
   it("caps at MAX_OFFERED_SLOTS (3) even when the calendar provider returns more, all sharing one roundId", async () => {

@@ -4,6 +4,7 @@ import type { OfferedSlot } from "../domain/offered-slot.js";
 import type { Lead, LeadStatus } from "../domain/lead.js";
 import type { Appointment } from "../domain/appointment.js";
 import { assertTransition } from "../domain/state-machine.js";
+import { isUpcomingBooked } from "../domain/appointment-timing.js";
 import { LeadNotOfferableError, SlotOfferClaimInProgressError } from "../domain/errors.js";
 import { assertSingleActiveRound } from "../domain/active-offer-consistency.js";
 import { recordLeadStatusTransition } from "./lead-status-audit.js";
@@ -29,8 +30,17 @@ import { config } from "../config.js";
  * them resume booking later via an explicit new-booking-intent message, same
  * WhatsAppBookingHandler.startNewBooking mechanism QUALIFIED_A/B already use. NURTURE_C ->
  * BOOKING_PENDING is the corresponding new state-machine edge.
+ *
+ * "BOOKED" (pre-launch hardening): a lead whose BOOKED appointment is stale/past (see
+ * isUpcomingBooked) can start a genuinely NEW booking. WhatsAppPastBookedRecoveryHandler is the
+ * ONLY caller that can ever pass a BOOKED lead here, and only after confirming (at the routing
+ * layer, whatsapp-inbound-service.ts) that the lead's current appointment is NOT upcoming --
+ * this is safe precisely BECAUSE the `activeAppointment` guard below is itself time-aware: a
+ * lead with a genuinely upcoming BOOKED appointment always still short-circuits to
+ * ALREADY_BOOKED, so this can never produce a second, competing future booking. BOOKED ->
+ * BOOKING_PENDING was already added as a valid state-machine edge for exactly this.
  */
-const OFFERABLE_LEAD_STATUSES: ReadonlySet<LeadStatus> = new Set(["QUALIFIED_A", "QUALIFIED_B", "NURTURE_C", "BOOKING_PENDING", "CANCELLED"]);
+const OFFERABLE_LEAD_STATUSES: ReadonlySet<LeadStatus> = new Set(["QUALIFIED_A", "QUALIFIED_B", "NURTURE_C", "BOOKING_PENDING", "CANCELLED", "BOOKED"]);
 
 /**
  * How many slots are ever persisted/shown to a lead in a single round, regardless of how many
@@ -208,8 +218,11 @@ export class SlotOfferingService {
       // (it isn't superseded until AFTER a new slot is selected) -- never a conflict, so this
       // guard simply does not apply. WhatsAppRescheduleHandler is the one that validates "exactly
       // one active appointment" before ever calling here.
+      // Pre-launch hardening: a PAST BOOKED appointment (status still BOOKED, but endsAt already
+      // elapsed) never blocks a new offer -- only a genuinely upcoming one does. See
+      // isUpcomingBooked / WhatsAppPastBookedRecoveryHandler.
       const activeAppointment = await this.appointments.findActiveByLeadId(lead.id);
-      if (activeAppointment) return { type: "ALREADY_BOOKED", appointment: activeAppointment };
+      if (activeAppointment && isUpcomingBooked(activeAppointment, now)) return { type: "ALREADY_BOOKED", appointment: activeAppointment };
     }
 
     const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now, rescheduleContextIdOf(mode));
@@ -247,8 +260,11 @@ export class SlotOfferingService {
     this.assertOfferable(lead, mode);
 
     if (mode?.type !== "RESCHEDULE") {
+      // Pre-launch hardening: a PAST BOOKED appointment (status still BOOKED, but endsAt already
+      // elapsed) never blocks a new offer -- only a genuinely upcoming one does. See
+      // isUpcomingBooked / WhatsAppPastBookedRecoveryHandler.
       const activeAppointment = await this.appointments.findActiveByLeadId(lead.id);
-      if (activeAppointment) return { type: "ALREADY_BOOKED", appointment: activeAppointment };
+      if (activeAppointment && isUpcomingBooked(activeAppointment, now)) return { type: "ALREADY_BOOKED", appointment: activeAppointment };
     }
 
     const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now, rescheduleContextIdOf(mode));

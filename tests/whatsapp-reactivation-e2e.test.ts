@@ -205,8 +205,11 @@ describe("Pre-launch hardening -- reactivating a CANCELLED lead", () => {
   it("G: BOOKED generic fallback still works, no regression", async () => {
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true });
-    const { lead, conversation } = await createLeadAtStatus(repos, "5214778890407", "BOOKED", { bookedAt: new Date(), meetingAt: new Date("2026-08-28T15:30:00.000Z") });
-    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-08-28T15:30:00.000Z"), endsAt: new Date("2026-08-28T16:00:00.000Z"), timezone: "America/Mexico_City" });
+    // A genuinely FUTURE appointment (not "today"/a fixed near-term date -- see the pre-launch
+    // "stale/past BOOKED appointment" hardening pass, which now routes a past-dated BOOKED lead
+    // to WhatsAppPastBookedRecoveryHandler instead of this generic fallback).
+    const { lead, conversation } = await createLeadAtStatus(repos, "5214778890407", "BOOKED", { bookedAt: new Date(), meetingAt: new Date("2030-06-15T15:30:00.000Z") });
+    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2030-06-15T15:30:00.000Z"), endsAt: new Date("2030-06-15T16:00:00.000Z"), timezone: "America/Mexico_City" });
 
     await send(app, "5214778890407", "wamid.g1", "Hola, quiero información");
 
@@ -231,7 +234,9 @@ describe("Pre-launch hardening -- reactivating a CANCELLED lead", () => {
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKED");
 
     const { lead: lead2 } = await createLeadAtStatus(repos, "5214778890409", "BOOKED");
-    await repos.appointmentsRepo.create({ leadId: lead2.id, status: "BOOKED", startsAt: new Date("2026-08-29T15:30:00.000Z"), endsAt: new Date("2026-08-29T16:00:00.000Z"), timezone: "America/Mexico_City" });
+    // Same future-date safety as lead1's appointment above -- a different day so the two never
+    // collide in InMemoryAppointmentRepository's global overlap check.
+    await repos.appointmentsRepo.create({ leadId: lead2.id, status: "BOOKED", startsAt: new Date("2030-06-16T15:30:00.000Z"), endsAt: new Date("2030-06-16T16:00:00.000Z"), timezone: "America/Mexico_City" });
     await send(app, "5214778890409", "wamid.h3", "Quiero cancelar");
     expect((await repos.leadsRepo.findById(lead2.id))?.status).toBe("CANCEL_PENDING");
     await send(app, "5214778890409", "wamid.h4", "1");

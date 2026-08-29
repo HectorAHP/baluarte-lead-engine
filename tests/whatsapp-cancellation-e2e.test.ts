@@ -77,7 +77,13 @@ async function createLeadAtStatus(repos: ReturnType<typeof buildRepos>, whatsapp
 describe("Phase 4B -- WHATSAPP_CANCELLATION_ENABLED flag matrix", () => {
   it("false (default): a BOOKED lead's cancellation-intent message gets no automated reply -- Phase 3C behavior unchanged", async () => {
     const repos = buildRepos();
-    const app = await buildTestApp({ ...repos, whatsappCancellationEnabled: false, whatsappBookingEnabled: true });
+    // whatsappBookingEnabled: false too -- this test isolates the cancellation flag specifically.
+    // With it on, this exact fixture (a BOOKED lead with literally no appointment row) would
+    // correctly be picked up by the pre-launch "stale/past BOOKED appointment" recovery handler
+    // instead (gated on whatsappBookingEnabled, independent of the cancellation flag) -- that is
+    // deliberate, tested separately (see whatsapp-past-booked-recovery-e2e.test.ts), and not what
+    // this test is about.
+    const app = await buildTestApp({ ...repos, whatsappCancellationEnabled: false, whatsappBookingEnabled: false });
     const { lead } = await createLeadAtStatus(repos, "5214778880001", "BOOKED");
 
     const res = await send(app, "5214778880001", "wamid.c1", "cancelar cita");

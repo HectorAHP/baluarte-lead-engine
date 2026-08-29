@@ -1,4 +1,4 @@
-import type { LeadRepository, ConversationRepository, MessageRepository, MessagingProvider, Logger } from "./ports.js";
+import type { LeadRepository, ConversationRepository, MessageRepository, MessagingProvider, Logger, AppointmentRepository } from "./ports.js";
 import type { LeadService } from "./services.js";
 import type { Lead } from "../domain/lead.js";
 import { persistInboundMessage } from "./message-ingestion.js";
@@ -7,6 +7,7 @@ import { normalizePhoneToE164 } from "../domain/phone.js";
 import { isOptOutMessage } from "../domain/opt-out-detection.js";
 import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isCancellationRequest } from "../domain/cancellation-intent-detection.js";
+import { isUpcomingBooked } from "../domain/appointment-timing.js";
 import { buildWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE, BOOKED_GENERIC_INBOUND_MESSAGE } from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
 
@@ -58,6 +59,16 @@ export interface ReactivationTurnHandler {
   handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
 }
 
+/**
+ * Pre-launch hardening: recovers a BOOKED lead whose appointment is stale/past (status still
+ * BOOKED, but endsAt already elapsed -- see isUpcomingBooked). Injected only when
+ * config.WHATSAPP_BOOKING_ENABLED is true (see app.ts), same reasoning as ReactivationTurnHandler
+ * above. WhatsAppPastBookedRecoveryHandler implements this.
+ */
+export interface PastBookedRecoveryTurnHandler {
+  handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
+}
+
 export interface InboundWhatsAppText {
   whatsappUserId: string;
   phoneRaw: string;
@@ -94,6 +105,15 @@ export interface WhatsAppInboundDeps {
    * -- see app.ts). Absent (the default), the CANCELLED routing branch below is never taken and a
    * CANCELLED lead falls through to the same "no automated reply" fallback as before, unchanged. */
   reactivationHandler?: ReactivationTurnHandler;
+  /** Present only when the pre-launch past-booked-recovery feature is on (reuses
+   * WHATSAPP_BOOKING_ENABLED -- see app.ts). Absent (the default), the "is this lead's appointment
+   * actually upcoming" check below is skipped entirely (no extra read), and a BOOKED lead's text
+   * is routed exactly as it was before this hardening pass -- byte-for-byte unchanged, including
+   * for a stale/past appointment. */
+  pastBookedRecoveryHandler?: PastBookedRecoveryTurnHandler;
+  /** Present only alongside pastBookedRecoveryHandler -- used ONLY to read the lead's current
+   * appointment for the isUpcomingBooked check above, never written to from this file. */
+  appointments?: AppointmentRepository;
 }
 
 export type WhatsAppInboundOutcome = "DUPLICATE" | "PROCESSED";
@@ -236,6 +256,23 @@ export async function handleInboundWhatsAppText(
       if (deps.rescheduleHandler && lead.status === "RESCHEDULE_REQUESTED") {
         await deps.rescheduleHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
+      }
+      // Pre-launch hardening: a BOOKED lead whose appointment is stale/past (status still
+      // BOOKED, but endsAt already elapsed) is routed to a dedicated recovery handler INSTEAD OF
+      // the reschedule-intent / cancellation / generic-BOOKED-fallback branches below -- all of
+      // which previously treated ANY status==="BOOKED" row as a genuine, current commitment
+      // (isUpcomingBooked's doc comment has the full "why"). Checked BEFORE the reschedule-intent
+      // branch immediately below so a past appointment is never mistaken for one still being
+      // rescheduled/cancelled. Gated on BOTH pastBookedRecoveryHandler and appointments being
+      // present -- absent either, this extra read/branch is skipped entirely and a BOOKED lead's
+      // text is routed exactly as it was before this hardening pass, unchanged.
+      if (deps.pastBookedRecoveryHandler && deps.appointments && lead.status === "BOOKED") {
+        const activeAppointment = await deps.appointments.findActiveByLeadId(lead.id);
+        const hasUpcomingAppointment = !!activeAppointment && isUpcomingBooked(activeAppointment, new Date());
+        if (!hasUpcomingAppointment) {
+          await deps.pastBookedRecoveryHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
+          return;
+        }
       }
       // Phase 4C: a BOOKED lead's free text is checked for reschedule-intent BEFORE
       // cancellation-intent -- one explicit, deterministic precedence decision here (mirroring

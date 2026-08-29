@@ -86,7 +86,7 @@ async function createLeadAtStatus(repos: ReturnType<typeof buildRepos>, whatsapp
     country: "MX", productVertical: "GMM", productInterest: "GMM", status: "NEW", score: 81,
     assignedAdvisor: "Hector Herrera", consentContact: true, whatsappUserId,
     bookedAt: new Date("2026-08-20T10:00:00.000Z"),
-    meetingAt: new Date("2026-08-28T15:30:00.000Z"),
+    meetingAt: new Date("2030-06-15T15:30:00.000Z"),
     ...overrides,
   });
   await repos.leadsRepo.update(lead.id, { status, ...overrides });
@@ -104,7 +104,7 @@ describe("Pre-launch hardening -- BOOKED transactional intents must win over the
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214778890401", "BOOKED");
-    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-08-28T15:30:00.000Z"), endsAt: new Date("2026-08-28T16:00:00.000Z"), timezone: "America/Mexico_City" });
+    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2030-06-15T15:30:00.000Z"), endsAt: new Date("2030-06-15T16:00:00.000Z"), timezone: "America/Mexico_City" });
 
     await send(app, "5214778890401", "wamid.a1", "Reagendar");
 
@@ -117,7 +117,7 @@ describe("Pre-launch hardening -- BOOKED transactional intents must win over the
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214778890402", "BOOKED");
-    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-08-28T15:30:00.000Z"), endsAt: new Date("2026-08-28T16:00:00.000Z"), timezone: "America/Mexico_City" });
+    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2030-06-15T15:30:00.000Z"), endsAt: new Date("2030-06-15T16:00:00.000Z"), timezone: "America/Mexico_City" });
 
     await send(app, "5214778890402", "wamid.b1", "reagendar");
 
@@ -130,7 +130,7 @@ describe("Pre-launch hardening -- BOOKED transactional intents must win over the
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214778890403", "BOOKED");
-    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-08-28T15:30:00.000Z"), endsAt: new Date("2026-08-28T16:00:00.000Z"), timezone: "America/Mexico_City" });
+    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2030-06-15T15:30:00.000Z"), endsAt: new Date("2030-06-15T16:00:00.000Z"), timezone: "America/Mexico_City" });
 
     await send(app, "5214778890403", "wamid.c1", "REAGENDAR");
 
@@ -143,7 +143,7 @@ describe("Pre-launch hardening -- BOOKED transactional intents must win over the
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214778890404", "BOOKED");
-    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-08-28T15:30:00.000Z"), endsAt: new Date("2026-08-28T16:00:00.000Z"), timezone: "America/Mexico_City" });
+    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2030-06-15T15:30:00.000Z"), endsAt: new Date("2030-06-15T16:00:00.000Z"), timezone: "America/Mexico_City" });
 
     await send(app, "5214778890404", "wamid.d1", "  Reagendar  ");
 
@@ -156,7 +156,7 @@ describe("Pre-launch hardening -- BOOKED transactional intents must win over the
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214778890405", "BOOKED");
-    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-08-28T15:30:00.000Z"), endsAt: new Date("2026-08-28T16:00:00.000Z"), timezone: "America/Mexico_City" });
+    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2030-06-15T15:30:00.000Z"), endsAt: new Date("2030-06-15T16:00:00.000Z"), timezone: "America/Mexico_City" });
 
     await send(app, "5214778890405", "wamid.e1", "Quiero reagendar mi cita");
 
@@ -169,7 +169,7 @@ describe("Pre-launch hardening -- BOOKED transactional intents must win over the
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214778890406", "BOOKED");
-    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-08-28T15:30:00.000Z"), endsAt: new Date("2026-08-28T16:00:00.000Z"), timezone: "America/Mexico_City" });
+    await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2030-06-15T15:30:00.000Z"), endsAt: new Date("2030-06-15T16:00:00.000Z"), timezone: "America/Mexico_City" });
 
     await send(app, "5214778890406", "wamid.f1", "Cancelar");
 
@@ -182,7 +182,7 @@ describe("Pre-launch hardening -- BOOKED transactional intents must win over the
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214778890407", "BOOKED");
-    const appointment = await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2026-08-28T15:30:00.000Z"), endsAt: new Date("2026-08-28T16:00:00.000Z"), timezone: "America/Mexico_City" });
+    const appointment = await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2030-06-15T15:30:00.000Z"), endsAt: new Date("2030-06-15T16:00:00.000Z"), timezone: "America/Mexico_City" });
 
     await send(app, "5214778890407", "wamid.g1", "Hola tengo una duda");
 

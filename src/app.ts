@@ -39,6 +39,7 @@ import { WhatsAppBookingHandler } from "./application/whatsapp-booking-handler.j
 import { WhatsAppCancellationHandler } from "./application/whatsapp-cancellation-handler.js";
 import { WhatsAppRescheduleHandler } from "./application/whatsapp-reschedule-handler.js";
 import { WhatsAppReactivationHandler } from "./application/whatsapp-reactivation-handler.js";
+import { WhatsAppPastBookedRecoveryHandler } from "./application/whatsapp-past-booked-recovery-handler.js";
 import { extractWhatsAppMessages } from "./domain/whatsapp-webhook-payload.js";
 import { verifyMetaSignature } from "./domain/meta-signature.js";
 import { timingSafeEqualStrings } from "./domain/timing-safe-compare.js";
@@ -338,6 +339,24 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
       )
     : undefined;
 
+  // Pre-launch hardening: recovers a BOOKED lead whose appointment is stale/past. Same
+  // whatsappBookingEnabled reuse and undefined-keeps-routing-untaken reasoning as
+  // reactivationHandler above -- see WhatsAppPastBookedRecoveryHandler's class doc comment.
+  const pastBookedRecoveryHandler = whatsappBookingEnabled
+    ? new WhatsAppPastBookedRecoveryHandler(
+        {
+          leads: leadsRepo,
+          conversations: conversationsRepo,
+          slotOffering: slotOfferingService,
+          messaging,
+          messages: messagesRepo,
+          leadStatusHistory: leadStatusHistoryRepo,
+          logger: app.log,
+        },
+        config.ADVISOR_TIMEZONE,
+      )
+    : undefined;
+
   // Sanitized: all flags are plain booleans, never secrets/tokens/message bodies.
   app.log.info({ qualificationEngineEnabled, whatsappBookingEnabled, whatsappCancellationEnabled, whatsappRescheduleEnabled }, "Phase 3B/3C/4B/4C WhatsApp feature flags");
 
@@ -418,7 +437,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
         continue;
       }
       await handleInboundWhatsAppText(
-        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler, reactivationHandler },
+        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler, reactivationHandler, pastBookedRecoveryHandler, appointments: appointmentsRepo },
         message,
       );
     }

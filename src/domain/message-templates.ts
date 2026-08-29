@@ -271,3 +271,29 @@ export const CANCELLED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE =
 /** C. "Quiero cancelar" from a CANCELLED lead -- idempotent, non-destructive: nothing to cancel
  * again, no Calendar call, no state change. */
 export const CANCELLED_ALREADY_MESSAGE = "Tu cita anterior ya está cancelada.";
+
+// ---------------------------------------------------------------------------------------------
+// Pre-launch hardening -- a BOOKED lead whose appointment is stale/past (status still BOOKED, but
+// endsAt already elapsed -- see isUpcomingBooked). Same "never silence, never imply a state that
+// didn't happen, never a destructive automatic action" principles as the CANCELLED-reactivation
+// copy above, but distinct wording: this lead's own appointment record still says BOOKED, so the
+// copy must not falsely claim it was cancelled -- only that it already passed. See
+// WhatsAppPastBookedRecoveryHandler.
+// ---------------------------------------------------------------------------------------------
+
+/** A. Generic inbound (no clear intent) -- explains the appointment already passed, offers a new
+ * one, without starting anything or implying the old one was ever cancelled. */
+export const PAST_BOOKED_GENERIC_INBOUND_MESSAGE =
+  "¡Hola! Veo que la fecha de tu cita anterior ya pasó. Si quieres agendar una nueva, escribe \"agendar\". Si prefieres hacer una pregunta primero, escríbela aquí y con gusto te ayudamos.";
+
+/** B. "Quiero reagendar" for a past appointment -- there is nothing left to move (the original
+ * time already elapsed), so this is reframed as a new-booking intent, same reasoning as
+ * CANCELLED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE. */
+export const PAST_BOOKED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE =
+  "La fecha de tu cita anterior ya pasó. Puedo ayudarte a agendar una nueva.";
+
+/** C. "Quiero cancelar" for a past appointment -- non-destructive: never calls Calendar, never
+ * touches the appointment or lead status. A cancellation only makes sense for something still
+ * upcoming. */
+export const PAST_BOOKED_CANCELLATION_MESSAGE =
+  "La fecha de esa cita ya pasó, así que no hay nada que cancelar. Si quieres agendar una nueva, escribe \"agendar\".";
