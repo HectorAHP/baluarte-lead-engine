@@ -16,8 +16,8 @@ import type { AppointmentRescheduleService } from "./appointment-reschedule-serv
 import { parseSlotSelection } from "../domain/slot-selection-parser.js";
 import {
   RESCHEDULE_INTRO_MESSAGE, buildRescheduleConfirmedMessage, RESCHEDULE_TECHNICAL_ERROR_MESSAGE,
-  RESCHEDULE_IN_PROGRESS_MESSAGE, buildInvalidSelectionMessage, buildCancelConfirmationPromptMessage,
-  formatSlotForDisplay,
+  RESCHEDULE_IN_PROGRESS_MESSAGE, buildInvalidSelectionMessage, buildReschedulePendingFallbackMessage,
+  buildCancelConfirmationPromptMessage, formatSlotForDisplay,
 } from "../domain/message-templates.js";
 import { config } from "../config.js";
 
@@ -128,7 +128,13 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     const selection = parseSlotSelection(inboundText, activeSlots, now);
 
     if (selection.type === "INVALID") {
-      await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildInvalidSelectionMessage(activeSlots, this.advisorTimezone));
+      // Pre-launch hardening (same fix as WhatsAppBookingHandler's identical BOOKING_PENDING
+      // trap): a general question no longer gets the terse "Por favor responde 1, 2 o 3"
+      // reminder -- buildReschedulePendingFallbackMessage restates the same active options but
+      // names the REAL escape hatch here (cancellation-intent is already checked above this
+      // method's active-round lookup and hands off into CANCEL_PENDING -- see
+      // handOffToCancellation), instead of only ever repeating the same instruction.
+      await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildReschedulePendingFallbackMessage(activeSlots, this.advisorTimezone));
       return;
     }
 

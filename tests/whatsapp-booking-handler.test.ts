@@ -290,7 +290,11 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
 
     expect(calendar.calls).toBe(0);
     expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("Por favor responde");
+    // Pre-launch hardening: no longer the terse "Por favor responde 1, 2 o 3" nag -- a friendlier
+    // fallback that still restates the active options and names the abandon escape hatch.
+    expect(messaging.sentTexts[0].body).toContain("Estamos en el proceso de agendar tu cita");
+    expect(messaging.sentTexts[0].body).toContain("Responde con el número de la opción que prefieras");
+    expect(messaging.sentTexts[0].body).toContain('"cancelar"');
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKING_PENDING");
   });

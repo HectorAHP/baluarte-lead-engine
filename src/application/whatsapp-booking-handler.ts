@@ -11,11 +11,16 @@ import {
 } from "../domain/errors.js";
 import { sendAndPersistReply, type BookingTurnHandler } from "./whatsapp-inbound-service.js";
 import type { SlotOfferingService } from "./slot-offering-service.js";
-import type { AppointmentService } from "./services.js";
+import { targetStatusForScore, type AppointmentService } from "./services.js";
 import { parseSlotSelection } from "../domain/slot-selection-parser.js";
 import { markLeadBooked, escalateToHuman, dispatchSlotOfferOutcome } from "./booking-outcome-dispatch.js";
+import { isBookingAbandonRequest } from "../domain/booking-abandon-intent-detection.js";
+import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
+import { assertTransition } from "../domain/state-machine.js";
+import { recordLeadStatusTransition } from "./lead-status-audit.js";
 import {
   buildInvalidSelectionMessage, buildBookingConfirmedMessage, buildExistingBookingMessage,
+  buildBookingPendingFallbackMessage, BOOKING_ABANDONED_MESSAGE,
   BOOKING_IN_PROGRESS_MESSAGE, BOOKING_TECHNICAL_ERROR_MESSAGE, SLOT_OFFER_CLAIM_IN_PROGRESS_MESSAGE,
   formatSlotForDisplay,
 } from "../domain/message-templates.js";
@@ -54,16 +59,42 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
   async handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void> {
     const { lead, conversationId, whatsappUserId, inboundText, now } = params;
 
-    // Guard: this handler only ever acts on a lead currently in BOOKING_PENDING. Anything else
-    // (still QUALIFIED_A/B, already BOOKED, HUMAN_HANDOFF, ...) is a no-op -- no Calendar call,
-    // no message, no state change of any kind.
-    if (lead.status !== "BOOKING_PENDING") return;
-
-    try {
-      await this.handleTurnInner(lead, conversationId, whatsappUserId, inboundText, now);
-    } catch (err) {
-      await this.handleError(err, lead, conversationId, whatsappUserId);
+    if (lead.status === "BOOKING_PENDING") {
+      try {
+        await this.handleTurnInner(lead, conversationId, whatsappUserId, inboundText, now);
+      } catch (err) {
+        await this.handleError(err, lead, conversationId, whatsappUserId);
+      }
+      return;
     }
+
+    // Pre-launch hardening: a QUALIFIED_A/QUALIFIED_B/NURTURE_C lead explicitly asking to book
+    // (most commonly right after abandoning a prior BOOKING_PENDING round -- see
+    // abandonBookingPending below) starts/reuses an offer. Anything else from these statuses is a
+    // no-op -- same silent "no automated reply" fallback these statuses already had before this
+    // hardening pass; this only ADDS the explicit new-booking-intent capability, never broadens
+    // what else gets a reply. whatsapp-inbound-service.ts dispatches to this handler unconditionally
+    // on status alone for these three (mirroring the CANCELLED -> WhatsAppReactivationHandler
+    // precedent), so the intent check lives here, not duplicated at the routing layer.
+    if ((lead.status === "QUALIFIED_A" || lead.status === "QUALIFIED_B" || lead.status === "NURTURE_C") && isNewBookingRequest(inboundText)) {
+      try {
+        await this.startNewBooking(lead, conversationId, whatsappUserId, now);
+      } catch (err) {
+        await this.handleError(err, lead, conversationId, whatsappUserId);
+      }
+      return;
+    }
+  }
+
+  /** Reuses SlotOfferingService's existing QUALIFIED_A/B/NURTURE_C -> BOOKING_PENDING transition
+   * (booking mode, the default -- no `mode` param) -- no bespoke transition-writing logic here,
+   * same pattern as WhatsAppReactivationHandler.startNewBooking. If an active round from before an
+   * abandon is still live (within its TTL), getOrCreateOffer reuses it as-is (item C.4 of the
+   * pre-launch spec: "reofrecer/reutilizar ronda vigente si corresponde") -- otherwise a fresh one
+   * is created, subject to the same MAX_OFFER_ROUNDS budget as any other booking round. */
+  private async startNewBooking(lead: Lead, conversationId: string, whatsappUserId: string, now: Date): Promise<void> {
+    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now });
+    await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
   }
 
   private async handleTurnInner(lead: Lead, conversationId: string, whatsappUserId: string, inboundText: string, now: Date): Promise<void> {
@@ -74,6 +105,16 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     if (existingAppointment) {
       await markLeadBooked(this.deps, lead, existingAppointment);
       await this.replyExistingBooking(lead.id, conversationId, whatsappUserId, existingAppointment);
+      return;
+    }
+
+    // Pre-launch hardening (item C.2): "cancelar"/"ya no"/"salir" while BOOKING_PENDING -- checked
+    // BEFORE ever attempting to parse the text as a slot selection, same precedence discipline as
+    // WhatsAppRescheduleHandler checking cancellation-intent before parseSlotSelection. No
+    // appointment exists at this point (the guard immediately above already returned if one did),
+    // so this can never be mistaken for an appointment cancellation.
+    if (isBookingAbandonRequest(inboundText)) {
+      await this.abandonBookingPending(lead, conversationId, whatsappUserId);
       return;
     }
 
@@ -91,9 +132,14 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     const selection = parseSlotSelection(inboundText, activeSlots, now);
 
     if (selection.type === "INVALID") {
+      // Pre-launch hardening (item C.3): a general question ("¿Cuáles son los servicios?") or any
+      // other unrecognized text no longer gets the terse "Por favor responde 1, 2 o 3" reminder --
+      // buildBookingPendingFallbackMessage restates the SAME active options (so item C.4's
+      // "reofrecer ronda vigente" still holds for a vague retry) but frames it informatively and
+      // names the abandon escape hatch, instead of only ever repeating the same instruction.
       // Reuses the SAME active offered_slots already loaded above -- never a new round, never a
-      // new Calendar call, just the same options restated.
-      await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildInvalidSelectionMessage(activeSlots, this.advisorTimezone));
+      // new Calendar call.
+      await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildBookingPendingFallbackMessage(activeSlots, this.advisorTimezone));
       return;
     }
 
@@ -181,6 +227,42 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     await this.deps.offeredSlots.update(slot.id, { selected: true });
     await markLeadBooked(this.deps, lead, appointment);
     await this.replyBookingConfirmed(lead.id, conversationId, whatsappUserId, appointment);
+  }
+
+  /**
+   * Item C.2 (pre-launch hardening): "cancelar"/"ya no"/"salir" during BOOKING_PENDING means
+   * abandon the booking PROCESS, never cancel an appointment -- no appointment exists yet at this
+   * point (handleTurnInner's existingAppointment guard already returned if one did). Returns the
+   * lead to its TRUE prior qualified tier via targetStatusForScore(lead.scoreClass) -- the EXACT
+   * SAME mapping LeadService uses to land a freshly-scored lead on QUALIFIED_A/QUALIFIED_B/
+   * NURTURE_C -- rather than collapsing every tier into NURTURE_C. product/score/scoreClass/
+   * qualification_answers/lead_scores/qualifiedAt are all untouched: this method writes only
+   * leads.status.
+   *
+   * Re-fetches the lead's current status before writing -- same stale-snapshot discipline as
+   * WhatsAppRescheduleHandler's ensureLeadBookedAfterReschedule/handOffToCancellation: if a
+   * concurrent turn already moved the lead elsewhere (e.g. a race just booked it), this leaves it
+   * alone rather than writing a misleading transition on top of what already happened.
+   */
+  private async abandonBookingPending(lead: Lead, conversationId: string, whatsappUserId: string): Promise<void> {
+    const current = (await this.deps.leads.findById(lead.id)) ?? lead;
+    if (current.status !== "BOOKING_PENDING") {
+      this.deps.logger.warn(
+        { leadId: lead.id, expectedStatus: "BOOKING_PENDING", actualStatus: current.status },
+        "Booking-abandon intent arrived for a lead no longer BOOKING_PENDING (a concurrent turn already resolved it) -- left unactioned.",
+      );
+      return;
+    }
+    const target = targetStatusForScore(current.scoreClass ?? "C");
+    assertTransition(current.status, target);
+    await this.deps.leads.update(lead.id, { status: target });
+    await recordLeadStatusTransition(this.deps.leadStatusHistory, this.deps.logger, {
+      leadId: lead.id,
+      fromStatus: current.status,
+      toStatus: target,
+      eventType: "BOOKING_ABANDONED",
+    });
+    await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, BOOKING_ABANDONED_MESSAGE);
   }
 
   /**

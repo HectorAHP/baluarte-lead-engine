@@ -204,6 +204,19 @@ export async function handleInboundWhatsAppText(
         await deps.qualificationHandler.handleTurn({ lead: recoveredLead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text });
         return;
       }
+      // Pre-launch hardening: a QUALIFIED_A/QUALIFIED_B/NURTURE_C lead's free text is checked by
+      // WhatsAppBookingHandler itself for explicit new-booking intent (isNewBookingRequest) --
+      // most commonly reached right after abandoning a prior BOOKING_PENDING round (see
+      // WhatsAppBookingHandler.abandonBookingPending), but also reachable for a lead who simply
+      // never started booking yet. Anything else from these statuses is left completely
+      // untouched by the handler -- same silent "no automated reply" fallback these statuses
+      // already had before this hardening pass. Dispatches unconditionally on status alone,
+      // mirroring the CANCELLED -> reactivationHandler precedent below (the intent check lives
+      // inside the handler, not duplicated here).
+      if (deps.bookingHandler && (lead.status === "QUALIFIED_A" || lead.status === "QUALIFIED_B" || lead.status === "NURTURE_C")) {
+        await deps.bookingHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
+        return;
+      }
       // Phase 3C: a lead in BOOKING_PENDING is picking a slot, declining, or otherwise replying
       // to the booking flow -- routed here, after every earlier guard (opt-out, medical-sensitive
       // handoff, welcome/new-lead, QUALIFYING, CONTACTED recovery) has already had first chance

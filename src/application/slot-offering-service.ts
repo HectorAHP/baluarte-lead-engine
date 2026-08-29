@@ -23,8 +23,14 @@ import { config } from "../config.js";
  * logic needed. The old (CANCELLED) appointment is never touched, restored, or referenced by this
  * or the resulting booking in any way -- AppointmentService.book() creates a wholly independent
  * new appointment, exactly like a lead's very first booking.
+ *
+ * "NURTURE_C" (pre-launch hardening): a lead who abandoned a prior BOOKING_PENDING round can land
+ * back on NURTURE_C (see targetStatusForScore) if that was their true qualified tier -- this lets
+ * them resume booking later via an explicit new-booking-intent message, same
+ * WhatsAppBookingHandler.startNewBooking mechanism QUALIFIED_A/B already use. NURTURE_C ->
+ * BOOKING_PENDING is the corresponding new state-machine edge.
  */
-const OFFERABLE_LEAD_STATUSES: ReadonlySet<LeadStatus> = new Set(["QUALIFIED_A", "QUALIFIED_B", "BOOKING_PENDING", "CANCELLED"]);
+const OFFERABLE_LEAD_STATUSES: ReadonlySet<LeadStatus> = new Set(["QUALIFIED_A", "QUALIFIED_B", "NURTURE_C", "BOOKING_PENDING", "CANCELLED"]);
 
 /**
  * How many slots are ever persisted/shown to a lead in a single round, regardless of how many

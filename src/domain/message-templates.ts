@@ -127,6 +127,50 @@ export const BOOKING_NO_AVAILABILITY_MESSAGE =
   "Por ahora no tengo horarios disponibles para ofrecerte. En cuanto haya opciones te aviso, o si lo prefieres, un asesor puede contactarte directamente.";
 
 /**
+ * H. Shared by buildBookingPendingFallbackMessage/buildReschedulePendingFallbackMessage below --
+ * pre-launch hardening: replaces the old behavior of resending buildInvalidSelectionMessage's
+ * terse "Por favor responde 1, 2 o 3" reminder for EVERY unrecognized inbound while
+ * BOOKING_PENDING/RESCHEDULE_REQUESTED (a general question like "¿Cuáles son los servicios?" got
+ * the exact same nag as a genuinely invalid number). Still restates the active options (so
+ * "agendar"/a vague retry naturally reoffers the current round -- item C.4 of the pre-launch
+ * spec) but frames it informatively and always names the way out, instead of only ever repeating
+ * the same instruction.
+ */
+function buildPendingFallbackMessage(intro: string, escapeInstruction: string, slots: OfferedSlot[], timezone: string): string {
+  return `${intro}\n\n${formatSlotList(slots, timezone)}\n\nResponde con el número de la opción que prefieras, o ${escapeInstruction}. Si tienes otra duda, escríbela aquí y con gusto te ayudamos.`;
+}
+
+/** BOOKING_PENDING: no appointment exists yet -- the escape hatch is "cancelar" (abandon the
+ * pending booking, see BOOKING_ABANDONED_MESSAGE / isBookingAbandonRequest), never
+ * AppointmentCancellationService. */
+export function buildBookingPendingFallbackMessage(slots: OfferedSlot[], timezone: string): string {
+  return buildPendingFallbackMessage(
+    "Estamos en el proceso de agendar tu cita. Estas son las opciones disponibles:",
+    'escribe "cancelar" si prefieres no agendar por ahora',
+    slots,
+    timezone,
+  );
+}
+
+/** RESCHEDULE_REQUESTED: a real appointment already exists -- the escape hatch is the existing
+ * cancellation-intent handoff into CANCEL_PENDING (see WhatsAppRescheduleHandler.handOffToCancellation),
+ * so the copy below points at that real, already-correct path rather than inventing a second one. */
+export function buildReschedulePendingFallbackMessage(slots: OfferedSlot[], timezone: string): string {
+  return buildPendingFallbackMessage(
+    "Estamos en el proceso de cambiar tu cita. Estas son las opciones disponibles:",
+    'escribe "cancelar" si prefieres cancelar tu cita en su lugar',
+    slots,
+    timezone,
+  );
+}
+
+/** Pre-launch hardening: "cancelar"/"ya no"/"salir" while BOOKING_PENDING abandons the pending
+ * booking process (never an appointment cancellation -- none exists yet). Sent once the lead's
+ * status has durably returned to its prior qualified tier. */
+export const BOOKING_ABANDONED_MESSAGE =
+  'De acuerdo, no agendaremos por ahora. Si quieres retomarlo, escribe "agendar".';
+
+/**
  * SlotOfferClaimInProgressError -- a concurrent request is actively creating (or just finished
  * creating) this conversation's offer right now, or a legitimately-in-progress claim simply
  * hasn't finished within the bounded polling window. Purely a timing/concurrency signal, never a

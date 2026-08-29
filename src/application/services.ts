@@ -10,7 +10,11 @@ import {normalizePhoneToE164} from "../domain/phone.js";
 import {LeadNotFoundError,SlotUnavailableError,IdempotencyConflictError,BookingAttemptKeyConflictError,BookingInProgressError,BookingAttemptInconsistentError} from "../domain/errors.js";
 import {recordLeadStatusTransition} from "./lead-status-audit.js";
 
-function targetStatusForScore(scoreClass:ScoreClass):LeadStatus{return scoreClass==="A"?"QUALIFIED_A":scoreClass==="B"?"QUALIFIED_B":"NURTURE_C";}
+/** Exported (pre-launch hardening) so WhatsAppBookingHandler.abandonBookingPending reuses the
+ * EXACT SAME scoreClass -> LeadStatus mapping this class already uses to land a freshly-scored
+ * lead on QUALIFIED_A/QUALIFIED_B/NURTURE_C -- single source of truth, never a second, divergent
+ * copy of this mapping. */
+export function targetStatusForScore(scoreClass:ScoreClass):LeadStatus{return scoreClass==="A"?"QUALIFIED_A":scoreClass==="B"?"QUALIFIED_B":"NURTURE_C";}
 
 export class LeadService{
   constructor(

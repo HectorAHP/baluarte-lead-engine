@@ -373,7 +373,7 @@ describe("SlotOfferingService.getOrCreateOffer", () => {
     expect(await offeredSlots.listRoundIdsByConversationId(conversationId)).toHaveLength(0);
   });
 
-  it.each<LeadStatus>(["HUMAN_HANDOFF", "DO_NOT_CONTACT", "NURTURE_C", "BOOKED"])(
+  it.each<LeadStatus>(["HUMAN_HANDOFF", "DO_NOT_CONTACT", "BOOKED"])(
     "a lead with status %s is never offered slots -- throws LeadNotOfferableError, no Calendar call, no offered_slots",
     async (status) => {
       const calendar = new CountingCalendarProvider(new FakeCalendarProvider());
@@ -387,6 +387,19 @@ describe("SlotOfferingService.getOrCreateOffer", () => {
       expect(await offeredSlots.listActiveByConversationId(conversationId, now)).toHaveLength(0);
     },
   );
+
+  it("pre-launch hardening: a lead with status NURTURE_C IS now offerable -- lets a lead who abandoned a prior BOOKING_PENDING round (landing on NURTURE_C) resume booking, same mechanism as QUALIFIED_A/B", async () => {
+    const { service, leads } = makeService({ calendar: new FakeCalendarProvider() });
+    const lead = await makeLead(leads, { status: "NURTURE_C", scoreClass: "C" });
+    const conversationId = randomUUID();
+    const now = new Date("2026-03-02T12:00:00.000Z");
+
+    const outcome = await service.getOrCreateOffer({ lead, conversationId, now });
+
+    expect(outcome.type).toBe("CREATED");
+    const reloadedLead = await leads.findById(lead.id);
+    expect(reloadedLead?.status).toBe("BOOKING_PENDING");
+  });
 
   it("caps at MAX_OFFERED_SLOTS (3) even when the calendar provider returns more, all sharing one roundId", async () => {
     const { service, leads } = makeService({ calendar: fiveSlotCalendar });

@@ -405,7 +405,9 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     // code path actually delivers it.
     await recoveredHandler.handleTurn({ lead: outcome.lead, conversationId: conversation.id, whatsappUserId: "5214778000011", inboundText: "hola", now });
     expect(workingMessaging.sentTexts).toHaveLength(1);
-    expect(workingMessaging.sentTexts[0].body).toContain("Por favor responde");
+    // Pre-launch hardening: no longer the terse "Por favor responde 1, 2 o 3" nag -- see
+    // buildBookingPendingFallbackMessage; still restates the SAME persisted options either way.
+    expect(workingMessaging.sentTexts[0].body).toContain("Estamos en el proceso de agendar tu cita");
     expect(workingMessaging.sentTexts[0].body).toContain(persisted[0].position.toString());
     expect(await repos.offeredSlotsRepo.listRoundIdsByConversationId(conversation.id)).toHaveLength(1); // still the same round -- no duplicate
   });

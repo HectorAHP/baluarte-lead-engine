@@ -7,8 +7,17 @@ const transitions: Record<LeadStatus, readonly LeadStatus[]> = {
   QUALIFYING:["QUALIFIED_A","QUALIFIED_B","NURTURE_C","DO_NOT_CONTACT","HUMAN_HANDOFF"],
   QUALIFIED_A:["BOOKING_PENDING","BOOKED","DO_NOT_CONTACT","HUMAN_HANDOFF"],
   QUALIFIED_B:["BOOKING_PENDING","NURTURE_C","BOOKED","DO_NOT_CONTACT","HUMAN_HANDOFF"],
-  NURTURE_C:["QUALIFYING","DO_NOT_CONTACT","HUMAN_HANDOFF"],
-  BOOKING_PENDING:["BOOKED","NURTURE_C","DO_NOT_CONTACT","HUMAN_HANDOFF"],
+  // Pre-launch hardening: NURTURE_C -> BOOKING_PENDING lets a lead who abandoned a prior
+  // BOOKING_PENDING round (landing back on NURTURE_C, see targetStatusForScore) resume booking
+  // later by sending an explicit new-booking-intent message -- same mechanism/precedent as
+  // CANCELLED -> BOOKING_PENDING (Phase 4A edge, driven by WhatsAppReactivationHandler).
+  NURTURE_C:["QUALIFYING","BOOKING_PENDING","DO_NOT_CONTACT","HUMAN_HANDOFF"],
+  // Pre-launch hardening: BOOKING_PENDING -> QUALIFIED_A/QUALIFIED_B added so abandoning a
+  // pending booking (WhatsAppBookingHandler, "cancelar"/"ya no"/"salir" -- no appointment exists
+  // yet, so this is never a cancellation) returns the lead to its TRUE prior qualified tier
+  // (targetStatusForScore(lead.scoreClass)) rather than collapsing every tier into NURTURE_C,
+  // which already was -- and remains -- the only valid target for a C-tier lead.
+  BOOKING_PENDING:["BOOKED","QUALIFIED_A","QUALIFIED_B","NURTURE_C","DO_NOT_CONTACT","HUMAN_HANDOFF"],
   // Phase 4A additions: BOOKED/CONFIRMED -> CANCEL_PENDING (cancellation entry point, Phase 4B);
   // RESCHEDULE_REQUESTED -> HUMAN_HANDOFF was missing -- without it, a data-consistency error
   // during a reschedule (mirroring ActiveOfferInconsistentError/BookingAttemptInconsistentError's

@@ -203,7 +203,11 @@ describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
     expect((await h.leads.findById(pendingLead.id))?.status).toBe("RESCHEDULE_REQUESTED");
     expect((await h.appointments.findById(appointment.id))?.status).toBe("BOOKED");
     const lastMessage = h.messaging.sentTexts[h.messaging.sentTexts.length - 1];
-    expect(lastMessage.body).toContain("Por favor responde");
+    // Pre-launch hardening: no longer the terse "Por favor responde 1, 2 o 3" nag -- a friendlier
+    // fallback that still restates the active options and points at the real escape hatch
+    // (cancellation-intent, already handled above this check -- see handOffToCancellation).
+    expect(lastMessage.body).toContain("Estamos en el proceso de cambiar tu cita");
+    expect(lastMessage.body).toContain("Responde con el número de la opción que prefieras");
   });
 
   it("'otro horario' (DECLINED) fetches a new round instead of rescheduling", async () => {
