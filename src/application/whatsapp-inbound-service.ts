@@ -146,14 +146,28 @@ export async function handleInboundWhatsAppText(
     "whatsapp webhook: handleInboundWhatsAppText entered",
   );
 
+  // Pre-launch production diagnostic (temporary, redacted): sequential checkpoints around every
+  // await in this function, so a hang/slow-timeout/swallowed-error is pinpointable to the exact
+  // operation instead of only "somewhere between entered and attempting-outbound". Every
+  // "...checkpoint N: ..." pair brackets one real await; durationMs on the closing log is that
+  // await's own wall-clock time. Never logs the message body, full phone number, tokens, or
+  // secrets -- only truncated internal ids and booleans/durations.
+  const msgIdLast8 = input.providerMessageId.slice(-8);
+
+  deps.logger.warn({ messageIdLast8: msgIdLast8 }, "whatsapp inbound checkpoint 02: checking duplicate");
+  let stepStart = Date.now();
   const existingMessage = await deps.messages.findByProviderMessageId("WHATSAPP", input.providerMessageId);
+  deps.logger.warn({ messageIdLast8: msgIdLast8, durationMs: Date.now() - stepStart, isDuplicate: !!existingMessage }, "whatsapp inbound checkpoint 03: duplicate check complete");
   if (existingMessage) {
-    deps.logger.warn({ messageIdLast8: input.providerMessageId.slice(-8), duplicateDetected: true }, "whatsapp webhook ignored: duplicate");
+    deps.logger.warn({ messageIdLast8: msgIdLast8, duplicateDetected: true }, "whatsapp webhook ignored: duplicate");
     return { outcome: "DUPLICATE", leadId: existingMessage.leadId, conversationId: existingMessage.conversationId };
   }
 
+  deps.logger.warn({ messageIdLast8: msgIdLast8 }, "whatsapp inbound checkpoint 04: resolving lead");
+  stepStart = Date.now();
   const phoneE164 = normalizePhoneToE164(input.phoneRaw) ?? undefined;
   let lead = await deps.leads.findByDedupKey({ whatsappUserId: input.whatsappUserId, phoneE164 });
+  const isNewLeadRecord = !lead;
   if (!lead) {
     lead = await deps.leadService.createLead({
       firstName: input.displayName,
@@ -162,19 +176,35 @@ export async function handleInboundWhatsAppText(
       whatsappUserId: input.whatsappUserId,
     });
   }
+  deps.logger.warn(
+    { messageIdLast8: msgIdLast8, leadIdLast8: lead.id.slice(-8), durationMs: Date.now() - stepStart, isNewLeadRecord, leadStatusBefore: lead.status },
+    "whatsapp inbound checkpoint 05: lead resolved",
+  );
 
   // Captured before recordInboundContact mutates status/timestamps, since the decision logic
   // below needs to know what was true *before* this message.
   const wasAlreadySuppressed = lead.status === "DO_NOT_CONTACT" || lead.status === "HUMAN_HANDOFF";
   const wasNew = lead.status === "NEW";
 
+  deps.logger.warn({ messageIdLast8: msgIdLast8, leadIdLast8: lead.id.slice(-8) }, "whatsapp inbound checkpoint 06: recording inbound contact");
+  stepStart = Date.now();
   lead = await deps.leadService.recordInboundContact(lead.id);
+  deps.logger.warn({ messageIdLast8: msgIdLast8, leadIdLast8: lead.id.slice(-8), durationMs: Date.now() - stepStart }, "whatsapp inbound checkpoint 07: inbound contact recorded");
 
+  deps.logger.warn({ messageIdLast8: msgIdLast8, leadIdLast8: lead.id.slice(-8) }, "whatsapp inbound checkpoint 08: resolving conversation");
+  stepStart = Date.now();
   let conversation = await deps.conversations.findActiveByLeadId(lead.id);
+  const isNewConversation = !conversation;
   if (!conversation) {
     conversation = await deps.conversations.create({ leadId: lead.id, channel: "WHATSAPP", status: "ACTIVE" });
   }
+  deps.logger.warn(
+    { messageIdLast8: msgIdLast8, conversationIdLast8: conversation.id.slice(-8), durationMs: Date.now() - stepStart, isNewConversation },
+    "whatsapp inbound checkpoint 09: conversation resolved",
+  );
 
+  deps.logger.warn({ messageIdLast8: msgIdLast8, conversationIdLast8: conversation.id.slice(-8) }, "whatsapp inbound checkpoint 10: persisting inbound message");
+  stepStart = Date.now();
   const { sensitiveDetected } = await persistInboundMessage(
     { messages: deps.messages },
     {
@@ -185,6 +215,10 @@ export async function handleInboundWhatsAppText(
       sender: input.whatsappUserId,
     },
   );
+  deps.logger.warn(
+    { messageIdLast8: msgIdLast8, durationMs: Date.now() - stepStart, sensitiveDetected },
+    "whatsapp inbound checkpoint 11: inbound message persisted",
+  );
 
   const leadId = lead.id;
   const conversationId = conversation.id;
@@ -192,24 +226,43 @@ export async function handleInboundWhatsAppText(
   if (wasAlreadySuppressed) {
     // Lead was already DO_NOT_CONTACT or HUMAN_HANDOFF before this message: ingest silently,
     // no automated reply of any kind (not even a repeated handoff/opt-out acknowledgment).
+    deps.logger.warn(
+      { stage: "suppressed-lead-check", reason: "lead already DO_NOT_CONTACT or HUMAN_HANDOFF before this message", messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), conversationIdLast8: conversationId.slice(-8) },
+      "whatsapp inbound terminated",
+    );
     return { outcome: "PROCESSED", leadId, conversationId };
   }
 
+  /** Pre-launch production diagnostic (temporary): logs exactly which routing branch this turn
+   * matched (or "no-match" if it fell through every one) immediately before that branch acts --
+   * so a silent "no automated reply" outcome is always distinguishable, in the logs, from a hang
+   * or a swallowed error. */
+  const logBranch = (branch: string, willReply: boolean) =>
+    deps.logger.warn(
+      { messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), conversationIdLast8: conversationId.slice(-8), branch, willReply },
+      "whatsapp inbound checkpoint 13: branch matched",
+    );
+
+  deps.logger.warn({ messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), conversationIdLast8: conversationId.slice(-8) }, "whatsapp inbound checkpoint 12: entering processing boundary");
+  const processingBoundaryStart = Date.now();
   await runProcessingBoundary(
     async () => {
       if (isOptOutMessage(input.text)) {
+        logBranch("opt-out", true);
         await deps.leadService.requestDoNotContact(leadId);
         await deps.conversations.update(conversationId, { status: "CLOSED" });
         await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, OPT_OUT_CONFIRMATION_MESSAGE);
         return;
       }
       if (sensitiveDetected) {
+        logBranch("sensitive-health-content", true);
         await deps.leadService.requestHumanHandoff(leadId);
         await deps.conversations.update(conversationId, { status: "HUMAN_HANDOFF" });
         await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, HEALTH_HANDOFF_MESSAGE);
         return;
       }
       if (wasNew) {
+        logBranch("wasNew-welcome", true);
         await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildWelcomeMessage(input.displayName));
         if (deps.qualificationHandler) {
           await deps.qualificationHandler.beginQualification(leadId);
@@ -217,6 +270,7 @@ export async function handleInboundWhatsAppText(
         return;
       }
       if (deps.qualificationHandler && lead.status === "QUALIFYING") {
+        logBranch("qualifying-turn", true);
         await deps.qualificationHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text });
         return;
       }
@@ -230,6 +284,7 @@ export async function handleInboundWhatsAppText(
       // qualification and feeds it this exact inbound message, the same way a normal AWAITING_INTENT
       // turn would be handled.
       if (deps.qualificationHandler && lead.status === "CONTACTED" && !lead.productInterest) {
+        logBranch("contacted-recovery", true);
         await deps.qualificationHandler.beginQualification(leadId);
         const recoveredLead: Lead = { ...lead, status: "QUALIFYING" };
         await deps.qualificationHandler.handleTurn({ lead: recoveredLead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text });
@@ -245,6 +300,11 @@ export async function handleInboundWhatsAppText(
       // mirroring the CANCELLED -> reactivationHandler precedent below (the intent check lives
       // inside the handler, not duplicated here).
       if (deps.bookingHandler && (lead.status === "QUALIFIED_A" || lead.status === "QUALIFIED_B" || lead.status === "NURTURE_C")) {
+        // willReply: false -- this branch's own handler internally no-ops for anything except
+        // explicit new-booking intent (see WhatsAppBookingHandler.handleTurn), so entering it is
+        // NOT a guarantee a reply follows -- see that handler's own logs/lack thereof to tell
+        // "matched, handler chose silence" apart from "matched, reply attempted".
+        logBranch("qualified-or-nurture-booking-intent-check", false);
         await deps.bookingHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
@@ -258,6 +318,7 @@ export async function handleInboundWhatsAppText(
       // already BOOKED never matches this condition, so it falls through to the no-reply
       // fallback below, same as today -- no rebooking, no re-offering.
       if (deps.bookingHandler && lead.status === "BOOKING_PENDING") {
+        logBranch("booking-pending", true);
         await deps.bookingHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
@@ -265,6 +326,7 @@ export async function handleInboundWhatsAppText(
       // -- see WhatsAppRescheduleHandler, item 13). Only ever reachable via the BOOKED-turn branch
       // just below, so rescheduleHandler being present here is a precondition, not a coincidence.
       if (deps.rescheduleHandler && lead.status === "RESCHEDULE_REQUESTED") {
+        logBranch("reschedule-requested-turn", true);
         await deps.rescheduleHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
@@ -278,9 +340,16 @@ export async function handleInboundWhatsAppText(
       // present -- absent either, this extra read/branch is skipped entirely and a BOOKED lead's
       // text is routed exactly as it was before this hardening pass, unchanged.
       if (deps.pastBookedRecoveryHandler && deps.appointments && lead.status === "BOOKED") {
+        deps.logger.warn({ messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8) }, "whatsapp inbound checkpoint 12b: checking upcoming-appointment status (BOOKED lead)");
+        const upcomingCheckStart = Date.now();
         const activeAppointment = await deps.appointments.findActiveByLeadId(lead.id);
         const hasUpcomingAppointment = !!activeAppointment && isUpcomingBooked(activeAppointment, new Date());
+        deps.logger.warn(
+          { messageIdLast8: msgIdLast8, durationMs: Date.now() - upcomingCheckStart, hasActiveAppointment: !!activeAppointment, hasUpcomingAppointment },
+          "whatsapp inbound checkpoint 12c: upcoming-appointment check complete",
+        );
         if (!hasUpcomingAppointment) {
+          logBranch("booked-past-appointment-recovery", true);
           await deps.pastBookedRecoveryHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
           return;
         }
@@ -294,6 +363,7 @@ export async function handleInboundWhatsAppText(
       // even evaluated and a BOOKED lead's text is checked only against isCancellationRequest
       // below, byte-for-byte Phase 4B behavior.
       if (deps.rescheduleHandler && lead.status === "BOOKED" && isRescheduleRequest(input.text)) {
+        logBranch("booked-reschedule-intent", true);
         await deps.rescheduleHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
@@ -313,6 +383,7 @@ export async function handleInboundWhatsAppText(
       // other flag in this project. Placed BEFORE the cancellationHandler dispatch below so
       // genuinely non-actionable text never even reaches that handler's internal no-op.
       if (deps.rescheduleHandler && deps.cancellationHandler && lead.status === "BOOKED" && !isCancellationRequest(input.text)) {
+        logBranch("booked-generic-fallback", true);
         await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, BOOKED_GENERIC_INBOUND_MESSAGE);
         return;
       }
@@ -323,6 +394,7 @@ export async function handleInboundWhatsAppText(
       // taken and a BOOKED lead falls through to the same "no automated reply" fallback Phase 3C
       // already has today, unchanged.
       if (deps.cancellationHandler && (lead.status === "BOOKED" || lead.status === "CANCEL_PENDING")) {
+        logBranch("cancellation-turn", true);
         await deps.cancellationHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
@@ -334,6 +406,7 @@ export async function handleInboundWhatsAppText(
       // app.ts) -- absent, this branch is never taken and a CANCELLED lead falls through to the
       // same "no automated reply" fallback as before, unchanged.
       if (deps.reactivationHandler && lead.status === "CANCELLED") {
+        logBranch("cancelled-reactivation", true);
         await deps.reactivationHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
@@ -341,9 +414,14 @@ export async function handleInboundWhatsAppText(
       // or an existing lead outside an active round (e.g. already QUALIFIED_A/B/NURTURE_C, or a
       // CONTACTED lead that still carries a product from a prior round): no automated reply, same
       // as Phase 2.
+      logBranch("no-match", false);
     },
     deps.logger,
     { leadId, conversationId },
+  );
+  deps.logger.warn(
+    { messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), conversationIdLast8: conversationId.slice(-8), durationMs: Date.now() - processingBoundaryStart },
+    "whatsapp inbound checkpoint 15: processing boundary complete",
   );
 
   return { outcome: "PROCESSED", leadId, conversationId };

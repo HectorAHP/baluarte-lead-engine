@@ -20,11 +20,20 @@ export async function runProcessingBoundary(
   logger: Logger,
   context: Record<string, unknown>,
 ): Promise<void> {
+  // Pre-launch production diagnostic (temporary): durationMs/errorName added so a swallowed
+  // error is fully attributable (which error type, how long the work ran before it threw)
+  // without ever logging the raw error message (which could echo back inbound text/PII).
+  const start = Date.now();
   try {
     await work();
   } catch (err) {
     logger.warn(
-      { ...context, reason: err instanceof Error ? err.message : "unknown" },
+      {
+        ...context,
+        durationMs: Date.now() - start,
+        errorName: err instanceof Error ? err.name : "unknown",
+        reason: err instanceof Error ? err.message : "unknown",
+      },
       "WhatsApp inbound processing failed after successful ingestion; the inbound message remains safely persisted.",
     );
   }
