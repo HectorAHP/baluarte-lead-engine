@@ -8,7 +8,7 @@ import { isOptOutMessage } from "../domain/opt-out-detection.js";
 import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isCancellationRequest } from "../domain/cancellation-intent-detection.js";
 import { isUpcomingBooked } from "../domain/appointment-timing.js";
-import { buildWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE, BOOKED_GENERIC_INBOUND_MESSAGE } from "../domain/message-templates.js";
+import { buildWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE, BOOKED_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE } from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
 
 /**
@@ -26,9 +26,12 @@ export interface QualificationTurnHandler {
  * Phase 3C booking orchestrator, injected only when config.WHATSAPP_BOOKING_ENABLED is true (see
  * app.ts). Kept as a narrow interface here (not an import of the concrete class) for the same
  * decoupling reason as QualificationTurnHandler above -- WhatsAppBookingHandler implements this.
+ * Returns whether the handler actually acted on (and replied to) the turn -- see
+ * WhatsAppBookingHandler.handleTurn's doc comment; used by the QUALIFIED_A/QUALIFIED_B/NURTURE_C
+ * routing branch below to know whether it still owes the lead a reply of its own.
  */
 export interface BookingTurnHandler {
-  handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
+  handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<boolean>;
 }
 
 /**
@@ -294,18 +297,29 @@ export async function handleInboundWhatsAppText(
       // WhatsAppBookingHandler itself for explicit new-booking intent (isNewBookingRequest) --
       // most commonly reached right after abandoning a prior BOOKING_PENDING round (see
       // WhatsAppBookingHandler.abandonBookingPending), but also reachable for a lead who simply
-      // never started booking yet. Anything else from these statuses is left completely
-      // untouched by the handler -- same silent "no automated reply" fallback these statuses
-      // already had before this hardening pass. Dispatches unconditionally on status alone,
-      // mirroring the CANCELLED -> reactivationHandler precedent below (the intent check lives
-      // inside the handler, not duplicated here).
+      // never started booking yet. Dispatches unconditionally on status alone, mirroring the
+      // CANCELLED -> reactivationHandler precedent below (the intent check lives inside the
+      // handler, not duplicated here).
+      //
+      // Root-cause fix (confirmed against real production logs): WhatsAppBookingHandler.handleTurn
+      // now reports back whether it actually acted (and therefore already replied) on the turn --
+      // see that method's doc comment. When it did NOT (a genuinely non-booking message, e.g.
+      // "Hola, quiero información"), this is the sole owner of a SEPARATE, generic conversational
+      // fallback -- never silence for a qualified lead's valid free text, same "never leave a
+      // real inbound message unanswered" principle already applied to BOOKED_GENERIC_INBOUND_MESSAGE
+      // and PAST_BOOKED_GENERIC_INBOUND_MESSAGE. Exactly one reply either way: the handler's own
+      // (booking intent) or this fallback (no booking intent) -- never both, since this branch
+      // only sends its own message when the handler's return value says it did nothing.
+      // WhatsAppBookingHandler itself is deliberately NOT changed into a generic handler -- it
+      // still only ever knows about booking; the fallback decision and copy live here.
       if (deps.bookingHandler && (lead.status === "QUALIFIED_A" || lead.status === "QUALIFIED_B" || lead.status === "NURTURE_C")) {
-        // willReply: false -- this branch's own handler internally no-ops for anything except
-        // explicit new-booking intent (see WhatsAppBookingHandler.handleTurn), so entering it is
-        // NOT a guarantee a reply follows -- see that handler's own logs/lack thereof to tell
-        // "matched, handler chose silence" apart from "matched, reply attempted".
-        logBranch("qualified-or-nurture-booking-intent-check", false);
-        await deps.bookingHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
+        const handledByBooking = await deps.bookingHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
+        if (handledByBooking) {
+          logBranch("qualified-or-nurture-booking", true);
+        } else {
+          logBranch("qualified-or-nurture-generic-fallback", true);
+          await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+        }
         return;
       }
       // Phase 3C: a lead in BOOKING_PENDING is picking a slot, declining, or otherwise replying

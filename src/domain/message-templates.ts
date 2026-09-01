@@ -297,3 +297,13 @@ export const PAST_BOOKED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE =
  * upcoming. */
 export const PAST_BOOKED_CANCELLATION_MESSAGE =
   "La fecha de esa cita ya pasó, así que no hay nada que cancelar. Si quieres agendar una nueva, escribe \"agendar\".";
+
+// ---------------------------------------------------------------------------------------------
+// Pre-launch hardening -- a QUALIFIED_A/QUALIFIED_B/NURTURE_C lead's free text that carries no
+// booking intent (see whatsapp-inbound-service.ts's routing / isNewBookingRequest) must still
+// get a reply -- never silence -- without ever mentioning score, tier, internal classification,
+// or anything CRM/automation-sounding. No state change accompanies this message; sent only when
+// WhatsAppBookingHandler itself did not act on the turn.
+// ---------------------------------------------------------------------------------------------
+export const QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE =
+  'Claro. Ya tengo parte de tu información registrada. ¿Qué te gustaría hacer ahora?\n\n1. Resolver una duda\n2. Conocer opciones\n3. Agendar una asesoría\n\nPuedes responder con el número o escribirme tu pregunta.';

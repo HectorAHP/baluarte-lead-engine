@@ -111,8 +111,9 @@ describe("WhatsAppBookingHandler -- guard", () => {
     const { lead, conversation } = await makeLeadAndConversation(leads, conversations, { status: "QUALIFIED_A", bookingStartedAt: undefined });
     const now = new Date("2026-03-02T12:00:00.000Z");
 
-    await handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    const handled = await handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
 
+    expect(handled).toBe(false); // pre-launch fix: the caller (whatsapp-inbound-service.ts) relies on this to know it must send its own fallback
     expect(calendar.calls).toBe(0);
     expect(messaging.sentTexts).toHaveLength(0);
     const reloaded = await leads.findById(lead.id);
@@ -128,8 +129,9 @@ describe("WhatsAppBookingHandler -- success", () => {
     const offer = await slotOffering.getOrCreateOffer({ lead, conversationId: conversation.id, now });
     if (offer.type !== "CREATED") throw new Error("unreachable");
 
-    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    const handled = await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
 
+    expect(handled).toBe(true); // pre-launch fix: BOOKING_PENDING always reports it acted
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKED");
     const stillActive = await offeredSlots.listActiveByConversationId(conversation.id, now);

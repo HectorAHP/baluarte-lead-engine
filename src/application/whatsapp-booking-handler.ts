@@ -57,7 +57,17 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     private readonly advisorTimezone: string = config.ADVISOR_TIMEZONE,
   ) {}
 
-  async handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void> {
+  /**
+   * Returns whether this call actually acted on the turn (and therefore already sent exactly one
+   * reply) -- `true` for BOOKING_PENDING (handleTurnInner/handleError always reply on every
+   * internal branch) and for a QUALIFIED_A/QUALIFIED_B/NURTURE_C lead with genuine new-booking
+   * intent (startNewBooking/handleError, same guarantee); `false` for anything else, i.e. a pure
+   * no-op. Pre-launch hardening (qualified-lead generic fallback): the caller
+   * (whatsapp-inbound-service.ts) uses this to know whether it must still send its own fallback
+   * reply for a QUALIFIED_A/QUALIFIED_B/NURTURE_C lead's non-booking text, WITHOUT this handler
+   * itself becoming a generic conversational handler -- it still only ever knows about booking.
+   */
+  async handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<boolean> {
     const { lead, conversationId, whatsappUserId, inboundText, now } = params;
 
     if (lead.status === "BOOKING_PENDING") {
@@ -66,25 +76,28 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
       } catch (err) {
         await this.handleError(err, lead, conversationId, whatsappUserId);
       }
-      return;
+      return true;
     }
 
     // Pre-launch hardening: a QUALIFIED_A/QUALIFIED_B/NURTURE_C lead explicitly asking to book
     // (most commonly right after abandoning a prior BOOKING_PENDING round -- see
     // abandonBookingPending below) starts/reuses an offer. Anything else from these statuses is a
-    // no-op -- same silent "no automated reply" fallback these statuses already had before this
-    // hardening pass; this only ADDS the explicit new-booking-intent capability, never broadens
-    // what else gets a reply. whatsapp-inbound-service.ts dispatches to this handler unconditionally
-    // on status alone for these three (mirroring the CANCELLED -> WhatsAppReactivationHandler
-    // precedent), so the intent check lives here, not duplicated at the routing layer.
+    // no-op (signaled via the `false` return below) -- the caller decides what, if anything, to
+    // do about a no-op; this only ADDS the explicit new-booking-intent capability, never broadens
+    // what else this handler itself replies to. whatsapp-inbound-service.ts dispatches to this
+    // handler unconditionally on status alone for these three (mirroring the CANCELLED ->
+    // WhatsAppReactivationHandler precedent), so the intent check lives here, not duplicated at
+    // the routing layer.
     if ((lead.status === "QUALIFIED_A" || lead.status === "QUALIFIED_B" || lead.status === "NURTURE_C") && isNewBookingRequest(inboundText)) {
       try {
         await this.startNewBooking(lead, conversationId, whatsappUserId, now);
       } catch (err) {
         await this.handleError(err, lead, conversationId, whatsappUserId);
       }
-      return;
+      return true;
     }
+
+    return false;
   }
 
   /** Reuses SlotOfferingService's existing QUALIFIED_A/B/NURTURE_C -> BOOKING_PENDING transition
