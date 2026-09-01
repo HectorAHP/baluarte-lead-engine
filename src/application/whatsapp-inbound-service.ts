@@ -136,8 +136,19 @@ export async function handleInboundWhatsAppText(
   deps: WhatsAppInboundDeps,
   input: InboundWhatsAppText,
 ): Promise<WhatsAppInboundResult> {
+  // Pre-launch production diagnostic (temporary, redacted -- see app.ts's webhook route for the
+  // matching "whatsapp webhook received"/"parsed inbound message" logs at the transport layer).
+  // deps.logger only exposes .warn (see the Logger port), so these use that level even though
+  // they aren't warnings -- kept deliberately visible for this diagnostic pass rather than
+  // silent, never the raw message body or full phone number.
+  deps.logger.warn(
+    { messageIdLast8: input.providerMessageId.slice(-8), fromLast4: input.whatsappUserId.slice(-4) },
+    "whatsapp webhook: handleInboundWhatsAppText entered",
+  );
+
   const existingMessage = await deps.messages.findByProviderMessageId("WHATSAPP", input.providerMessageId);
   if (existingMessage) {
+    deps.logger.warn({ messageIdLast8: input.providerMessageId.slice(-8), duplicateDetected: true }, "whatsapp webhook ignored: duplicate");
     return { outcome: "DUPLICATE", leadId: existingMessage.leadId, conversationId: existingMessage.conversationId };
   }
 
@@ -352,9 +363,16 @@ export async function sendAndPersistReply(
   body: string,
 ): Promise<void> {
   let providerMessageId: string | undefined;
+  // Pre-launch production diagnostic (temporary, redacted): never the full recipient, never the
+  // message body.
+  deps.logger.warn({ leadId, conversationId, toLast4: to.length >= 4 ? to.slice(-4) : to }, "attempting WhatsApp outbound response");
   try {
     const result = await deps.messaging.sendText(to, body);
     providerMessageId = result.providerMessageId;
+    deps.logger.warn(
+      { leadId, conversationId, messageIdLast8: providerMessageId?.slice(-8) },
+      "WhatsApp outbound response sent",
+    );
   } catch (err) {
     // Sanitized diagnostics only: never the raw error message (may echo Meta's error.message),
     // never the full recipient -- just enough shape to correlate a bad `to` format in prod logs.
@@ -375,12 +393,12 @@ export async function sendAndPersistReply(
           phoneNumberIdLast4: err.phoneNumberIdLast4,
           ...recipientDiagnostics,
         },
-        "Failed to send WhatsApp reply; the inbound message that triggered it remains persisted.",
+        "WhatsApp outbound response failed -- the inbound message that triggered it remains persisted.",
       );
     } else {
       deps.logger.warn(
         { leadId, conversationId, reason: "unknown", ...recipientDiagnostics },
-        "Failed to send WhatsApp reply; the inbound message that triggered it remains persisted.",
+        "WhatsApp outbound response failed -- the inbound message that triggered it remains persisted.",
       );
     }
     return;

@@ -427,15 +427,63 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
       return reply.code(401).send();
     }
 
+    // Pre-launch production diagnostic (temporary, redacted): a signature-valid webhook that
+    // reaches this point can still legitimately carry zero actionable messages (a Meta status
+    // callback, a read-receipt event, ...) -- this shape summary is logged BEFORE parsing so a
+    // silently-empty result is always distinguishable from "never reached this route at all".
+    // Never logs the raw payload, phone numbers, or message text -- only counts/shapes.
+    const rawPayload = req.body as { object?: unknown; entry?: unknown } | undefined;
+    const entryArray = Array.isArray(rawPayload?.entry) ? (rawPayload!.entry as unknown[]) : [];
+    const fields = new Set<string>();
+    let changeCount = 0;
+    let hasValue = false;
+    let hasMessages = false;
+    let messagesCount = 0;
+    for (const entry of entryArray) {
+      const changes = Array.isArray((entry as { changes?: unknown })?.changes) ? ((entry as { changes: unknown[] }).changes) : [];
+      changeCount += changes.length;
+      for (const change of changes) {
+        const c = change as { field?: unknown; value?: { messages?: unknown } };
+        if (typeof c.field === "string") fields.add(c.field);
+        if (c.value !== undefined) hasValue = true;
+        if (Array.isArray(c.value?.messages)) {
+          hasMessages = true;
+          messagesCount += c.value.messages.length;
+        }
+      }
+    }
+    app.log.info(
+      {
+        webhookObject: typeof rawPayload?.object === "string" ? rawPayload.object : undefined,
+        entryCount: entryArray.length,
+        changeCount,
+        fields: [...fields],
+        hasValue,
+        hasMessages,
+        messagesCount,
+      },
+      "whatsapp webhook received",
+    );
+
     // Signature-valid payloads that don't match our expected message shape (e.g. Meta status
     // callbacks) are legitimate deliveries we simply don't act on yet -- ack, don't error.
-    const messages = extractWhatsAppMessages(req.body) ?? [];
+    const parserResult = extractWhatsAppMessages(req.body);
+    const messages = parserResult ?? [];
+    if (parserResult === null) {
+      app.log.warn({ ignoredReason: "payload did not match the expected webhook envelope shape" }, "whatsapp webhook ignored: unparseable envelope");
+    } else if (messages.length === 0) {
+      app.log.warn({ hasMessages, ignoredReason: hasMessages ? "messages array present but no entry matched the parser's message shape" : "no messages array in this delivery (e.g. a status callback)" }, "whatsapp webhook ignored: no messages");
+    }
 
     for (const message of messages) {
       if (message.kind === "unsupported") {
-        app.log.warn({ providerMessageId: message.providerMessageId, messageType: message.messageType }, "Ignoring unsupported WhatsApp message type");
+        app.log.warn({ messageIdLast8: message.providerMessageId.slice(-8), messageType: message.messageType, ignoredReason: "unsupported message type" }, "whatsapp webhook ignored: unsupported message type");
         continue;
       }
+      app.log.info(
+        { messageIdLast8: message.providerMessageId.slice(-8), fromLast4: message.phoneRaw.slice(-4), messageType: "text" },
+        "whatsapp webhook parsed inbound message",
+      );
       await handleInboundWhatsAppText(
         { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler, reactivationHandler, pastBookedRecoveryHandler, appointments: appointmentsRepo },
         message,
