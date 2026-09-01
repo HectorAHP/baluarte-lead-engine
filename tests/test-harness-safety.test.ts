@@ -71,10 +71,12 @@ describe("test harness safety -- npm test can never touch production Supabase/Ca
     const created = await app1.inject({
       method: "POST",
       url: "/api/leads",
-      payload: { firstName: "Ana", phone: "+525512345678" },
+      // privacyAccepted: true is required since the Baluarte Lead Engine web-capture integration
+      // (see web-lead-capture.ts) -- POST /api/leads now rejects a submission without it.
+      payload: { firstName: "Ana", phone: "+525512345678", privacyAccepted: true },
     });
     expect(created.statusCode).toBe(201);
-    const leadId = created.json().id;
+    const leadId = created.json().leadId;
 
     const lookupInOtherApp = await app2.inject({ method: "GET", url: `/api/leads/${leadId}` });
     expect(lookupInOtherApp.statusCode).toBe(404); // never visible in a different app's InMemory store

@@ -34,6 +34,7 @@ const leadRow: LeadRow = {
   assigned_advisor: "Hector Herrera",
   notes: null,
   consent_contact: true,
+  privacy_accepted_at: "2026-01-01T00:30:00.000Z",
   first_contact_at: "2026-01-01T01:00:00.000Z",
   first_response_at: null,
   qualified_at: "2026-01-01T02:00:00.000Z",

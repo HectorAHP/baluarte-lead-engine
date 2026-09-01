@@ -24,7 +24,7 @@ export class LeadService{
     private readonly logger:Logger,
   ){}
 
-  async createLead(input:{firstName?:string;lastName?:string;phone?:string;email?:string;source?:string;sourceDetail?:string;productVertical?:Vertical;productInterest?:string;metaLeadId?:string;whatsappUserId?:string;consentContact?:boolean;}):Promise<Lead>{
+  async createLead(input:{firstName?:string;lastName?:string;phone?:string;email?:string;city?:string;source?:string;sourceDetail?:string;campaignName?:string;productVertical?:Vertical;productInterest?:string;metaLeadId?:string;whatsappUserId?:string;consentContact?:boolean;notes?:string;privacyAcceptedAt?:Date;}):Promise<Lead>{
     const {phone,consentContact,...rest}=input;
     const phoneE164=normalizePhoneToE164(phone)??undefined;
     return this.leads.create({

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import { z } from "zod";
@@ -8,9 +9,10 @@ import {
   InMemoryLeadScoreRepository, InMemoryConversationRepository, InMemoryMessageRepository,
   InMemoryQualificationAnswerRepository, InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
   InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository, InMemoryAppointmentMessageDeliveryRepository,
-  InMemoryAppointmentCancellationRepository, InMemoryAppointmentRescheduleRepository,
+  InMemoryAppointmentCancellationRepository, InMemoryAppointmentRescheduleRepository, InMemoryProcessedEventRepository,
 } from "./infrastructure/memory-repositories.js";
 import { SupabaseLeadRepository } from "./infrastructure/supabase-lead-repository.js";
+import { SupabaseProcessedEventRepository } from "./infrastructure/supabase-processed-event-repository.js";
 import { SupabaseAppointmentRepository } from "./infrastructure/supabase-appointment-repository.js";
 import { SupabaseBookingAttemptRepository } from "./infrastructure/supabase-booking-attempt-repository.js";
 import { SupabaseLeadScoreRepository } from "./infrastructure/supabase-lead-score-repository.js";
@@ -30,6 +32,8 @@ import { GoogleCalendarProvider } from "./infrastructure/google-calendar-provide
 import { FakeMessagingProvider } from "./infrastructure/fake-messaging-provider.js";
 import { MetaWhatsAppProvider } from "./infrastructure/meta-whatsapp-provider.js";
 import { LeadService, AppointmentService } from "./application/services.js";
+import { WebLeadCaptureService } from "./application/web-lead-capture.js";
+import { formatFiscalCalculatorNote } from "./domain/fiscal-calculator-lead-note.js";
 import { SlotOfferingService } from "./application/slot-offering-service.js";
 import { AppointmentCancellationService } from "./application/appointment-cancellation-service.js";
 import { AppointmentRescheduleService } from "./application/appointment-reschedule-service.js";
@@ -52,7 +56,7 @@ import type {
   ConversationRepository, MessageRepository, QualificationAnswerRepository, OfferedSlotRepository,
   SlotOfferClaimRepository, CalendarProvider, MessagingProvider,
   LeadStatusHistoryRepository, AppointmentStatusHistoryRepository, AppointmentMessageDeliveryRepository,
-  AppointmentCancellationRepository, AppointmentRescheduleRepository,
+  AppointmentCancellationRepository, AppointmentRescheduleRepository, ProcessedEventRepository,
 } from "./application/ports.js";
 
 declare module "fastify" {
@@ -76,6 +80,11 @@ export interface AppDependencies {
    */
   supabaseClient?: SupabaseClient | null;
   leadsRepo?: LeadRepository;
+  /** Web lead capture (impuestos.html fiscal calculator and any future public web form) --
+   * idempotency guard backed by the existing `processed_events` table. See
+   * ProcessedEventRepository's doc comment in ports.ts and WebLeadCaptureService's class doc
+   * comment in web-lead-capture.ts. */
+  processedEventsRepo?: ProcessedEventRepository;
   appointmentsRepo?: AppointmentRepository;
   bookingAttemptsRepo?: BookingAttemptRepository;
   leadScoresRepo?: LeadScoreRepository;
@@ -168,6 +177,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // undefined (production's only path) preserves today's exact behavior.
   const supabaseClient = overrides.supabaseClient !== undefined ? overrides.supabaseClient : config.SUPABASE_URL && config.SUPABASE_SECRET_KEY ? createSupabaseClient() : null;
   const leadsRepo = overrides.leadsRepo ?? (supabaseClient ? new SupabaseLeadRepository(supabaseClient) : new InMemoryLeadRepository());
+  const processedEventsRepo = overrides.processedEventsRepo ?? (supabaseClient ? new SupabaseProcessedEventRepository(supabaseClient) : new InMemoryProcessedEventRepository());
   const appointmentsRepo = overrides.appointmentsRepo ?? (supabaseClient ? new SupabaseAppointmentRepository(supabaseClient) : new InMemoryAppointmentRepository());
   const bookingAttemptsRepo = overrides.bookingAttemptsRepo ?? (supabaseClient ? new SupabaseBookingAttemptRepository(supabaseClient) : new InMemoryBookingAttemptRepository());
   const leadScoresRepo = overrides.leadScoresRepo ?? (supabaseClient ? new SupabaseLeadScoreRepository(supabaseClient) : new InMemoryLeadScoreRepository());
@@ -192,6 +202,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   const messaging = overrides.messaging ?? (hasWhatsAppCredentials ? new MetaWhatsAppProvider() : new FakeMessagingProvider());
 
   const leadService = new LeadService(leadsRepo, leadScoresRepo, leadStatusHistoryRepo, app.log);
+  const webLeadCaptureService = new WebLeadCaptureService(leadsRepo, processedEventsRepo, leadService, app.log);
   const appointmentService = new AppointmentService(calendar, appointmentsRepo, bookingAttemptsRepo, leadsRepo, app.log);
   // Always constructed -- cheap, stateless, and needed by both qualificationHandler (to offer
   // slots right after QUALIFIED_A/B) and bookingHandler below, each gated independently by its
@@ -379,8 +390,97 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
     whatsappProvider,
   }));
 
-  const createLeadSchema = z.object({ firstName: z.string().min(1).optional(), lastName: z.string().min(1).optional(), phone: z.string().min(8).optional(), email: z.string().email().optional(), source: z.string().optional(), productVertical: z.enum(["PATRIMONIAL", "GMM", "UNKNOWN"]).optional(), productInterest: z.string().optional() });
-  app.post("/api/leads", async (req, reply) => reply.code(201).send(await leadService.createLead(createLeadSchema.parse(req.body))));
+  // Web lead capture (Baluarte Lead Engine integration, fiscal calculator + any future public web
+  // form). Extends the pre-existing "manual lead" shape additively:
+  //   - privacyAccepted is now REQUIRED (z.literal(true)) -- a deliberate behavior change from the
+  //     Sprint 1 schema (which had no consent gate at all). No other caller of this route exists
+  //     anywhere in this codebase today (grep-verified: createLead() is called only from here and
+  //     from whatsapp-inbound-service.ts, which never goes through HTTP) -- see the integration
+  //     report for the explicit call-out of this change.
+  //   - city/notes/consentContact/campaignName were already valid Lead fields with no route-level
+  //     way to set them; now exposed.
+  //   - attribution/fiscalCalculator are optional, purpose-built for the impuestos.html payload
+  //     contract -- present only for calculator submissions, absent for a plain manual lead.
+  //   - Idempotency-Key header is OPTIONAL here (unlike /api/appointments' required header) so a
+  //     caller that predates this change and never sends one still works exactly as before, just
+  //     without replay protection.
+  const attributionSchema = z.object({
+    utm_source: z.string().optional(), utm_medium: z.string().optional(), utm_campaign: z.string().optional(),
+    utm_content: z.string().optional(), utm_term: z.string().optional(), fbclid: z.string().optional(),
+    landing_page: z.string().optional(), referrer: z.string().optional(),
+  }).optional();
+  const fiscalCalculatorSchema = z.object({
+    age: z.number().int().positive().max(120).optional(),
+    city: z.string().optional(),
+    taxRegime: z.string().optional(),
+    filesAnnualReturn: z.boolean().optional(),
+    monthlyIncome: z.number().nonnegative(),
+    annualContribution: z.number().nonnegative(),
+    deductions: z.object({ medicalExpenses: z.number().nonnegative(), tuition: z.number().nonnegative(), mortgageInterest: z.number().nonnegative(), other: z.number().nonnegative() }),
+    hasGmm: z.boolean().optional(),
+    hasPpr: z.boolean().optional(),
+    calculation: z.object({
+      annualIncome: z.number(), pprDeductionLimit: z.number(), effectivePprContribution: z.number(),
+      otherDeductionsConsidered: z.number(), estimatedTaxBenefitMin: z.number(), estimatedTaxBenefitMax: z.number(),
+    }),
+  }).optional();
+  const createLeadSchema = z.object({
+    firstName: z.string().min(1).optional(), lastName: z.string().min(1).optional(),
+    phone: z.string().min(8).optional(), email: z.string().email().optional(), city: z.string().min(1).optional(),
+    source: z.string().optional(), productVertical: z.enum(["PATRIMONIAL", "GMM", "UNKNOWN"]).optional(),
+    productInterest: z.string().optional(), notes: z.string().max(4000).optional(),
+    privacyAccepted: z.literal(true), consentContact: z.boolean().optional(),
+    attribution: attributionSchema, fiscalCalculator: fiscalCalculatorSchema,
+  });
+  const leadIdempotencyHeader = z.object({ "idempotency-key": z.string().min(1).optional() });
+  app.post("/api/leads", async (req, reply) => {
+    const body = createLeadSchema.parse(req.body);
+    const { "idempotency-key": idempotencyKey } = leadIdempotencyHeader.parse(req.headers);
+    // No caller-supplied Idempotency-Key: still safe from ACCIDENTAL duplication (dedup-by-phone/
+    // email in WebLeadCaptureService.capture always runs), just without replay protection against
+    // a literal double-send of the exact same request. Falls back to a fresh, request-scoped id --
+    // never reused across requests, so it can never collide with (or replay-protect) anything.
+    const submissionId = idempotencyKey ?? randomUUID();
+
+    const attribution = body.attribution;
+    const sourceDetailParts = attribution
+      ? [
+          attribution.utm_source ? `utm_source: ${attribution.utm_source}` : null,
+          attribution.utm_medium ? `utm_medium: ${attribution.utm_medium}` : null,
+          attribution.utm_content ? `utm_content: ${attribution.utm_content}` : null,
+          attribution.utm_term ? `utm_term: ${attribution.utm_term}` : null,
+          attribution.fbclid ? `fbclid: ${attribution.fbclid}` : null,
+          attribution.landing_page ? `landing_page: ${attribution.landing_page}` : null,
+          attribution.referrer ? `referrer: ${attribution.referrer}` : null,
+        ].filter((line): line is string => line !== null)
+      : [];
+
+    const fc = body.fiscalCalculator;
+    const submittedAt = new Date();
+    const noteParts = [
+      body.notes,
+      fc ? formatFiscalCalculatorNote({ ...fc, submissionId, submittedAt }) : undefined,
+      sourceDetailParts.length > 0 ? sourceDetailParts.join(" | ") : undefined,
+    ].filter((part): part is string => Boolean(part));
+
+    const result = await webLeadCaptureService.capture({
+      submissionId,
+      firstName: body.firstName,
+      lastName: body.lastName,
+      phone: body.phone,
+      email: body.email,
+      city: body.city ?? fc?.city,
+      source: body.source ?? "WEB",
+      campaignName: attribution?.utm_campaign,
+      productVertical: body.productVertical ?? (fc ? "PATRIMONIAL" : undefined),
+      productInterest: body.productInterest,
+      note: noteParts.length > 0 ? noteParts.join("\n\n") : undefined,
+      consentContact: body.consentContact ?? false,
+      privacyAcceptedAt: submittedAt,
+    });
+
+    return reply.code(result.matchedExisting ? 200 : 201).send({ ok: true, leadId: result.lead.id });
+  });
   app.get("/api/leads/:id", async (req, reply) => { const { id } = z.object({ id: z.string().uuid() }).parse(req.params); const lead = await leadsRepo.findById(id); return lead ?? reply.code(404).send({ error: "LEAD_NOT_FOUND" }); });
   app.post("/api/leads/:id/contact", async (req) => { const { id } = z.object({ id: z.string().uuid() }).parse(req.params); return leadService.markContacted(id); });
   app.post("/api/leads/:id/qualification/start", async (req) => { const { id } = z.object({ id: z.string().uuid() }).parse(req.params); return leadService.startQualification(id); });

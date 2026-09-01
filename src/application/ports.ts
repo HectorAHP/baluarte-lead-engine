@@ -1,5 +1,17 @@
 import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment, AppointmentStatus } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js"; import type { LeadStatusHistoryEntry } from "../domain/lead-status-history.js"; import type { AppointmentStatusHistoryEntry } from "../domain/appointment-status-history.js"; import type { AppointmentMessageDelivery } from "../domain/appointment-message-delivery.js"; import type { AppointmentCancellation } from "../domain/appointment-cancellation.js"; import type { AppointmentReschedule } from "../domain/appointment-reschedule.js";
+import type { ProcessedEvent } from "../domain/processed-event.js";
 export interface LeadRepository { create(input:Omit<Lead,"id"|"createdAt"|"updatedAt">):Promise<Lead>; findById(id:string):Promise<Lead|null>; update(id:string,patch:Partial<Lead>):Promise<Lead>; findByDedupKey(key:LeadDedupKey):Promise<Lead|null>; }
+/**
+ * Generic (provider, event_id) idempotency guard, backed by the `processed_events` table
+ * (existing since migration 001, previously unused by any application code). Same tryCreate
+ * idiom as SlotOfferClaimRepository/AppointmentMessageDeliveryRepository/etc: wins outright
+ * (insert succeeds) or returns null on a (provider, event_id) unique-conflict -- i.e. this exact
+ * event was already processed -- never throws for that case, only for genuinely unexpected
+ * errors. First consumer: web-lead-capture.ts, keyed by the frontend-generated submissionId.
+ */
+export interface ProcessedEventRepository {
+  tryCreate(input: { provider: string; eventId: string }): Promise<ProcessedEvent | null>;
+}
 export interface AppointmentRepository {
   create(input:Omit<Appointment,"id">):Promise<Appointment>;
   findById(id:string):Promise<Appointment|null>;

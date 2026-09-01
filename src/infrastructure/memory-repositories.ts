@@ -1,5 +1,5 @@
 import {randomUUID} from "node:crypto";
-import type {LeadRepository,AppointmentRepository,BookingAttemptRepository,ConversationRepository,MessageRepository,QualificationAnswerRepository,LeadScoreRepository,OfferedSlotRepository,SlotOfferClaimRepository,LeadStatusHistoryRepository,AppointmentStatusHistoryRepository,AppointmentMessageDeliveryRepository,AppointmentCancellationRepository,AppointmentRescheduleRepository} from "../application/ports.js";
+import type {LeadRepository,AppointmentRepository,BookingAttemptRepository,ConversationRepository,MessageRepository,QualificationAnswerRepository,LeadScoreRepository,OfferedSlotRepository,SlotOfferClaimRepository,LeadStatusHistoryRepository,AppointmentStatusHistoryRepository,AppointmentMessageDeliveryRepository,AppointmentCancellationRepository,AppointmentRescheduleRepository,ProcessedEventRepository} from "../application/ports.js";
 import type {Lead,LeadDedupKey} from "../domain/lead.js";
 import type {Appointment,AppointmentStatus} from "../domain/appointment.js";
 import type {BookingAttempt,BookingAttemptStatus} from "../domain/booking-attempt.js";
@@ -14,6 +14,7 @@ import type {AppointmentStatusHistoryEntry} from "../domain/appointment-status-h
 import type {AppointmentMessageDelivery} from "../domain/appointment-message-delivery.js";
 import type {AppointmentCancellation} from "../domain/appointment-cancellation.js";
 import type {AppointmentReschedule} from "../domain/appointment-reschedule.js";
+import type {ProcessedEvent} from "../domain/processed-event.js";
 import {SlotUnavailableError,DuplicateMessageError,BookingAttemptKeyConflictError} from "../domain/errors.js";
 import {messageDedupKey} from "../domain/message-dedup-key.js";
 
@@ -443,5 +444,22 @@ export class InMemoryAppointmentRescheduleRepository implements AppointmentResch
 
   async listByLeadId(leadId:string):Promise<AppointmentReschedule[]>{
     return [...this.data.values()].filter(r=>r.leadId===leadId);
+  }
+}
+
+// -------------------------------------------------------------------------------------------
+// Web lead capture -- generic (provider, event_id) idempotency guard, mirrors the real
+// `processed_events` table's unique(provider, event_id) constraint (migration 001, previously
+// unused). First consumer: web-lead-capture.ts.
+// -------------------------------------------------------------------------------------------
+
+export class InMemoryProcessedEventRepository implements ProcessedEventRepository{
+  private byKey=new Map<string,ProcessedEvent>();
+  async tryCreate(input:{provider:string;eventId:string}):Promise<ProcessedEvent|null>{
+    const key=`${input.provider}:${input.eventId}`;
+    if(this.byKey.has(key)) return null; // already processed -- same convention as InMemorySlotOfferClaimRepository.tryCreate
+    const event:ProcessedEvent={id:randomUUID(),provider:input.provider,eventId:input.eventId,createdAt:new Date()};
+    this.byKey.set(key,event);
+    return event;
   }
 }

@@ -32,6 +32,7 @@ export interface LeadRow {
   assigned_advisor: string;
   notes: string | null;
   consent_contact: boolean;
+  privacy_accepted_at: string | null;
   first_contact_at: string | null;
   first_response_at: string | null;
   qualified_at: string | null;
@@ -76,6 +77,7 @@ export function mapRowToLead(row: LeadRow): Lead {
     assignedAdvisor: row.assigned_advisor,
     notes: row.notes ?? undefined,
     consentContact: row.consent_contact,
+    privacyAcceptedAt: toDateOrUndefined(row.privacy_accepted_at),
     firstContactAt: toDateOrUndefined(row.first_contact_at),
     firstResponseAt: toDateOrUndefined(row.first_response_at),
     qualifiedAt: toDateOrUndefined(row.qualified_at),
@@ -114,6 +116,7 @@ export function mapLeadToInsertRow(input: Omit<Lead, "id" | "createdAt" | "updat
     assigned_advisor: input.assignedAdvisor,
     notes: input.notes ?? null,
     consent_contact: input.consentContact,
+    privacy_accepted_at: input.privacyAcceptedAt?.toISOString() ?? null,
     first_contact_at: input.firstContactAt?.toISOString() ?? null,
     first_response_at: input.firstResponseAt?.toISOString() ?? null,
     qualified_at: input.qualifiedAt?.toISOString() ?? null,
@@ -152,6 +155,7 @@ export function mapLeadPatchToRow(patch: Partial<Lead>): Record<string, unknown>
   if (patch.assignedAdvisor !== undefined) row.assigned_advisor = patch.assignedAdvisor;
   if (patch.notes !== undefined) row.notes = patch.notes;
   if (patch.consentContact !== undefined) row.consent_contact = patch.consentContact;
+  if (patch.privacyAcceptedAt !== undefined) row.privacy_accepted_at = patch.privacyAcceptedAt.toISOString();
   if (patch.firstContactAt !== undefined) row.first_contact_at = patch.firstContactAt.toISOString();
   if (patch.firstResponseAt !== undefined) row.first_response_at = patch.firstResponseAt.toISOString();
   if (patch.qualifiedAt !== undefined) row.qualified_at = patch.qualifiedAt.toISOString();

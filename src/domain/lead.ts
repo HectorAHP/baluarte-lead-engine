@@ -21,6 +21,15 @@ export interface Lead {
   status: LeadStatus; score: number; scoreClass?: "A" | "B" | "C";
   assignedAdvisor: string; notes?: string;
   metaLeadId?: string; whatsappUserId?: string; consentContact: boolean;
+  /**
+   * When this lead accepted the Aviso de Privacidad (LFPDPPP) for a given web submission.
+   * Deliberately separate from consentContact -- privacy acceptance is a precondition for the
+   * submission to be valid at all (see web-lead-capture.ts), while consentContact is the
+   * independent, optional marketing-contact opt-in. Set once, on first acceptance, and never
+   * overwritten by a later submission (see captureWebLead's "first privacy acceptance wins"
+   * rule) -- mirrors how UTM first-touch attribution is preserved elsewhere in this flow.
+   */
+  privacyAcceptedAt?: Date;
   firstContactAt?: Date; firstResponseAt?: Date;
   /**
    * Set only when the lead becomes a *commercially* qualified lead -- i.e. reaches
