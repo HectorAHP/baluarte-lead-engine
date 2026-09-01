@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { config, hasGoogleCalendarCredentials, hasWhatsAppCredentials } from "./config.js";
+import { config, hasGoogleCalendarCredentials, hasWhatsAppCredentials, corsAllowedOrigins as defaultCorsAllowedOrigins } from "./config.js";
 import {
   InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository,
   InMemoryLeadScoreRepository, InMemoryConversationRepository, InMemoryMessageRepository,
@@ -147,11 +148,46 @@ export interface AppDependencies {
   /** Override for config.WHATSAPP_RESCHEDULE_ENABLED -- same rationale and precedence as
    * whatsappCancellationEnabled above, kept fully independent. */
   whatsappRescheduleEnabled?: boolean;
+  /** Production hardening (POST /api/leads). Override for config's computed corsAllowedOrigins --
+   * lets a test assert prod-like allow/reject behavior without actually setting NODE_ENV=production
+   * for the whole process. undefined (the only production path) uses config's own computed list. */
+  corsAllowedOrigins?: string[];
+  /** Override for config.LEADS_RATE_LIMIT_MAX -- lets a test trigger a 429 in a handful of
+   * requests instead of the real (generous) production default. */
+  leadsRateLimitMax?: number;
+  /** Override for config.LEADS_RATE_LIMIT_WINDOW_MS -- same rationale as leadsRateLimitMax. */
+  leadsRateLimitWindowMs?: number;
 }
 
 export async function buildApp(overrides: AppDependencies = {}): Promise<FastifyInstance> {
   const app = Fastify({ logger: true });
-  await app.register(cors, { origin: true });
+
+  // Production hardening: allowlist-based CORS, replacing the previous origin:true (reflects any
+  // origin -- unsafe for a surface that now carries PII/financial data). CORS only governs
+  // BROWSER requests that send an Origin header; server-to-server callers (Meta's WhatsApp
+  // webhook, any future backend-to-backend integration) never send one and are unaffected --
+  // explicitly allowed through below rather than silently rejected. corsAllowedOrigins is
+  // NODE_ENV-aware (see config.ts) with an explicit CORS_ALLOWED_ORIGINS env var override; tests
+  // inject a specific list via overrides.corsAllowedOrigins instead of mutating NODE_ENV.
+  const corsAllowedOrigins = overrides.corsAllowedOrigins ?? defaultCorsAllowedOrigins;
+  await app.register(cors, {
+    origin: (origin, cb) => {
+      if (!origin) { cb(null, true); return; }
+      // cb(null, false) -- NOT an Error -- is @fastify/cors' documented "deny, no framework-level
+      // error" form. CORS is enforced by the BROWSER refusing to expose the response to script
+      // when Access-Control-Allow-Origin is absent/mismatched; the server still completes the
+      // request normally either way (see the production-hardening tests for exactly this
+      // distinction: status code is unaffected, only the response headers differ).
+      cb(null, corsAllowedOrigins.includes(origin));
+    },
+  });
+
+  // Registered global:false -- @fastify/rate-limit adds NO behavior to any route by default here.
+  // Only routes that opt in via their own `config: { rateLimit: {...} }` (POST /api/leads, below)
+  // are ever rate-limited. In-memory store (this plugin's default) -- correct for a single
+  // instance; do not swap for a distributed store without first confirming this ever runs as more
+  // than one process (see this task's "no inventes infraestructura distribuida" instruction).
+  await app.register(rateLimit, { global: false, keyGenerator: (req) => req.ip });
 
   // Captures the exact raw bytes of every JSON body, needed to verify Meta's HMAC signature
   // (which is computed over the raw payload, not a re-serialization of the parsed object).
@@ -404,83 +440,141 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   //   - Idempotency-Key header is OPTIONAL here (unlike /api/appointments' required header) so a
   //     caller that predates this change and never sends one still works exactly as before, just
   //     without replay protection.
+  // Production hardening (Phase: web lead capture hardening): every string field below now has an
+  // explicit upper bound (defense against megabyte-scale strings -- see this task's "body size y
+  // validaciones defensivas" instruction) and every numeric calculator field has a plausible upper
+  // bound alongside its pre-existing nonnegative() floor. None of this touches fiscal MEANING --
+  // calcular()/tasaEstimada() are untouched, these bounds only reject technically-absurd payloads
+  // (e.g. a 50MB "city" string, or a $999,999,999/month income) before they ever reach storage.
+  const MAX_PLAUSIBLE_MXN = 50_000_000; // ~50M MXN/month or /year is already an absurd upper bound for this form; not a tax-law limit of any kind
   const attributionSchema = z.object({
-    utm_source: z.string().optional(), utm_medium: z.string().optional(), utm_campaign: z.string().optional(),
-    utm_content: z.string().optional(), utm_term: z.string().optional(), fbclid: z.string().optional(),
-    landing_page: z.string().optional(), referrer: z.string().optional(),
+    utm_source: z.string().max(256).optional(), utm_medium: z.string().max(256).optional(), utm_campaign: z.string().max(256).optional(),
+    utm_content: z.string().max(256).optional(), utm_term: z.string().max(256).optional(), fbclid: z.string().max(512).optional(),
+    landing_page: z.string().max(2048).optional(), referrer: z.string().max(2048).optional(),
   }).optional();
+  const mxnAmount = z.number().nonnegative().max(MAX_PLAUSIBLE_MXN);
   const fiscalCalculatorSchema = z.object({
-    age: z.number().int().positive().max(120).optional(),
-    city: z.string().optional(),
-    taxRegime: z.string().optional(),
+    age: z.number().int().min(18).max(99).optional(), // mirrors impuestos.html's own p-edad min/max exactly
+    city: z.string().max(100).optional(),
+    taxRegime: z.string().max(100).optional(),
     filesAnnualReturn: z.boolean().optional(),
-    monthlyIncome: z.number().nonnegative(),
-    annualContribution: z.number().nonnegative(),
-    deductions: z.object({ medicalExpenses: z.number().nonnegative(), tuition: z.number().nonnegative(), mortgageInterest: z.number().nonnegative(), other: z.number().nonnegative() }),
+    monthlyIncome: mxnAmount,
+    annualContribution: mxnAmount,
+    deductions: z.object({ medicalExpenses: mxnAmount, tuition: mxnAmount, mortgageInterest: mxnAmount, other: mxnAmount }),
     hasGmm: z.boolean().optional(),
     hasPpr: z.boolean().optional(),
     calculation: z.object({
-      annualIncome: z.number(), pprDeductionLimit: z.number(), effectivePprContribution: z.number(),
-      otherDeductionsConsidered: z.number(), estimatedTaxBenefitMin: z.number(), estimatedTaxBenefitMax: z.number(),
+      annualIncome: mxnAmount, pprDeductionLimit: mxnAmount, effectivePprContribution: mxnAmount,
+      otherDeductionsConsidered: mxnAmount, estimatedTaxBenefitMin: mxnAmount, estimatedTaxBenefitMax: mxnAmount,
     }),
   }).optional();
   const createLeadSchema = z.object({
-    firstName: z.string().min(1).optional(), lastName: z.string().min(1).optional(),
-    phone: z.string().min(8).optional(), email: z.string().email().optional(), city: z.string().min(1).optional(),
-    source: z.string().optional(), productVertical: z.enum(["PATRIMONIAL", "GMM", "UNKNOWN"]).optional(),
-    productInterest: z.string().optional(), notes: z.string().max(4000).optional(),
+    firstName: z.string().min(1).max(100).optional(), lastName: z.string().min(1).max(100).optional(),
+    phone: z.string().min(8).max(20).optional(), email: z.string().email().max(254).optional(), city: z.string().min(1).max(100).optional(),
+    source: z.string().max(100).optional(), productVertical: z.enum(["PATRIMONIAL", "GMM", "UNKNOWN"]).optional(),
+    productInterest: z.string().max(200).optional(), notes: z.string().max(4000).optional(),
     privacyAccepted: z.literal(true), consentContact: z.boolean().optional(),
     attribution: attributionSchema, fiscalCalculator: fiscalCalculatorSchema,
   });
-  const leadIdempotencyHeader = z.object({ "idempotency-key": z.string().min(1).optional() });
-  app.post("/api/leads", async (req, reply) => {
-    const body = createLeadSchema.parse(req.body);
-    const { "idempotency-key": idempotencyKey } = leadIdempotencyHeader.parse(req.headers);
-    // No caller-supplied Idempotency-Key: still safe from ACCIDENTAL duplication (dedup-by-phone/
-    // email in WebLeadCaptureService.capture always runs), just without replay protection against
-    // a literal double-send of the exact same request. Falls back to a fresh, request-scoped id --
-    // never reused across requests, so it can never collide with (or replay-protect) anything.
-    const submissionId = idempotencyKey ?? randomUUID();
+  // Idempotency-Key stays OPTIONAL at the schema level for backwards compatibility with any caller
+  // that predates this change (see the doc comment above) -- impuestos.html itself is required, by
+  // convention enforced in the frontend, to always send one (crypto.randomUUID()). When present,
+  // bounded so a caller can't send a megabyte "key" -- never derived from PII either way.
+  const leadIdempotencyHeader = z.object({ "idempotency-key": z.string().min(8).max(200).optional() });
+  app.post(
+    "/api/leads",
+    {
+      // ~24KB comfortably covers the largest realistic fiscalCalculator+attribution+notes payload
+      // (every string field above at its max, plus JSON overhead) with headroom, while rejecting
+      // anything megabyte-scale outright -- independent of, and much tighter than, Fastify's global
+      // default (1MB) which still governs every other route.
+      bodyLimit: 24_000,
+      config: {
+        rateLimit: {
+          max: overrides.leadsRateLimitMax ?? config.LEADS_RATE_LIMIT_MAX,
+          timeWindow: overrides.leadsRateLimitWindowMs ?? config.LEADS_RATE_LIMIT_WINDOW_MS,
+          // @fastify/rate-limit's own internals `throw params.errorResponseBuilder(...)` -- it
+          // MUST return a real Error (with .statusCode set), exactly mirroring the plugin's own
+          // defaultErrorResponse, or the thrown value falls through to app.setErrorHandler's
+          // generic catch-all as an unrecognized error (500, wrong status). The minimal
+          // {ok:false,error:"rate_limited"} body itself (task requirement, never the plugin's
+          // default shape which would include the caller's IP and retry-after phrasing) is sent
+          // by the statusCode===429 branch in app.setErrorHandler below.
+          errorResponseBuilder: (_req, context) => {
+            const err = new Error("rate_limited") as Error & { statusCode: number };
+            err.statusCode = context.statusCode;
+            return err;
+          },
+        },
+      },
+    },
+    async (req, reply) => {
+      let body: z.infer<typeof createLeadSchema>;
+      let idempotencyKey: string | undefined;
+      try {
+        body = createLeadSchema.parse(req.body);
+        idempotencyKey = leadIdempotencyHeader.parse(req.headers)["idempotency-key"];
+      } catch {
+        // Minimal response (task requirement) -- never Zod's own .flatten()/.issues, which can
+        // echo back the caller's submitted values. Nothing about the invalid payload is logged.
+        return reply.code(400).send({ ok: false, error: "invalid_request" });
+      }
 
-    const attribution = body.attribution;
-    const sourceDetailParts = attribution
-      ? [
-          attribution.utm_source ? `utm_source: ${attribution.utm_source}` : null,
-          attribution.utm_medium ? `utm_medium: ${attribution.utm_medium}` : null,
-          attribution.utm_content ? `utm_content: ${attribution.utm_content}` : null,
-          attribution.utm_term ? `utm_term: ${attribution.utm_term}` : null,
-          attribution.fbclid ? `fbclid: ${attribution.fbclid}` : null,
-          attribution.landing_page ? `landing_page: ${attribution.landing_page}` : null,
-          attribution.referrer ? `referrer: ${attribution.referrer}` : null,
-        ].filter((line): line is string => line !== null)
-      : [];
+      // No caller-supplied Idempotency-Key: still safe from ACCIDENTAL duplication (dedup-by-phone/
+      // email in WebLeadCaptureService.capture always runs), just without replay protection against
+      // a literal double-send of the exact same request. Falls back to a fresh, request-scoped id --
+      // never reused across requests, so it can never collide with (or replay-protect) anything.
+      const submissionId = idempotencyKey ?? randomUUID();
 
-    const fc = body.fiscalCalculator;
-    const submittedAt = new Date();
-    const noteParts = [
-      body.notes,
-      fc ? formatFiscalCalculatorNote({ ...fc, submissionId, submittedAt }) : undefined,
-      sourceDetailParts.length > 0 ? sourceDetailParts.join(" | ") : undefined,
-    ].filter((part): part is string => Boolean(part));
+      try {
+        const attribution = body.attribution;
+        const sourceDetailParts = attribution
+          ? [
+              attribution.utm_source ? `utm_source: ${attribution.utm_source}` : null,
+              attribution.utm_medium ? `utm_medium: ${attribution.utm_medium}` : null,
+              attribution.utm_content ? `utm_content: ${attribution.utm_content}` : null,
+              attribution.utm_term ? `utm_term: ${attribution.utm_term}` : null,
+              attribution.fbclid ? `fbclid: ${attribution.fbclid}` : null,
+              attribution.landing_page ? `landing_page: ${attribution.landing_page}` : null,
+              attribution.referrer ? `referrer: ${attribution.referrer}` : null,
+            ].filter((line): line is string => line !== null)
+          : [];
 
-    const result = await webLeadCaptureService.capture({
-      submissionId,
-      firstName: body.firstName,
-      lastName: body.lastName,
-      phone: body.phone,
-      email: body.email,
-      city: body.city ?? fc?.city,
-      source: body.source ?? "WEB",
-      campaignName: attribution?.utm_campaign,
-      productVertical: body.productVertical ?? (fc ? "PATRIMONIAL" : undefined),
-      productInterest: body.productInterest,
-      note: noteParts.length > 0 ? noteParts.join("\n\n") : undefined,
-      consentContact: body.consentContact ?? false,
-      privacyAcceptedAt: submittedAt,
-    });
+        const fc = body.fiscalCalculator;
+        const submittedAt = new Date();
+        const noteParts = [
+          body.notes,
+          fc ? formatFiscalCalculatorNote({ ...fc, submissionId, submittedAt }) : undefined,
+          sourceDetailParts.length > 0 ? sourceDetailParts.join(" | ") : undefined,
+        ].filter((part): part is string => Boolean(part));
 
-    return reply.code(result.matchedExisting ? 200 : 201).send({ ok: true, leadId: result.lead.id });
-  });
+        const result = await webLeadCaptureService.capture({
+          submissionId,
+          firstName: body.firstName,
+          lastName: body.lastName,
+          phone: body.phone,
+          email: body.email,
+          city: body.city ?? fc?.city,
+          source: body.source ?? "WEB",
+          campaignName: attribution?.utm_campaign,
+          productVertical: body.productVertical ?? (fc ? "PATRIMONIAL" : undefined),
+          productInterest: body.productInterest,
+          note: noteParts.length > 0 ? noteParts.join("\n\n") : undefined,
+          consentContact: body.consentContact ?? false,
+          privacyAcceptedAt: submittedAt,
+        });
+
+        return reply.code(result.matchedExisting ? 200 : 201).send({ ok: true, leadId: result.lead.id });
+      } catch (err) {
+        // Server-side diagnostic only -- the message/stack can legitimately contain a DB host or
+        // driver detail (e.g. SUPABASE_LEAD_CREATE_FAILED), never PII (nothing about the lead's
+        // name/phone/email/income is ever included in an Error thrown by this path). Never
+        // forwarded to the client.
+        app.log.error({ err, submissionIdLast8: submissionId.slice(-8) }, "web lead ingestion failed");
+        return reply.code(500).send({ ok: false, error: "internal_error" });
+      }
+    },
+  );
   app.get("/api/leads/:id", async (req, reply) => { const { id } = z.object({ id: z.string().uuid() }).parse(req.params); const lead = await leadsRepo.findById(id); return lead ?? reply.code(404).send({ error: "LEAD_NOT_FOUND" }); });
   app.post("/api/leads/:id/contact", async (req) => { const { id } = z.object({ id: z.string().uuid() }).parse(req.params); return leadService.markContacted(id); });
   app.post("/api/leads/:id/qualification/start", async (req) => { const { id } = z.object({ id: z.string().uuid() }).parse(req.params); return leadService.startQualification(id); });
@@ -594,6 +688,16 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   });
 
   app.setErrorHandler((error, _req, reply) => {
+    // @fastify/rate-limit throws whatever its errorResponseBuilder returns (see POST /api/leads'
+    // route options above) -- it's a real Error with .statusCode=429 set, never anything else in
+    // this codebase sets that exact statusCode, so this check is unambiguous. Minimal body per
+    // this task's error-response requirement; nothing about the caller's IP/limit/retry-after is
+    // echoed back.
+    if ((error as { statusCode?: number }).statusCode === 429) return reply.code(429).send({ ok: false, error: "rate_limited" });
+    // Fastify's own body-parser throws this BEFORE any route handler runs (see POST /api/leads'
+    // bodyLimit option) -- without this check it fell through to the generic 500 branch below,
+    // which is the wrong status for a client-side "your payload is too big" mistake.
+    if ((error as { code?: string }).code === "FST_ERR_CTP_BODY_TOO_LARGE") return reply.code(413).send({ ok: false, error: "payload_too_large" });
     if (error instanceof z.ZodError) return reply.code(400).send({ error: "VALIDATION_ERROR", details: error.flatten() });
     if (error instanceof LeadNotFoundError) return reply.code(404).send({ error: "LEAD_NOT_FOUND", leadId: error.leadId });
     if (error instanceof InvalidLeadTransitionError) return reply.code(409).send({ error: "INVALID_LEAD_TRANSITION", from: error.from, to: error.to });

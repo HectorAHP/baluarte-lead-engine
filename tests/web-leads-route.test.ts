@@ -146,7 +146,10 @@ describe("POST /api/leads -- web lead capture (fiscal calculator)", () => {
     });
     const res = await app.inject({ method: "POST", url: "/api/leads", payload: basePayload() });
     expect(res.statusCode).toBe(500);
-    expect(res.json()).toEqual({ error: "INTERNAL_ERROR" });
+    // Production hardening: POST /api/leads now has its own minimal error shape (ok:false,
+    // error:"internal_error"), distinct from the app-wide error handler's {error:"INTERNAL_ERROR"}
+    // used by every other route -- see this task's "error responses" requirement.
+    expect(res.json()).toEqual({ ok: false, error: "internal_error" });
     expect(JSON.stringify(res.json())).not.toContain("db.internal");
     expect(JSON.stringify(res.json())).not.toContain("svc_prod");
   });

@@ -58,9 +58,27 @@ export interface WebLeadCaptureResult {
   idempotentReplay: boolean;
 }
 
+/**
+ * Production hardening: a lead can run the fiscal calculator (or any future web form) an
+ * unbounded number of times, and every run appends to this single leads.notes column (see the
+ * class doc comment's HISTORICAL LIMITATION for why there's no per-run table yet). Left
+ * unchecked, that's unbounded growth from a public, unauthenticated endpoint. This caps the
+ * TOTAL stored length and, once exceeded, drops the OLDEST content first (never the newest --
+ * the most recent submission is always what a human needs when they open this lead) with an
+ * explicit marker so the truncation is visible, never silent. 8000 chars is roughly 2-3 full
+ * calculator submissions' worth of formatted note text -- generous for the realistic case (a
+ * handful of resubmissions) while bounding the pathological one (hundreds of scripted
+ * resubmissions).
+ */
+const MAX_NOTES_LENGTH = 8000;
+const TRUNCATION_MARKER = "[...historial anterior recortado...]\n\n";
+
 function appendNote(existing: string | undefined, addition: string | undefined): string | undefined {
   if (!addition) return existing;
-  return existing ? `${existing}\n\n${addition}` : addition;
+  const merged = existing ? `${existing}\n\n${addition}` : addition;
+  if (merged.length <= MAX_NOTES_LENGTH) return merged;
+  const keepFrom = merged.length - (MAX_NOTES_LENGTH - TRUNCATION_MARKER.length);
+  return TRUNCATION_MARKER + merged.slice(keepFrom);
 }
 
 export class WebLeadCaptureService {

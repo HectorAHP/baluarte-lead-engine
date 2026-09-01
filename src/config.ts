@@ -41,6 +41,16 @@ const schema=z.object({
   // to WhatsAppRescheduleHandler only ever activates when this is explicitly "true". Same safe-
   // parsing rationale: never z.coerce.boolean().
   WHATSAPP_RESCHEDULE_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Production hardening (web lead capture / POST /api/leads). Comma-separated origin allowlist
+  // for @fastify/cors -- optional because a sensible NODE_ENV-based default (see
+  // corsAllowedOrigins below) covers the common case without requiring an env var in every
+  // environment. Explicit env var always wins when set, in either environment.
+  CORS_ALLOWED_ORIGINS:z.string().optional(),
+  // POST /api/leads rate limit (per IP). Deliberately generous defaults -- see corsAllowedOrigins'
+  // sibling comment: this guards against abuse, not against a shared office/NAT submitting the
+  // fiscal calculator a handful of times in a minute.
+  LEADS_RATE_LIMIT_MAX:z.coerce.number().int().positive().default(20),
+  LEADS_RATE_LIMIT_WINDOW_MS:z.coerce.number().int().positive().default(60_000),
 }).superRefine((cfg,ctx)=>{
   const googleFields=[cfg.GOOGLE_CLIENT_ID,cfg.GOOGLE_CLIENT_SECRET,cfg.GOOGLE_REFRESH_TOKEN];
   const setCount=googleFields.filter(Boolean).length;
@@ -51,3 +61,17 @@ const schema=z.object({
 export const config=schema.parse(process.env);
 export const hasGoogleCalendarCredentials=Boolean(config.GOOGLE_CLIENT_ID&&config.GOOGLE_CLIENT_SECRET&&config.GOOGLE_REFRESH_TOKEN);
 export const hasWhatsAppCredentials=Boolean(config.WHATSAPP_ACCESS_TOKEN&&config.WHATSAPP_PHONE_NUMBER_ID&&config.WHATSAPP_VERIFY_TOKEN&&config.META_APP_SECRET);
+
+// Production hardening: CORS allowlist for the public web surface (POST /api/leads and friends --
+// PII/financial data). CORS is a browser-enforced concept; server-to-server callers (Meta's
+// WhatsApp webhook, a future Lead Engine-to-Lead-Engine call) never send an Origin header at all,
+// so they are entirely unaffected by this allowlist -- see app.ts's cors registration.
+const DEFAULT_PROD_CORS_ORIGINS=["https://baluartecapital.com.mx","https://www.baluartecapital.com.mx"];
+// Local dev origins actually used by this project: this repo's own `npm run dev` (PORT, default
+// 3000) for same-origin tooling/curl, plus the baluarte-capital static site's two documented local
+// preview ports (python http.server on 8765 per that repo's .claude/launch.json, and the 5500
+// Live-Server-style default some editors use). Never used in production (see the branch below).
+const DEFAULT_DEV_CORS_ORIGINS=["http://localhost:3000","http://127.0.0.1:3000","http://localhost:5500","http://127.0.0.1:5500","http://localhost:8765","http://127.0.0.1:8765"];
+export const corsAllowedOrigins:string[]=config.CORS_ALLOWED_ORIGINS
+  ? config.CORS_ALLOWED_ORIGINS.split(",").map((o)=>o.trim()).filter(Boolean)
+  : config.NODE_ENV==="production" ? DEFAULT_PROD_CORS_ORIGINS : DEFAULT_DEV_CORS_ORIGINS;
