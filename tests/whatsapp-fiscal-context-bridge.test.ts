@@ -296,3 +296,115 @@ describe("Fase 6B -- WhatsApp inbound fiscal context bridge", () => {
     expect(deps.messaging.sentTexts).toHaveLength(0);
   });
 });
+
+/**
+ * Fase 6B.1 -- corrects the "first WhatsApp inbound" signal used to decide the fiscal-contextual
+ * welcome. wasNew (lead.status === "NEW") happens to be true in the simplest, untouched web
+ * capture -> WhatsApp path, but is NOT a reliable "first WhatsApp inbound" signal in general: a
+ * lead's status can move away from NEW for reasons entirely unrelated to WhatsApp (e.g. a manual
+ * CRM "/contact" call) before their first genuine WhatsApp message ever arrives. These tests
+ * exercise exactly that edge case -- status manually moved to CONTACTED before the first WhatsApp
+ * message -- to prove the fiscal welcome no longer silently depends on wasNew.
+ */
+describe("Fase 6B.1 -- fiscal-contextual welcome uses real first-WhatsApp-inbound history, not lead.status", () => {
+  it("1+2. a preexisting web lead with fiscal context whose status already moved away from NEW still gets the contextual welcome on its genuinely first WhatsApp inbound (wasNew === false)", async () => {
+    const deps = makeDeps();
+    const fiscalLead = await deps.leadService.createLead({ phone: "4772121001", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
+    await seedFiscalScore(deps.fiscalLeadScores, fiscalLead.id);
+    // Simulates a manual CRM "/contact" call (or any other non-WhatsApp touch) that happened
+    // BEFORE this lead ever wrote in on WhatsApp -- moves status away from "NEW".
+    await deps.leads.update(fiscalLead.id, { status: "CONTACTED" });
+    const beforeInbound = await deps.leads.findById(fiscalLead.id);
+    expect(beforeInbound?.status).not.toBe("NEW"); // explicit proof wasNew will be false
+
+    const result = await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772121001", phoneRaw: "4772121001", text: PREFILLED_TEXT }));
+    expect(result.outcome).toBe("PROCESSED");
+    expect(deps.messaging.sentTexts).toHaveLength(1);
+    expect(deps.messaging.sentTexts[0].body).toBe(buildFiscalContextWelcomeMessage("Ana"));
+
+    const branchLog = deps.logger.warnings.find((w) => w.details.branch === "existing-lead-first-whatsapp-fiscal-welcome");
+    expect(branchLog).toBeTruthy(); // confirms the NEW branch fired, not the wasNew one
+  });
+
+  it("3. a second WhatsApp inbound from the same lead never repeats the contextual welcome", async () => {
+    const deps = makeDeps();
+    const fiscalLead = await deps.leadService.createLead({ phone: "4772121002", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
+    await seedFiscalScore(deps.fiscalLeadScores, fiscalLead.id);
+    await deps.leads.update(fiscalLead.id, { status: "CONTACTED" });
+
+    await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772121002", phoneRaw: "4772121002", providerMessageId: "wamid.first", text: PREFILLED_TEXT }));
+    await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772121002", phoneRaw: "4772121002", providerMessageId: "wamid.second", text: PREFILLED_TEXT }));
+
+    expect(deps.messaging.sentTexts).toHaveLength(1); // only the first turn's welcome, never a second one
+    expect(deps.messaging.sentTexts[0].body).toBe(buildFiscalContextWelcomeMessage("Ana"));
+  });
+
+  it("4. a retry of the exact first webhook (same providerMessageId) never duplicates the contextual welcome", async () => {
+    const deps = makeDeps();
+    const fiscalLead = await deps.leadService.createLead({ phone: "4772121003", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
+    await seedFiscalScore(deps.fiscalLeadScores, fiscalLead.id);
+    await deps.leads.update(fiscalLead.id, { status: "CONTACTED" });
+
+    const input = baseInput({ whatsappUserId: "5214772121003", phoneRaw: "4772121003", providerMessageId: "wamid.retry-me", text: PREFILLED_TEXT });
+    const first = await handleInboundWhatsAppText(deps, input);
+    const retry = await handleInboundWhatsAppText(deps, input); // literal webhook retry, same providerMessageId
+
+    expect(first.outcome).toBe("PROCESSED");
+    expect(retry.outcome).toBe("DUPLICATE");
+    expect(deps.messaging.sentTexts).toHaveLength(1); // no second send for the retry
+  });
+
+  it("5. a preexisting web lead WITHOUT fiscal context behaves as normal (no contextual welcome) even with status already moved off NEW", async () => {
+    const deps = makeDeps();
+    const nonFiscalLead = await deps.leadService.createLead({ phone: "4772121004", source: "WEB", consentContact: false });
+    await deps.leads.update(nonFiscalLead.id, { status: "CONTACTED" });
+
+    const result = await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772121004", phoneRaw: "4772121004", text: PREFILLED_TEXT }));
+    expect(result.outcome).toBe("PROCESSED");
+    // No fiscalContext, no qualificationHandler/bookingHandler wired -- falls through to the
+    // existing "no-match" fallback, exactly as it would have before Fase 6B/6B.1 existed.
+    expect(deps.messaging.sentTexts).toHaveLength(0);
+    const branchLog = deps.logger.warnings.find((w) => w.details.branch === "no-match");
+    expect(branchLog).toBeTruthy();
+  });
+
+  it("6. a fiscal-context lead's first inbound that does NOT mention the calculator does not force the contextual welcome (fiscalContext stays available internally)", async () => {
+    const deps = makeDeps();
+    const fiscalLead = await deps.leadService.createLead({ phone: "4772121005", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
+    await seedFiscalScore(deps.fiscalLeadScores, fiscalLead.id);
+    await deps.leads.update(fiscalLead.id, { status: "CONTACTED" });
+
+    const result = await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772121005", phoneRaw: "4772121005", text: "Hola, buenas tardes" }));
+    expect(result.outcome).toBe("PROCESSED");
+    expect(deps.messaging.sentTexts).toHaveLength(0); // no forced welcome
+    const resolvedLog = deps.logger.warnings.find((w) => w.message === "fiscal context resolved for whatsapp inbound");
+    expect(resolvedLog?.details.contextFound).toBe(true); // still resolved internally, just not surfaced
+  });
+
+  it("7. a brand-new WhatsApp-only lead with no fiscal context keeps the exact pre-Fase-6B welcome behavior", async () => {
+    const deps = makeDeps();
+    const result = await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772121006", phoneRaw: "4772121006" }));
+    expect(result.outcome).toBe("PROCESSED");
+    expect(deps.messaging.sentTexts).toHaveLength(1);
+    expect(deps.messaging.sentTexts[0].body).toBe(buildWelcomeMessage("Ana"));
+    const branchLog = deps.logger.warnings.find((w) => w.details.branch === "wasNew-welcome");
+    expect(branchLog).toBeTruthy();
+  });
+
+  it("8. status, WhatsApp-qualifier score/scoreClass (A/B/C), and lifecycle fields stay untouched by the new fiscal-welcome branch", async () => {
+    const deps = makeDeps();
+    const fiscalLead = await deps.leadService.createLead({ phone: "4772121007", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
+    await seedFiscalScore(deps.fiscalLeadScores, fiscalLead.id, { scoreClass: "HOT", score: 100 });
+    await deps.leads.update(fiscalLead.id, { status: "CONTACTED" });
+
+    await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772121007", phoneRaw: "4772121007", text: PREFILLED_TEXT }));
+
+    const lead = await deps.leads.findById(fiscalLead.id);
+    expect(lead?.status).toBe("CONTACTED"); // the new branch never mutates status itself
+    expect(lead?.scoreClass).toBeUndefined(); // A/B/C field, never touched by fiscal HOT
+    expect(lead?.score).toBe(0); // WhatsApp-qualifier numeric score, untouched
+    expect(lead?.qualifiedAt).toBeUndefined();
+    expect(lead?.bookingStartedAt).toBeUndefined();
+    expect(lead?.bookedAt).toBeUndefined();
+  });
+});

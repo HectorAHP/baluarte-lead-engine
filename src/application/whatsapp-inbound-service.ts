@@ -9,6 +9,7 @@ import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isCancellationRequest } from "../domain/cancellation-intent-detection.js";
 import { isUpcomingBooked } from "../domain/appointment-timing.js";
 import { looksLikeFiscalCalculatorOrigin } from "../domain/fiscal-calculator-origin-detection.js";
+import { isFirstWhatsAppInboundForConversation } from "../domain/whatsapp-first-inbound.js";
 import { buildWelcomeMessage, buildFiscalContextWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE, BOOKED_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE } from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
 import { getFiscalLeadContextForLead, type FiscalLeadContext } from "./fiscal-lead-context.js";
@@ -252,6 +253,18 @@ export async function handleInboundWhatsAppText(
     "whatsapp inbound checkpoint 09: conversation resolved",
   );
 
+  // Fase 6B.1 -- "primer inbound relevante de WhatsApp" for this lead/conversation, computed
+  // from the conversation's ACTUAL message history (fetched now, before persistInboundMessage
+  // below adds the current one -- so it never counts itself). Deliberately NOT lead.status
+  // ("NEW") -- see domain/whatsapp-first-inbound.ts's doc comment for why. Only computed when a
+  // fiscal context exists: it is the sole consumer of this signal (the fiscal-welcome branch
+  // below), so a lead with no fiscal context never pays for the extra read.
+  let isFirstWhatsAppInbound = false;
+  if (fiscalContext) {
+    const priorConversationMessages = isNewConversation ? [] : await deps.messages.listByConversationId(conversation.id);
+    isFirstWhatsAppInbound = isFirstWhatsAppInboundForConversation(priorConversationMessages);
+  }
+
   deps.logger.warn({ messageIdLast8: msgIdLast8, conversationIdLast8: conversation.id.slice(-8) }, "whatsapp inbound checkpoint 10: persisting inbound message");
   stepStart = Date.now();
   const { sensitiveDetected } = await persistInboundMessage(
@@ -329,6 +342,23 @@ export async function handleInboundWhatsAppText(
         if (deps.qualificationHandler) {
           await deps.qualificationHandler.beginQualification(leadId);
         }
+        return;
+      }
+      // Fase 6B.1 -- the actual E2E case this bridge exists for: a lead already captured via the
+      // web fiscal calculator (source=WEB_FISCAL_CALCULATOR), whose status may have already moved
+      // away from "NEW" for a reason entirely unrelated to WhatsApp (see
+      // domain/whatsapp-first-inbound.ts's doc comment) -- so wasNew is false here, and the
+      // branch above never fires for them. This is their genuinely first WhatsApp message ever
+      // (isFirstWhatsAppInbound, computed from real conversation history above), it carries a
+      // fiscal context, and the text itself suggests fiscal-calculator origin: still deserves the
+      // one-time fiscal acknowledgment, sent here and ONLY here for this lead shape. Deliberately
+      // does NOT call beginQualification (unlike the wasNew branch) -- this lead's status is not
+      // "NEW"/freshly-contacted, so the existing status-based routing below (unchanged) still
+      // owns whatever happens on this and every subsequent turn; this branch's only effect is
+      // sending exactly one extra acknowledgment message, nothing else.
+      if (!wasNew && fiscalContext && isFirstWhatsAppInbound && looksLikeFiscalCalculatorOrigin(input.text)) {
+        logBranch("existing-lead-first-whatsapp-fiscal-welcome", true);
+        await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildFiscalContextWelcomeMessage(input.displayName));
         return;
       }
       if (deps.qualificationHandler && lead.status === "QUALIFYING") {
