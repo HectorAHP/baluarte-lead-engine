@@ -65,7 +65,7 @@ describe("Fase 6A -- fiscal lead scoring integration", () => {
 
     // Isolation: leads.score / leads.scoreClass (owned by the WhatsApp qualifier) are NEVER
     // written by fiscal scoring -- this is the architectural guarantee migration
-    // 017_fiscal_lead_scores.sql's header comment documents.
+    // 018_fiscal_lead_scores.sql's header comment documents.
     const lead = await getLead(app, leadId);
     expect(lead.score).toBe(0);
     expect(lead.scoreClass).toBeUndefined();

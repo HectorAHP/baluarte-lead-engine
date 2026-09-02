@@ -95,7 +95,7 @@ export interface QualificationAnswerRepository { create(input:Omit<Qualification
 export interface LeadScoreRepository { create(input:Omit<LeadScoreRecord,"id"|"createdAt">):Promise<LeadScoreRecord>; listByLeadId(leadId:string):Promise<LeadScoreRecord[]>; }
 /**
  * Fase 6A -- fiscal calculator commercial scoring (fiscal_v1), deliberately separate from
- * LeadScoreRepository/lead_scores above (see migration 017_fiscal_lead_scores.sql's header
+ * LeadScoreRepository/lead_scores above (see migration 018_fiscal_lead_scores.sql's header
  * comment for why: LeadScoreRecord.vertical/scoreClass are closed types owned by the WhatsApp
  * conversational qualifier, and breakdown cannot hold a reasons array).
  */

@@ -115,7 +115,7 @@ export class WebLeadCaptureService {
    *
    * Deliberately does NOT touch lead.score / lead.scoreClass / lead.status / assignedAdvisor /
    * conversations / appointments / lifecycle timestamps -- see migration
-   * 017_fiscal_lead_scores.sql's header comment for why those stay untouched.
+   * 018_fiscal_lead_scores.sql's header comment for why those stay untouched.
    */
   private async scoreFiscalCalculatorSubmission(lead: Lead, input: WebLeadCaptureInput): Promise<void> {
     if (input.source !== FISCAL_CALCULATOR_SOURCE) return;

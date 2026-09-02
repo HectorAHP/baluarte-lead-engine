@@ -56,7 +56,7 @@ function mapFiscalLeadScoreToInsertRow(input: Omit<FiscalLeadScore, "id" | "crea
 }
 
 /** Fase 6A -- append-only fiscal calculator scoring history. See migration
- * 017_fiscal_lead_scores.sql's header comment for why this is a dedicated table, never
+ * 018_fiscal_lead_scores.sql's header comment for why this is a dedicated table, never
  * lead_scores/leads.score_class. */
 export class SupabaseFiscalLeadScoreRepository implements FiscalLeadScoreRepository {
   constructor(private readonly client: SupabaseClient) {}
