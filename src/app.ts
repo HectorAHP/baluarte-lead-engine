@@ -699,7 +699,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
         "whatsapp webhook parsed inbound message",
       );
       await handleInboundWhatsAppText(
-        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler, reactivationHandler, pastBookedRecoveryHandler, appointments: appointmentsRepo },
+        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler, reactivationHandler, pastBookedRecoveryHandler, appointments: appointmentsRepo, fiscalLeadScores: fiscalLeadScoresRepo },
         message,
       );
     }

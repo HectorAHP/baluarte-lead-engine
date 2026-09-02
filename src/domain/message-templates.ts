@@ -10,6 +10,20 @@ export function buildWelcomeMessage(firstName?: string): string {
   return `${greeting} Gracias por contactar a Baluarte Capital. Soy el asistente de Baluarte y puedo ayudarte a preparar tu cita con Héctor.\n\n¿Buscas información sobre:\n\n1. Ahorro e inversión\n2. Retiro / PPR\n3. Gastos Médicos Mayores\n4. Otro tema?`;
 }
 
+/**
+ * Fase 6B -- sent instead of buildWelcomeMessage ONLY when: this is the lead's first inbound
+ * message, a FiscalLeadContext was recovered for this phone (see application/fiscal-lead-context.ts),
+ * and the inbound text itself suggests fiscal-calculator origin (see
+ * domain/fiscal-calculator-origin-detection.ts). Same menu structure as buildWelcomeMessage
+ * (the qualification engine's intent classification on the NEXT turn expects it) -- only the
+ * opening line changes. Acknowledges fiscal-calculator origin in general terms only -- never
+ * mentions score, scoreClass, income/contribution bands, or any other internal classification.
+ */
+export function buildFiscalContextWelcomeMessage(firstName?: string): string {
+  const greeting = firstName ? `Hola, ${firstName}.` : "Hola.";
+  return `${greeting} Claro, ya tengo identificado que vienes de la estimación fiscal de Baluarte Capital. Podemos revisar tu escenario y ver qué alternativas podrían tener sentido para ti.\n\n¿Buscas información sobre:\n\n1. Ahorro e inversión\n2. Retiro / PPR\n3. Gastos Médicos Mayores\n4. Otro tema?`;
+}
+
 export const HEALTH_HANDOFF_MESSAGE =
   "Gracias por compartirlo. Para cuidar tu información, este caso debe revisarlo personalmente Héctor. Te ayudaremos a continuar con él.";
 

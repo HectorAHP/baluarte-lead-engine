@@ -1,4 +1,4 @@
-import type { LeadRepository, ConversationRepository, MessageRepository, MessagingProvider, Logger, AppointmentRepository } from "./ports.js";
+import type { LeadRepository, ConversationRepository, MessageRepository, MessagingProvider, Logger, AppointmentRepository, FiscalLeadScoreRepository } from "./ports.js";
 import type { LeadService } from "./services.js";
 import type { Lead } from "../domain/lead.js";
 import { persistInboundMessage } from "./message-ingestion.js";
@@ -8,8 +8,10 @@ import { isOptOutMessage } from "../domain/opt-out-detection.js";
 import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isCancellationRequest } from "../domain/cancellation-intent-detection.js";
 import { isUpcomingBooked } from "../domain/appointment-timing.js";
-import { buildWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE, BOOKED_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE } from "../domain/message-templates.js";
+import { looksLikeFiscalCalculatorOrigin } from "../domain/fiscal-calculator-origin-detection.js";
+import { buildWelcomeMessage, buildFiscalContextWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE, BOOKED_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE } from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
+import { getFiscalLeadContextForLead, type FiscalLeadContext } from "./fiscal-lead-context.js";
 
 /**
  * Phase 3B qualifier orchestrator, injected only when config.QUALIFICATION_ENGINE_ENABLED is
@@ -117,6 +119,15 @@ export interface WhatsAppInboundDeps {
   /** Present only alongside pastBookedRecoveryHandler -- used ONLY to read the lead's current
    * appointment for the isUpcomingBooked check above, never written to from this file. */
   appointments?: AppointmentRepository;
+  /**
+   * Fase 6B -- fiscal calculator context bridge. Present in production (app.ts always
+   * constructs and injects the same FiscalLeadScoreRepository the web capture flow uses --
+   * FASE 6A). Absent (e.g. a test that doesn't need it), the fiscal-context lookup below is
+   * skipped entirely and behavior is byte-for-byte unchanged -- same "optional dependency is the
+   * de facto flag" convention as every other handler in this file. Read-only from here: never
+   * used to write leads/lead_scores/fiscal_lead_scores.
+   */
+  fiscalLeadScores?: FiscalLeadScoreRepository;
 }
 
 export type WhatsAppInboundOutcome = "DUPLICATE" | "PROCESSED";
@@ -194,6 +205,41 @@ export async function handleInboundWhatsAppText(
   lead = await deps.leadService.recordInboundContact(lead.id);
   deps.logger.warn({ messageIdLast8: msgIdLast8, leadIdLast8: lead.id.slice(-8), durationMs: Date.now() - stepStart }, "whatsapp inbound checkpoint 07: inbound contact recorded");
 
+  // Fase 6B -- fiscal calculator context bridge. Recovers the most recent FiscalLeadContext for
+  // this EXACT lead: the same Lead object the dedup logic above already resolved (whatsappUserId
+  // first, then phoneE164 -- see LeadRepository.findByDedupKey's priority order), never a
+  // second, independent phone lookup that could ever resolve to a different lead than the one
+  // this pipeline is actually processing (see this task's identity principle -- phone only, no
+  // name/email/fbclid/campaign/fuzzy matching, and never a false match). Fail-open: a lookup
+  // failure -- or the dependency simply not being wired (e.g. a test that doesn't need it) --
+  // never blocks ingestion or the reply; fiscalContext just stays null, identical to a lead that
+  // never used the calculator. Read-only: getFiscalLeadContextForLead never writes to
+  // leads/lead_scores/fiscal_lead_scores, so this can never mutate status/score/scoreClass/
+  // qualifiedAt/bookingStartedAt/bookedAt/assignedAdvisor -- those stay owned exclusively by the
+  // existing pipeline (qualification engine, booking handler, etc.), completely independent of
+  // fiscal HOT/WARM/NURTURE.
+  let fiscalContext: FiscalLeadContext | null = null;
+  if (deps.fiscalLeadScores) {
+    try {
+      fiscalContext = await getFiscalLeadContextForLead({ fiscalLeadScores: deps.fiscalLeadScores }, lead);
+    } catch (err) {
+      // Safe warning only -- never phone/email/name/exact amounts, matching this task's logging
+      // constraints.
+      deps.logger.warn(
+        { leadIdLast8: lead.id.slice(-8), errorName: err instanceof Error ? err.name : "unknown" },
+        "fiscal context lookup failed for whatsapp inbound -- continuing without it",
+      );
+    }
+    deps.logger.warn(
+      {
+        leadIdLast8: lead.id.slice(-8),
+        contextFound: !!fiscalContext,
+        ...(fiscalContext ? { scoreClass: fiscalContext.scoreClass, scoreVersion: fiscalContext.scoreVersion } : {}),
+      },
+      "fiscal context resolved for whatsapp inbound",
+    );
+  }
+
   deps.logger.warn({ messageIdLast8: msgIdLast8, leadIdLast8: lead.id.slice(-8) }, "whatsapp inbound checkpoint 08: resolving conversation");
   stepStart = Date.now();
   let conversation = await deps.conversations.findActiveByLeadId(lead.id);
@@ -216,6 +262,10 @@ export async function handleInboundWhatsAppText(
       body: input.text,
       providerMessageId: input.providerMessageId,
       sender: input.whatsappUserId,
+      // Fase 6B, item 9: no duplication of score/bands here (recoverable from
+      // fiscal_lead_scores via the lead) -- only a lightweight marker so a human/future handler
+      // browsing conversations can see this message came from a fiscal-context-linked lead.
+      extraMetadata: fiscalContext ? { origin: "FISCAL_CALCULATOR", fiscalContextAvailable: true } : undefined,
     },
   );
   deps.logger.warn(
@@ -266,7 +316,16 @@ export async function handleInboundWhatsAppText(
       }
       if (wasNew) {
         logBranch("wasNew-welcome", true);
-        await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildWelcomeMessage(input.displayName));
+        // Fase 6B, item 6: the ONLY conversational effect of fiscalContext in this phase --
+        // acknowledges fiscal-calculator origin in general terms, no score/bands/amounts, and
+        // only on the lead's very first inbound message, and only when that message itself
+        // suggests fiscal-calculator origin (the prefilled CTA text or a close variant). Any
+        // other combination (no fiscalContext, or a first message that doesn't mention it) sends
+        // the exact same buildWelcomeMessage as before this phase -- unchanged.
+        const welcomeBody = fiscalContext && looksLikeFiscalCalculatorOrigin(input.text)
+          ? buildFiscalContextWelcomeMessage(input.displayName)
+          : buildWelcomeMessage(input.displayName);
+        await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, welcomeBody);
         if (deps.qualificationHandler) {
           await deps.qualificationHandler.beginQualification(leadId);
         }

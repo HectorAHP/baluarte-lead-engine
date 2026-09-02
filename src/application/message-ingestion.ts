@@ -8,6 +8,15 @@ export interface InboundMessageInput {
   body: string;
   providerMessageId?: string;
   sender?: string;
+  /**
+   * Fase 6B -- optional extra fields merged into the inbound message's metadata, alongside
+   * whatever redactSensitiveHealthContent already computes (no key collision: that function only
+   * ever writes sensitive_content_detected/category). Used by whatsapp-inbound-service.ts to
+   * record `{ origin: "FISCAL_CALCULATOR", fiscalContextAvailable: true }` on the inbound row
+   * when a FiscalLeadContext was recovered for this lead -- never score/bands/exact amounts, and
+   * never required (omitted, this is a no-op -- existing callers are unaffected).
+   */
+  extraMetadata?: Record<string, unknown>;
 }
 
 export interface InboundMessageResult {
@@ -37,7 +46,7 @@ export async function persistInboundMessage(
     body: redactedBody,
     providerMessageId: input.providerMessageId,
     aiGenerated: false,
-    metadata,
+    metadata: input.extraMetadata ? { ...metadata, ...input.extraMetadata } : metadata,
   });
   return { message, sensitiveDetected };
 }
