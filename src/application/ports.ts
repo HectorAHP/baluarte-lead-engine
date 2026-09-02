@@ -1,5 +1,6 @@
 import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment, AppointmentStatus } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js"; import type { LeadStatusHistoryEntry } from "../domain/lead-status-history.js"; import type { AppointmentStatusHistoryEntry } from "../domain/appointment-status-history.js"; import type { AppointmentMessageDelivery } from "../domain/appointment-message-delivery.js"; import type { AppointmentCancellation } from "../domain/appointment-cancellation.js"; import type { AppointmentReschedule } from "../domain/appointment-reschedule.js";
 import type { ProcessedEvent } from "../domain/processed-event.js";
+import type { FiscalLeadScore } from "../domain/fiscal-lead-score.js";
 export interface LeadRepository { create(input:Omit<Lead,"id"|"createdAt"|"updatedAt">):Promise<Lead>; findById(id:string):Promise<Lead|null>; update(id:string,patch:Partial<Lead>):Promise<Lead>; findByDedupKey(key:LeadDedupKey):Promise<Lead|null>; }
 /**
  * Generic (provider, event_id) idempotency guard, backed by the `processed_events` table
@@ -92,6 +93,22 @@ export interface ConversationRepository { create(input:Omit<Conversation,"id"|"c
 export interface MessageRepository { create(input:Omit<Message,"id"|"createdAt">):Promise<Message>; findByProviderMessageId(channel:Message["channel"],providerMessageId:string):Promise<Message|null>; listByConversationId(conversationId:string):Promise<Message[]>; }
 export interface QualificationAnswerRepository { create(input:Omit<QualificationAnswer,"id"|"createdAt">):Promise<QualificationAnswer>; listByLeadId(leadId:string):Promise<QualificationAnswer[]>; }
 export interface LeadScoreRepository { create(input:Omit<LeadScoreRecord,"id"|"createdAt">):Promise<LeadScoreRecord>; listByLeadId(leadId:string):Promise<LeadScoreRecord[]>; }
+/**
+ * Fase 6A -- fiscal calculator commercial scoring (fiscal_v1), deliberately separate from
+ * LeadScoreRepository/lead_scores above (see migration 017_fiscal_lead_scores.sql's header
+ * comment for why: LeadScoreRecord.vertical/scoreClass are closed types owned by the WhatsApp
+ * conversational qualifier, and breakdown cannot hold a reasons array).
+ */
+export interface FiscalLeadScoreRepository {
+  /** Wins outright (INSERT succeeds) or returns null on a (lead_id, submission_id) conflict --
+   * never throws for the "already scored this submission" case, same tryCreate convention as
+   * ProcessedEventRepository/SlotOfferClaimRepository. This is what makes fiscal scoring
+   * idempotent per calculator submission. */
+  tryCreate(input: Omit<FiscalLeadScore, "id" | "createdAt">): Promise<FiscalLeadScore | null>;
+  /** Every fiscal_lead_scores row for this lead, newest first -- used by the WhatsApp context
+   * bridge (fiscal-lead-context.ts) to read the most recent score/bands for a lead. */
+  listByLeadId(leadId: string): Promise<FiscalLeadScore[]>;
+}
 export interface OfferedSlotRepository {
   create(input:Omit<OfferedSlot,"id"|"createdAt">):Promise<OfferedSlot>;
   /**

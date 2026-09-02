@@ -15,6 +15,8 @@ import type {AppointmentMessageDelivery} from "../domain/appointment-message-del
 import type {AppointmentCancellation} from "../domain/appointment-cancellation.js";
 import type {AppointmentReschedule} from "../domain/appointment-reschedule.js";
 import type {ProcessedEvent} from "../domain/processed-event.js";
+import type {FiscalLeadScoreRepository} from "../application/ports.js";
+import type {FiscalLeadScore} from "../domain/fiscal-lead-score.js";
 import {SlotUnavailableError,DuplicateMessageError,BookingAttemptKeyConflictError} from "../domain/errors.js";
 import {messageDedupKey} from "../domain/message-dedup-key.js";
 
@@ -461,5 +463,29 @@ export class InMemoryProcessedEventRepository implements ProcessedEventRepositor
     const event:ProcessedEvent={id:randomUUID(),provider:input.provider,eventId:input.eventId,createdAt:new Date()};
     this.byKey.set(key,event);
     return event;
+  }
+}
+
+// -------------------------------------------------------------------------------------------
+// Fase 6A -- fiscal calculator commercial scoring (fiscal_v1). Deliberately separate from
+// InMemoryLeadScoreRepository above -- see ports.ts's FiscalLeadScoreRepository doc comment.
+// -------------------------------------------------------------------------------------------
+
+export class InMemoryFiscalLeadScoreRepository implements FiscalLeadScoreRepository{
+  private byKey=new Map<string,FiscalLeadScore>();
+  private byLeadId=new Map<string,FiscalLeadScore[]>();
+  async tryCreate(input:Omit<FiscalLeadScore,"id"|"createdAt">):Promise<FiscalLeadScore|null>{
+    const key=`${input.leadId}:${input.submissionId}`;
+    if(this.byKey.has(key)) return null; // already scored this submission -- same tryCreate convention as InMemoryProcessedEventRepository
+    const row:FiscalLeadScore={...input,id:randomUUID(),createdAt:new Date()};
+    this.byKey.set(key,row);
+    const existing=this.byLeadId.get(input.leadId)??[];
+    existing.push(row);
+    this.byLeadId.set(input.leadId,existing);
+    return row;
+  }
+  async listByLeadId(leadId:string):Promise<FiscalLeadScore[]>{
+    const rows=this.byLeadId.get(leadId)??[];
+    return [...rows].sort((a,b)=>b.createdAt.getTime()-a.createdAt.getTime());
   }
 }

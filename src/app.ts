@@ -11,9 +11,11 @@ import {
   InMemoryQualificationAnswerRepository, InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
   InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository, InMemoryAppointmentMessageDeliveryRepository,
   InMemoryAppointmentCancellationRepository, InMemoryAppointmentRescheduleRepository, InMemoryProcessedEventRepository,
+  InMemoryFiscalLeadScoreRepository,
 } from "./infrastructure/memory-repositories.js";
 import { SupabaseLeadRepository } from "./infrastructure/supabase-lead-repository.js";
 import { SupabaseProcessedEventRepository } from "./infrastructure/supabase-processed-event-repository.js";
+import { SupabaseFiscalLeadScoreRepository } from "./infrastructure/supabase-fiscal-lead-score-repository.js";
 import { SupabaseAppointmentRepository } from "./infrastructure/supabase-appointment-repository.js";
 import { SupabaseBookingAttemptRepository } from "./infrastructure/supabase-booking-attempt-repository.js";
 import { SupabaseLeadScoreRepository } from "./infrastructure/supabase-lead-score-repository.js";
@@ -58,6 +60,7 @@ import type {
   SlotOfferClaimRepository, CalendarProvider, MessagingProvider,
   LeadStatusHistoryRepository, AppointmentStatusHistoryRepository, AppointmentMessageDeliveryRepository,
   AppointmentCancellationRepository, AppointmentRescheduleRepository, ProcessedEventRepository,
+  FiscalLeadScoreRepository,
 } from "./application/ports.js";
 
 declare module "fastify" {
@@ -86,6 +89,10 @@ export interface AppDependencies {
    * ProcessedEventRepository's doc comment in ports.ts and WebLeadCaptureService's class doc
    * comment in web-lead-capture.ts. */
   processedEventsRepo?: ProcessedEventRepository;
+  /** Fase 6A: fiscal calculator commercial scoring (fiscal_v1) history -- deliberately separate
+   * from leadScoresRepo below (owned by the WhatsApp qualification engine). See
+   * FiscalLeadScoreRepository's doc comment in ports.ts. */
+  fiscalLeadScoresRepo?: FiscalLeadScoreRepository;
   appointmentsRepo?: AppointmentRepository;
   bookingAttemptsRepo?: BookingAttemptRepository;
   leadScoresRepo?: LeadScoreRepository;
@@ -214,6 +221,8 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   const supabaseClient = overrides.supabaseClient !== undefined ? overrides.supabaseClient : config.SUPABASE_URL && config.SUPABASE_SECRET_KEY ? createSupabaseClient() : null;
   const leadsRepo = overrides.leadsRepo ?? (supabaseClient ? new SupabaseLeadRepository(supabaseClient) : new InMemoryLeadRepository());
   const processedEventsRepo = overrides.processedEventsRepo ?? (supabaseClient ? new SupabaseProcessedEventRepository(supabaseClient) : new InMemoryProcessedEventRepository());
+  // Fase 6A: fiscal calculator commercial scoring (fiscal_v1) history -- see FiscalLeadScoreRepository's doc comment in ports.ts.
+  const fiscalLeadScoresRepo = overrides.fiscalLeadScoresRepo ?? (supabaseClient ? new SupabaseFiscalLeadScoreRepository(supabaseClient) : new InMemoryFiscalLeadScoreRepository());
   const appointmentsRepo = overrides.appointmentsRepo ?? (supabaseClient ? new SupabaseAppointmentRepository(supabaseClient) : new InMemoryAppointmentRepository());
   const bookingAttemptsRepo = overrides.bookingAttemptsRepo ?? (supabaseClient ? new SupabaseBookingAttemptRepository(supabaseClient) : new InMemoryBookingAttemptRepository());
   const leadScoresRepo = overrides.leadScoresRepo ?? (supabaseClient ? new SupabaseLeadScoreRepository(supabaseClient) : new InMemoryLeadScoreRepository());
@@ -238,7 +247,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   const messaging = overrides.messaging ?? (hasWhatsAppCredentials ? new MetaWhatsAppProvider() : new FakeMessagingProvider());
 
   const leadService = new LeadService(leadsRepo, leadScoresRepo, leadStatusHistoryRepo, app.log);
-  const webLeadCaptureService = new WebLeadCaptureService(leadsRepo, processedEventsRepo, leadService, app.log);
+  const webLeadCaptureService = new WebLeadCaptureService(leadsRepo, processedEventsRepo, leadService, app.log, fiscalLeadScoresRepo);
   const appointmentService = new AppointmentService(calendar, appointmentsRepo, bookingAttemptsRepo, leadsRepo, app.log);
   // Always constructed -- cheap, stateless, and needed by both qualificationHandler (to offer
   // slots right after QUALIFIED_A/B) and bookingHandler below, each gated independently by its
@@ -562,6 +571,17 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
           note: noteParts.length > 0 ? noteParts.join("\n\n") : undefined,
           consentContact: body.consentContact ?? false,
           privacyAcceptedAt: submittedAt,
+          // Fase 6A: only meaningful when source === "WEB_FISCAL_CALCULATOR" (enforced inside
+          // WebLeadCaptureService, not here) -- passed through structurally, never parsed back out
+          // of noteParts/notes.
+          fiscalCalculator: fc
+            ? {
+                monthlyIncome: fc.monthlyIncome,
+                annualContribution: fc.annualContribution,
+                filesAnnualReturn: fc.filesAnnualReturn,
+                hasPpr: fc.hasPpr,
+              }
+            : undefined,
         });
 
         return reply.code(result.matchedExisting ? 200 : 201).send({ ok: true, leadId: result.lead.id });

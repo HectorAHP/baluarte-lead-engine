@@ -5,6 +5,7 @@ import {
   InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
   InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository, InMemoryAppointmentMessageDeliveryRepository,
   InMemoryAppointmentCancellationRepository, InMemoryAppointmentRescheduleRepository,
+  InMemoryFiscalLeadScoreRepository,
 } from "../../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../../src/infrastructure/fake-calendar.js";
 import { FakeMessagingProvider } from "../../src/infrastructure/fake-messaging-provider.js";
@@ -54,6 +55,8 @@ export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
     // exactly the failure mode this helper's own doc comment exists to prevent.
     appointmentCancellationsRepo: new InMemoryAppointmentCancellationRepository(),
     appointmentReschedulesRepo: new InMemoryAppointmentRescheduleRepository(),
+    // Fase 6A -- same "complete set, never a config-driven default" rationale as every repo above.
+    fiscalLeadScoresRepo: new InMemoryFiscalLeadScoreRepository(),
     calendar: new FakeCalendarProvider(),
     messaging: new FakeMessagingProvider(),
     whatsappVerifyToken: TEST_WHATSAPP_VERIFY_TOKEN,

@@ -1,7 +1,13 @@
-import type { LeadRepository, ProcessedEventRepository, Logger } from "./ports.js";
+import type { LeadRepository, ProcessedEventRepository, Logger, FiscalLeadScoreRepository } from "./ports.js";
 import type { Lead, Vertical } from "../domain/lead.js";
 import { normalizePhoneToE164 } from "../domain/phone.js";
 import type { LeadService } from "./services.js";
+import { scoreFiscalCalculatorLead } from "../domain/fiscal-lead-scoring.js";
+import type { FiscalScoreInput } from "../domain/fiscal-lead-score.js";
+
+/** Source value that gates fiscal_v1 scoring -- see FASE 6A. Any other `source` never runs
+ * fiscal scoring, regardless of whether a `fiscalCalculator` payload happens to be present. */
+const FISCAL_CALCULATOR_SOURCE = "WEB_FISCAL_CALCULATOR";
 
 /**
  * Web lead capture (impuestos.html fiscal calculator, and any future public web form).
@@ -46,6 +52,13 @@ export interface WebLeadCaptureInput {
   note?: string;
   consentContact: boolean;
   privacyAcceptedAt: Date;
+  /**
+   * Fase 6A: only consulted when source === "WEB_FISCAL_CALCULATOR". Passed through as-is from
+   * the calculator's structured payload -- scoring runs directly against these fields, never by
+   * parsing/regex-extracting from `note`/leads.notes (that text is free-form and not a scoring
+   * input by design; see the class doc comment's HISTORICAL LIMITATION).
+   */
+  fiscalCalculator?: FiscalScoreInput;
 }
 
 export interface WebLeadCaptureResult {
@@ -87,7 +100,57 @@ export class WebLeadCaptureService {
     private readonly processedEvents: ProcessedEventRepository,
     private readonly leadService: LeadService,
     private readonly logger: Logger,
+    // Fase 6A -- optional so every existing test-app/production wiring that predates fiscal
+    // scoring keeps compiling; app.ts always supplies a real one (InMemory or Supabase). When
+    // absent, fiscal scoring is silently skipped (never throws) -- deliberately fail-open, since
+    // scoring is additive and must never block a lead capture from succeeding.
+    private readonly fiscalLeadScores?: FiscalLeadScoreRepository,
   ) {}
+
+  /**
+   * Fase 6A: scores + persists a fiscal_v1 row for `lead`'s current submission, when eligible.
+   * Idempotent via FiscalLeadScoreRepository.tryCreate's (lead_id, submission_id) uniqueness --
+   * a resend of the same submissionId returns null (no-op) rather than a duplicate row. Never
+   * throws: a scoring failure must never fail the surrounding lead-capture request.
+   *
+   * Deliberately does NOT touch lead.score / lead.scoreClass / lead.status / assignedAdvisor /
+   * conversations / appointments / lifecycle timestamps -- see migration
+   * 017_fiscal_lead_scores.sql's header comment for why those stay untouched.
+   */
+  private async scoreFiscalCalculatorSubmission(lead: Lead, input: WebLeadCaptureInput): Promise<void> {
+    if (input.source !== FISCAL_CALCULATOR_SOURCE) return;
+    if (!input.fiscalCalculator) return;
+    if (!this.fiscalLeadScores) return;
+    try {
+      const result = scoreFiscalCalculatorLead(input.fiscalCalculator);
+      const persisted = await this.fiscalLeadScores.tryCreate({
+        leadId: lead.id,
+        submissionId: input.submissionId,
+        score: result.score,
+        scoreClass: result.scoreClass,
+        version: result.version,
+        reasons: result.reasons,
+        monthlyIncomeBand: result.monthlyIncomeBand,
+        annualContributionBand: result.annualContributionBand,
+        hasPpr: input.fiscalCalculator.hasPpr,
+        filesAnnualReturn: input.fiscalCalculator.filesAnnualReturn,
+      });
+      if (persisted) {
+        // ALLOWED to log: opaque leadId fragment, scoreClass, score, version. FORBIDDEN: name,
+        // phone, email, exact income/contribution, deductions, fiscal result -- none of those are
+        // referenced here.
+        this.logger.warn(
+          { leadIdLast8: lead.id.slice(-8), score: result.score, scoreClass: result.scoreClass, version: result.version },
+          "lead fiscal score calculated",
+        );
+      }
+    } catch (err) {
+      this.logger.warn(
+        { leadIdLast8: lead.id.slice(-8), errorName: err instanceof Error ? err.name : "unknown" },
+        "lead fiscal score calculation failed",
+      );
+    }
+  }
 
   async capture(input: WebLeadCaptureInput): Promise<WebLeadCaptureResult> {
     const claim = await this.processedEvents.tryCreate({ provider: WEB_LEAD_EVENT_PROVIDER, eventId: input.submissionId });
@@ -127,6 +190,7 @@ export class WebLeadCaptureService {
       if (mergedNotes !== existing.notes) patch.notes = mergedNotes;
 
       const lead = Object.keys(patch).length > 0 ? await this.leads.update(existing.id, patch) : existing;
+      await this.scoreFiscalCalculatorSubmission(lead, input);
       return { lead, matchedExisting: true, idempotentReplay };
     }
 
@@ -145,6 +209,7 @@ export class WebLeadCaptureService {
       notes: input.note,
       privacyAcceptedAt: input.privacyAcceptedAt,
     });
+    await this.scoreFiscalCalculatorSubmission(lead, input);
     return { lead, matchedExisting: false, idempotentReplay };
   }
 }
