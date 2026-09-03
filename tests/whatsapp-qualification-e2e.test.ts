@@ -229,7 +229,7 @@ describe("Phase 3B WhatsApp qualification -- flag on", () => {
     expect(conversation).toBeNull();
     const answers = await repos.qualificationAnswersRepo.listByLeadId(lead!.id);
     expect(answers).toHaveLength(0);
-    expect(messaging.sentTexts.at(-1)?.body).toMatch(/Héctor/);
+    expect(messaging.sentTexts.at(-1)?.body).toMatch(/asesor/i);
 
     // Handoff is irreversible automatically: a further message gets no new automated reply.
     const before = messaging.sentTexts.length;
@@ -307,7 +307,7 @@ describe("Phase 3B WhatsApp qualification -- health-safety incident regression (
     // Exactly one new outbound: the health handoff message. Never the urgency question.
     const newReplies = messaging.sentTexts.slice(repliesBefore);
     expect(newReplies).toHaveLength(1);
-    expect(newReplies[0].body).toMatch(/Héctor/);
+    expect(newReplies[0].body).toMatch(/asesor/i);
     expect(newReplies[0].body).not.toMatch(/pronto te gustaría resolver/i); // the urgency question
 
     // The raw clinical text is absent from the persisted message body and its metadata.

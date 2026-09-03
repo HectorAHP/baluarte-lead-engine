@@ -17,6 +17,7 @@ import { markLeadBooked, escalateToHuman, dispatchSlotOfferOutcome } from "./boo
 import { isBookingAbandonRequest } from "../domain/booking-abandon-intent-detection.js";
 import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
 import { isUpcomingBooked } from "../domain/appointment-timing.js";
+import { conversationalFirstName } from "../domain/conversation-name.js";
 import { assertTransition } from "../domain/state-machine.js";
 import { recordLeadStatusTransition } from "./lead-status-audit.js";
 import {
@@ -127,7 +128,7 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     const existingAppointment = await this.deps.appointments.findActiveByLeadId(lead.id);
     if (existingAppointment && isUpcomingBooked(existingAppointment, now)) {
       await markLeadBooked(this.deps, lead, existingAppointment);
-      await this.replyExistingBooking(lead.id, conversationId, whatsappUserId, existingAppointment);
+      await this.replyExistingBooking(lead, conversationId, whatsappUserId, existingAppointment);
       return;
     }
 
@@ -197,7 +198,7 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     const existingAppointment = await this.deps.appointments.findActiveByLeadId(lead.id);
     if (existingAppointment && isUpcomingBooked(existingAppointment, now)) {
       await markLeadBooked(this.deps, lead, existingAppointment);
-      await this.replyExistingBooking(lead.id, conversationId, whatsappUserId, existingAppointment);
+      await this.replyExistingBooking(lead, conversationId, whatsappUserId, existingAppointment);
       return;
     }
 
@@ -250,7 +251,7 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     // an increment/toggle), and markLeadBooked no-ops once the lead is already BOOKED.
     await this.deps.offeredSlots.update(slot.id, { selected: true });
     await markLeadBooked(this.deps, lead, appointment);
-    await this.replyBookingConfirmed(lead.id, conversationId, whatsappUserId, appointment);
+    await this.replyBookingConfirmed(lead, conversationId, whatsappUserId, appointment);
   }
 
   /**
@@ -334,13 +335,13 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, BOOKING_TECHNICAL_ERROR_MESSAGE);
   }
 
-  private async replyExistingBooking(leadId: string, conversationId: string, whatsappUserId: string, appointment: Appointment): Promise<void> {
+  private async replyExistingBooking(lead: Lead, conversationId: string, whatsappUserId: string, appointment: Appointment): Promise<void> {
     const when = formatSlotForDisplay(appointment.startsAt, this.advisorTimezone);
-    await sendAndPersistReply(this.deps, leadId, conversationId, whatsappUserId, buildExistingBookingMessage(when, appointment.meetingUrl));
+    await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildExistingBookingMessage(when, appointment.meetingUrl, conversationalFirstName(lead)));
   }
 
-  private async replyBookingConfirmed(leadId: string, conversationId: string, whatsappUserId: string, appointment: Appointment): Promise<void> {
+  private async replyBookingConfirmed(lead: Lead, conversationId: string, whatsappUserId: string, appointment: Appointment): Promise<void> {
     const when = formatSlotForDisplay(appointment.startsAt, this.advisorTimezone);
-    await sendAndPersistReply(this.deps, leadId, conversationId, whatsappUserId, buildBookingConfirmedMessage(when, appointment.meetingUrl));
+    await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildBookingConfirmedMessage(when, appointment.meetingUrl, conversationalFirstName(lead)));
   }
 }

@@ -144,7 +144,7 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(2);
     expect(outbound[1].body).not.toBe(QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE);
-    expect(outbound[1].body).toContain("Tengo estas opciones disponibles");
+    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
     // 3 real slots came from FakeCalendarProvider (max 3, same cap GoogleCalendarProvider uses).
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     expect(offered.length).toBeGreaterThan(0);
@@ -159,7 +159,7 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
 
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(1);
-    expect(outbound[0].body).toContain("Tengo estas opciones disponibles");
+    expect(outbound[0].body).toContain("Tengo estos horarios disponibles");
   });
 
   it("4+5. offered slots come exclusively from CalendarProvider.getAvailableSlots -- never invented", async () => {
@@ -213,7 +213,7 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     await send(app, "5214776100007", "wamid.7b", "1");
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[outbound.length - 1].body).toContain("Ese horario acaba de ocuparse"); // SLOT_UNAVAILABLE_INTRO path
+    expect(outbound[outbound.length - 1].body).toContain("Ese horario acaba de dejar de estar disponible"); // SLOT_UNAVAILABLE_INTRO path
     const appts = await repos.appointmentsRepo.listAllByLeadId((await repos.leadsRepo.findByDedupKey({ whatsappUserId: "5214776100007" }))!.id);
     expect(appts.find((a) => a.startsAt.getTime() === first.slotStart.getTime())).toBeUndefined();
   });

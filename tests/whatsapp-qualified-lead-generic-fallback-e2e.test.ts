@@ -154,7 +154,7 @@ describe("Pre-launch fix -- qualified/nurture lead generic conversational fallba
     expect(finalLead?.status).toBe("BOOKING_PENDING"); // real booking flow started
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(1); // exactly one reply -- never the fallback ADDITIONALLY
-    expect(outbound[0].body).toContain("Tengo estas opciones disponibles"); // the real slot offer, not the fallback
+    expect(outbound[0].body).toContain("Tengo estos horarios disponibles"); // the real slot offer, not the fallback
     expect(outbound[0].body).not.toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
   });
 

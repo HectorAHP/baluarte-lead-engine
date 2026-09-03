@@ -8,7 +8,7 @@ import {
 import { FakeMessagingProvider } from "../src/infrastructure/fake-messaging-provider.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
 import {
-  buildFiscalContextWelcomeMessage, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_ASK_QUESTION_MESSAGE,
+  buildFiscalContextWelcomeMessage, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, buildQualifiedLeadAskQuestionMessage,
   buildQualifiedLeadTopicAnswer, buildQualifiedLeadOptionsMessage, QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE,
 } from "../src/domain/message-templates.js";
 import type { FiscalLeadScore } from "../src/domain/fiscal-lead-score.js";
@@ -64,7 +64,7 @@ async function seedFiscalScore(fiscalLeadScores: InMemoryFiscalLeadScoreReposito
  * A/B/C qualifier), fiscal HOT/90 (fiscal_v1, completely separate), first fiscal-welcome exchange
  * already happened. */
 async function seedQualifiedAFiscalLeadWithWelcome(deps: ReturnType<typeof makeDeps>, phone: string, waId: string) {
-  const lead = await deps.leadService.createLead({ phone, source: "WEB_FISCAL_CALCULATOR", consentContact: false });
+  const lead = await deps.leadService.createLead({ firstName: "Ana", phone, source: "WEB_FISCAL_CALCULATOR", consentContact: false });
   await seedFiscalScore(deps.fiscalLeadScores, lead.id);
   await deps.leads.update(lead.id, { status: "QUALIFIED_A", score: 78, scoreClass: "A", qualifiedAt: new Date("2026-01-01T00:00:00.000Z") });
 
@@ -100,7 +100,7 @@ describe("Fase 6C -- qualified-lead conversation router", () => {
     await send(deps, "5214776000002", "4776000002", "wamid.b2", "1");
 
     expect(deps.messaging.sentTexts).toHaveLength(3);
-    expect(deps.messaging.sentTexts[2].body).toBe(QUALIFIED_LEAD_ASK_QUESTION_MESSAGE);
+    expect(deps.messaging.sentTexts[2].body).toBe(buildQualifiedLeadAskQuestionMessage(true)); // fiscal context present
     expect(deps.messaging.sentTexts[2].body).not.toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
   });
 

@@ -179,6 +179,6 @@ describe("WHATSAPP_BOOKING_ENABLED -- qualification -> booking wiring (Phase 3C 
     // THEN a separate offer message -- never merged into one.
     expect(messaging.sentTexts).toHaveLength(turns.length + 1);
     expect(messaging.sentTexts.at(-2)?.body).toBe(QUALIFICATION_COMPLETE_AB_MESSAGE);
-    expect(messaging.sentTexts.at(-1)?.body).toContain("Tengo estas opciones disponibles");
+    expect(messaging.sentTexts.at(-1)?.body).toContain("Tengo estos horarios disponibles");
   });
 });

@@ -18,6 +18,9 @@ export type QualifiedLeadIntent =
   /** Digit "1" against the main menu specifically -- unlike free text, a bare digit carries no
    * question content yet, so the reply must ask for one instead of answering a topic directly. */
   | { kind: "MENU_QUESTION" }
+  /** Fase 6E -- "¿quién eres?" / "¿eres un bot?" / "¿con quién hablo?". Answered transparently
+   * (see domain/lia-identity.ts), never treated as a topic/booking question. */
+  | { kind: "IDENTITY" }
   | { kind: "UNKNOWN" };
 
 const COMBINING_DIACRITICS = new RegExp("[\\u0300-\\u036f]", "g");
@@ -35,6 +38,10 @@ const GMM_KEYWORDS = ["gmm", "gastos medicos", "seguro medico", "seguro de gasto
 const SAVINGS_KEYWORDS = ["ahorro", "ahorrar", "invertir", "inversion"];
 const EXPLORE_OPTIONS_KEYWORDS = ["conocer opciones", "conocer las opciones", "ver opciones", "que opciones", "conocer alternativas"];
 const BOOKING_KEYWORDS = ["agendar", "agenda", "cita", "asesoria"];
+// Fase 6E -- checked BEFORE every other keyword list: a meta-question about Lía herself must
+// never be misread as a topic/booking question, however unlikely the overlap. `normalize()`
+// already strips accents (NFD), so only the unaccented form needs to be listed here.
+const IDENTITY_KEYWORDS = ["quien eres", "eres un bot", "eres una ia", "eres inteligencia artificial", "eres humano", "eres humana", "eres real", "eres persona", "con quien hablo", "hablo con quien", "quien me escribe"];
 
 /** Matches a lone menu digit (1-3 only -- this menu has exactly 3 options), tolerating
  * "opcion 1", "1.", "1)", "la 2", etc. Same shape as intent-classifier.ts's matchMenuOption. */
@@ -45,6 +52,9 @@ function matchBareDigit(normalized: string): 1 | 2 | 3 | null {
 
 export function detectQualifiedLeadIntent(rawText: string, pendingMenu: QualifiedLeadPendingMenu | null): QualifiedLeadIntent {
   const normalized = normalize(rawText);
+
+  // Checked first: a meta-question about Lía herself always wins, regardless of pendingMenu.
+  if (IDENTITY_KEYWORDS.some((kw) => normalized.includes(kw))) return { kind: "IDENTITY" };
 
   // Free-text keyword detection ALWAYS runs first, regardless of pendingMenu -- an explicit
   // question ("¿Cómo funciona el PPR?") must never be shadowed by a stale/coincidental menu

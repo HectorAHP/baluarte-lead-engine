@@ -12,10 +12,12 @@ import { looksLikeFiscalCalculatorOrigin } from "../domain/fiscal-calculator-ori
 import { isFirstWhatsAppInboundForConversation } from "../domain/whatsapp-first-inbound.js";
 import { detectQualifiedLeadIntent } from "../domain/qualified-lead-intent-detection.js";
 import { resolvePendingQualifiedMenu, qualifiedMainMenuMetadata } from "../domain/qualified-lead-menu-state.js";
+import { conversationalFirstName } from "../domain/conversation-name.js";
 import {
   buildWelcomeMessage, buildFiscalContextWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE,
-  BOOKED_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_ASK_QUESTION_MESSAGE,
+  BOOKED_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, buildQualifiedLeadAskQuestionMessage,
   buildQualifiedLeadTopicAnswer, buildQualifiedLeadOptionsMessage, QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE,
+  QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE,
 } from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
 import { getFiscalLeadContextForLead, type FiscalLeadContext } from "./fiscal-lead-context.js";
@@ -355,8 +357,8 @@ export async function handleInboundWhatsAppText(
         // other combination (no fiscalContext, or a first message that doesn't mention it) sends
         // the exact same buildWelcomeMessage as before this phase -- unchanged.
         const welcomeBody = fiscalContext && looksLikeFiscalCalculatorOrigin(input.text)
-          ? buildFiscalContextWelcomeMessage(input.displayName)
-          : buildWelcomeMessage(input.displayName);
+          ? buildFiscalContextWelcomeMessage(conversationalFirstName(lead))
+          : buildWelcomeMessage(conversationalFirstName(lead));
         await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, welcomeBody);
         if (deps.qualificationHandler) {
           await deps.qualificationHandler.beginQualification(leadId);
@@ -377,7 +379,7 @@ export async function handleInboundWhatsAppText(
       // sending exactly one extra acknowledgment message, nothing else.
       if (!wasNew && fiscalContext && isFirstWhatsAppInbound && looksLikeFiscalCalculatorOrigin(input.text)) {
         logBranch("existing-lead-first-whatsapp-fiscal-welcome", true);
-        await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildFiscalContextWelcomeMessage(input.displayName));
+        await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildFiscalContextWelcomeMessage(conversationalFirstName(lead)));
         return;
       }
       if (deps.qualificationHandler && lead.status === "QUALIFYING") {
@@ -464,9 +466,11 @@ export async function handleInboundWhatsAppText(
           switch (intent.kind) {
             case "QUESTION":
               logBranch(`qualified-or-nurture-question-${intent.topic.toLowerCase()}`, true);
-              // Ends with the main menu again (see buildQualifiedLeadTopicAnswer) -- marks it so
-              // a following bare "1"/"2"/"3" is still interpretable.
-              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildQualifiedLeadTopicAnswer(intent.topic), qualifiedMainMenuMetadata());
+              // Fase 6E: ends on a topic-specific contextual question, never the main menu again
+              // (item 6 -- "no regresar automáticamente al menú principal") -- so this reply does
+              // NOT mark qualifiedMainMenuMetadata(); a bare "1"/"2"/"3" on the NEXT turn is
+              // genuinely ambiguous here and safely falls back to the main menu via UNKNOWN below.
+              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildQualifiedLeadTopicAnswer(intent.topic));
               break;
             case "EXPLORE_OPTIONS":
               logBranch("qualified-or-nurture-explore-options", true);
@@ -481,7 +485,13 @@ export async function handleInboundWhatsAppText(
               break;
             case "MENU_QUESTION":
               logBranch("qualified-or-nurture-menu-question", true);
-              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, QUALIFIED_LEAD_ASK_QUESTION_MESSAGE);
+              // hasFiscalContext narrows the prompt to "tu estrategia de retiro" -- topic only,
+              // never score/HOT/bands.
+              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildQualifiedLeadAskQuestionMessage(!!fiscalContext));
+              break;
+            case "IDENTITY":
+              logBranch("qualified-or-nurture-identity", true);
+              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE);
               break;
             case "UNKNOWN":
               logBranch("qualified-or-nurture-generic-fallback", true);

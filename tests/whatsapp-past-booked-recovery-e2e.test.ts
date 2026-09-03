@@ -181,7 +181,7 @@ describe("Pre-launch hardening -- stale/past BOOKED appointment recovery", () =>
     expect(finalLead?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(1);
-    expect(outbound[0].body).toContain("Tengo estas opciones disponibles");
+    expect(outbound[0].body).toContain("Tengo estos horarios disponibles");
     // The stale appointment row itself is never touched.
     const reloadedStale = await repos.appointmentsRepo.findById(staleAppointment.id);
     expect(reloadedStale?.status).toBe("BOOKED");
@@ -220,7 +220,7 @@ describe("Pre-launch hardening -- stale/past BOOKED appointment recovery", () =>
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(2); // acknowledgment + real new offer
     expect(outbound[0].body).toContain("ya pasó");
-    expect(outbound[1].body).toContain("Tengo estas opciones disponibles");
+    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
     // The old appointment never transitions to RESCHEDULED -- it was never "the" old appointment
     // of a reschedule, just an untouched stale row.
     const reloadedStale = await repos.appointmentsRepo.findById(staleAppointment.id);

@@ -138,7 +138,7 @@ describe("WhatsAppBookingHandler -- success", () => {
     expect(stillActive.find((s) => s.id === offer.slots[0].id)).toBeUndefined(); // no longer active -- selected
     expect(await appointments.findActiveByLeadId(lead.id)).toBeTruthy();
     expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("Listo, tu cita quedó agendada");
+    expect(messaging.sentTexts[0].body).toContain("quedó agendada");
   });
 
   it("M: the confirmation includes the real meetingUrl when the provider returns one", async () => {
@@ -222,7 +222,7 @@ describe("WhatsAppBookingHandler -- existing appointment / idempotency", () => {
     expect(reloadedLead?.meetingAt).toEqual(appt.startsAt);
     expect(calendar.calls).toBe(0);
     expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("Ya tienes una cita agendada");
+    expect(messaging.sentTexts[0].body).toContain("tienes una asesoría agendada");
     expect(messaging.sentTexts[0].body).toContain(appt.meetingUrl);
   });
 
@@ -271,8 +271,8 @@ describe("WhatsAppBookingHandler -- existing appointment / idempotency", () => {
     expect(secondAppointment?.id).toBe(firstAppointment?.id); // same appointment, never a duplicate
     expect(await offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(1); // P: no new round
     expect(messaging.sentTexts).toHaveLength(2);
-    expect(messaging.sentTexts[0].body).toContain("Listo, tu cita quedó agendada");
-    expect(messaging.sentTexts[1].body).toContain("Ya tienes una cita agendada"); // 2nd turn hits the appointment guard directly
+    expect(messaging.sentTexts[0].body).toContain("quedó agendada");
+    expect(messaging.sentTexts[1].body).toContain("tienes una asesoría agendada"); // 2nd turn hits the appointment guard directly
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKED"); // still BOOKED -- no InvalidLeadTransitionError, no regression
   });
@@ -314,7 +314,7 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
 
     expect(calendar.calls).toBe(1);
     expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("Tengo estas opciones disponibles");
+    expect(messaging.sentTexts[0].body).toContain("Tengo estos horarios disponibles");
     expect(await offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(2);
   });
 
@@ -333,7 +333,7 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
 
     expect(await appointments.findActiveByLeadId(lead.id)).toBeNull();
     expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("Ese horario acaba de ocuparse");
+    expect(messaging.sentTexts[0].body).toContain("Ese horario acaba de dejar de estar disponible");
     expect(await offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(2);
   });
 
@@ -460,7 +460,7 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKING_PENDING");
     expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("problema técnico");
+    expect(messaging.sentTexts[0].body).toContain("no pude consultar la agenda");
   });
 
   it("L: a slot round that expired since the offer -- no booking; the turn falls back to offering a fresh round", async () => {
@@ -479,6 +479,6 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
     const rounds = await offeredSlots.listRoundIdsByConversationId(conversation.id);
     expect(rounds).toHaveLength(2); // the expired round + a fresh one offered instead
     expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("Tengo estas opciones disponibles");
+    expect(messaging.sentTexts[0].body).toContain("Tengo estos horarios disponibles");
   });
 });

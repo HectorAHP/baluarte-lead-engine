@@ -182,7 +182,7 @@ describe("Phase 3C -- feature flag matrix", () => {
     for (const [i, t] of SAVINGS_TO_QUALIFIED_A_TURNS.entries()) await send(app, from, `wamid.c.${i}`, t);
     const lead = await repos.leadsRepo.findByDedupKey({ whatsappUserId: from });
     expect(lead?.status).toBe("BOOKING_PENDING");
-    expect(messaging.sentTexts.at(-1)?.body).toContain("Tengo estas opciones disponibles");
+    expect(messaging.sentTexts.at(-1)?.body).toContain("Tengo estos horarios disponibles");
   });
 
   it("D: qualification=true, booking=true -- NURTURE_C never offers slots", async () => {
@@ -233,7 +233,7 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     const appointment = await repos.appointmentsRepo.findActiveByLeadId(lead!.id);
     expect(appointment).toBeTruthy();
     expect(messaging.sentTexts).toHaveLength(beforeSelection + 1); // exactly one confirmation
-    expect(messaging.sentTexts.at(-1)?.body).toContain("Listo, tu cita quedó agendada");
+    expect(messaging.sentTexts.at(-1)?.body).toContain("quedó agendada");
   });
 
   it("B: GMM -> QUALIFIED_B -> offer -> BOOKING_PENDING -> \"1\" -> BOOKED", async () => {
@@ -463,7 +463,7 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     const leadAfterRetry = await repos.leadsRepo.findById(lead.id);
     expect(leadAfterRetry?.meetingAt).toEqual(afterFirst?.startsAt); // unchanged by the retry -- markLeadBooked's backfill guard is a no-op once already set
     expect(workingMessaging.sentTexts).toHaveLength(1);
-    expect(workingMessaging.sentTexts[0].body).toContain("Ya tienes una cita agendada");
+    expect(workingMessaging.sentTexts[0].body).toContain("tienes una asesoría agendada");
   });
 });
 

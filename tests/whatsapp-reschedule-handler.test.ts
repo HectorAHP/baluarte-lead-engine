@@ -67,7 +67,7 @@ describe("WhatsAppRescheduleHandler -- intent turn (BOOKED)", () => {
     expect((await h.leads.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
     expect(h.messaging.sentTexts.length).toBeGreaterThanOrEqual(2);
     expect(h.messaging.sentTexts[0].body).toContain("puedo ayudarte a cambiar tu cita");
-    expect(h.messaging.sentTexts[1].body).toContain("Responde con el número");
+    expect(h.messaging.sentTexts[1].body).toContain("¿Cuál te funciona mejor?");
     const history = await h.leadStatusHistory.listByLeadId(lead.id);
     expect(history).toHaveLength(1);
     expect(history[0]).toMatchObject({ fromStatus: "BOOKED", toStatus: "RESCHEDULE_REQUESTED", eventType: "RESCHEDULE_REQUESTED" });
@@ -219,7 +219,7 @@ describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
     expect((await h.leads.findById(pendingLead.id))?.status).toBe("RESCHEDULE_REQUESTED");
     expect((await h.appointments.findById(appointment.id))?.status).toBe("BOOKED");
     const lastMessage = h.messaging.sentTexts[h.messaging.sentTexts.length - 1];
-    expect(lastMessage.body).toContain("Ese horario acaba de ocuparse");
+    expect(lastMessage.body).toContain("Ese horario acaba de dejar de estar disponible");
   });
 
   it("item 13: 'cancelar cita' while RESCHEDULE_REQUESTED hands off to CANCEL_PENDING with the SAME confirmation prompt cancellation uses from BOOKED", async () => {

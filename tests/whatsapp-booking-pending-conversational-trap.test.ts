@@ -225,7 +225,7 @@ describe("Pre-launch hardening -- BOOKING_PENDING conversational trap", () => {
     expect(finalLead?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(2); // abandon confirmation + slot offer
-    expect(outbound[1].body).toContain("Tengo estas opciones disponibles");
+    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
   });
 
   it("8: score/product/qualification_answers/lead_scores remain intact after abandoning BOOKING_PENDING", async () => {

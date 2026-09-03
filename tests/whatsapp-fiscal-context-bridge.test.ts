@@ -197,7 +197,7 @@ describe("Fase 6B -- WhatsApp inbound fiscal context bridge", () => {
 
   it("11. the exact prefilled calculator message triggers the fiscal-acknowledgment welcome (no score/bands mentioned)", async () => {
     const deps = makeDeps();
-    const fiscalLead = await deps.leadService.createLead({ phone: "4778888888", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
+    const fiscalLead = await deps.leadService.createLead({ firstName: "Ana", phone: "4778888888", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
     await seedFiscalScore(deps.fiscalLeadScores, fiscalLead.id);
 
     const result = await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214778888888", phoneRaw: "5214778888888", text: PREFILLED_TEXT }));
@@ -211,7 +211,7 @@ describe("Fase 6B -- WhatsApp inbound fiscal context bridge", () => {
 
   it("12. a normal (non-prefilled) message from the same fiscal-context lead still resolves the context internally, even though the reply stays generic", async () => {
     const deps = makeDeps();
-    const fiscalLead = await deps.leadService.createLead({ phone: "4779999999", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
+    const fiscalLead = await deps.leadService.createLead({ firstName: "Ana", phone: "4779999999", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
     await seedFiscalScore(deps.fiscalLeadScores, fiscalLead.id);
 
     // First message: plain text, no calculator mention -- still gets the fiscal context resolved
@@ -319,7 +319,7 @@ describe("Fase 6B -- WhatsApp inbound fiscal context bridge", () => {
 describe("Fase 6B.1 -- fiscal-contextual welcome uses real first-WhatsApp-inbound history, not lead.status", () => {
   it("1+2. a preexisting web lead with fiscal context whose status already moved away from NEW still gets the contextual welcome on its genuinely first WhatsApp inbound (wasNew === false)", async () => {
     const deps = makeDeps();
-    const fiscalLead = await deps.leadService.createLead({ phone: "4772121001", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
+    const fiscalLead = await deps.leadService.createLead({ firstName: "Ana", phone: "4772121001", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
     await seedFiscalScore(deps.fiscalLeadScores, fiscalLead.id);
     // Simulates a manual CRM "/contact" call (or any other non-WhatsApp touch) that happened
     // BEFORE this lead ever wrote in on WhatsApp -- moves status away from "NEW".
@@ -338,7 +338,7 @@ describe("Fase 6B.1 -- fiscal-contextual welcome uses real first-WhatsApp-inboun
 
   it("3. a second WhatsApp inbound from the same lead never repeats the contextual welcome", async () => {
     const deps = makeDeps();
-    const fiscalLead = await deps.leadService.createLead({ phone: "4772121002", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
+    const fiscalLead = await deps.leadService.createLead({ firstName: "Ana", phone: "4772121002", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
     await seedFiscalScore(deps.fiscalLeadScores, fiscalLead.id);
     await deps.leads.update(fiscalLead.id, { status: "CONTACTED" });
 

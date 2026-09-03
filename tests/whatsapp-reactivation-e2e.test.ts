@@ -143,7 +143,7 @@ describe("Pre-launch hardening -- reactivating a CANCELLED lead", () => {
     expect(finalLead?.status).toBe("BOOKING_PENDING"); // never RESCHEDULE_REQUESTED
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound.some((m) => m.body === CANCELLED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE)).toBe(true);
-    expect(outbound.some((m) => m.body?.includes("Responde con el número"))).toBe(true); // real availability offered
+    expect(outbound.some((m) => m.body?.includes("¿Cuál te funciona mejor?"))).toBe(true); // real availability offered
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     expect(offered.every((s) => s.rescheduleContextId === undefined)).toBe(true);
   });

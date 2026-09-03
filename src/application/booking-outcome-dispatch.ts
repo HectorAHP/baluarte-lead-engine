@@ -5,8 +5,9 @@ import { assertTransition } from "../domain/state-machine.js";
 import { sendAndPersistReply } from "./whatsapp-inbound-service.js";
 import type { SlotOfferOutcome } from "./slot-offering-service.js";
 import { recordLeadStatusTransition } from "./lead-status-audit.js";
+import { conversationalFirstName } from "../domain/conversation-name.js";
 import {
-  buildSlotOfferMessage, SLOT_UNAVAILABLE_INTRO, buildExistingBookingMessage, formatSlotForDisplay,
+  buildSlotOfferMessage, buildBookingStartIntro, SLOT_UNAVAILABLE_INTRO, buildExistingBookingMessage, formatSlotForDisplay,
   BOOKING_NO_AVAILABILITY_MESSAGE, QUALIFIER_HUMAN_HANDOFF_MESSAGE,
 } from "../domain/message-templates.js";
 
@@ -129,17 +130,21 @@ export async function dispatchSlotOfferOutcome(
   switch (outcome.type) {
     case "CREATED":
     case "REUSED": {
+      // Fase 6E: the FIRST offer of a round gets the warm, name-aware "Perfecto, revisemos la
+      // agenda" lead-in (buildBookingStartIntro); a slot that just became unavailable between
+      // offer and selection gets SLOT_UNAVAILABLE_INTRO instead -- never both, and never a
+      // second lead-in on a mid-round re-offer.
       const message =
         reason === "slot_unavailable"
           ? buildSlotOfferMessage(outcome.slots, advisorTimezone, SLOT_UNAVAILABLE_INTRO)
-          : buildSlotOfferMessage(outcome.slots, advisorTimezone);
+          : buildSlotOfferMessage(outcome.slots, advisorTimezone, buildBookingStartIntro(conversationalFirstName(lead)));
       await sendAndPersistReply(deps, lead.id, conversationId, whatsappUserId, message);
       return;
     }
     case "ALREADY_BOOKED": {
       await markLeadBooked(deps, lead, outcome.appointment);
       const when = formatSlotForDisplay(outcome.appointment.startsAt, advisorTimezone);
-      await sendAndPersistReply(deps, lead.id, conversationId, whatsappUserId, buildExistingBookingMessage(when, outcome.appointment.meetingUrl));
+      await sendAndPersistReply(deps, lead.id, conversationId, whatsappUserId, buildExistingBookingMessage(when, outcome.appointment.meetingUrl, conversationalFirstName(lead)));
       return;
     }
     case "NO_AVAILABILITY":

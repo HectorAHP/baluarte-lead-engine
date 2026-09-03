@@ -1,31 +1,41 @@
 import { zonedTimeParts } from "./timezone.js";
 import type { OfferedSlot } from "./offered-slot.js";
+import { liaIntroLine, LIA_IDENTITY_ANSWER } from "./lia-identity.js";
 
 /**
  * Deterministic, non-AI-generated copy for Phase 2 (transport + persistence only -- no
  * conversational qualifier yet). Every message here is sent with aiGenerated=false.
+ *
+ * Fase 6E: Lía introduces herself by name here (the lead's first relevant reply) -- never
+ * repeated on later turns. The menu below keeps its EXACT original digit order/wording
+ * (1=Ahorro, 2=Retiro/PPR, 3=GMM, 4=Otro) deliberately -- domain/intent-classifier.ts's
+ * classifyIntent() maps those exact digits to SAVINGS/RETIREMENT_PPR/GMM/OTHER for the Phase 3B
+ * qualification engine's next turn, so changing the menu's order or item count here would
+ * silently misclassify a lead's reply whenever QUALIFICATION_ENGINE_ENABLED is on.
  */
 export function buildWelcomeMessage(firstName?: string): string {
-  const greeting = firstName ? `Hola, ${firstName}.` : "Hola.";
-  return `${greeting} Gracias por contactar a Baluarte Capital. Soy el asistente de Baluarte y puedo ayudarte a preparar tu cita con Héctor.\n\n¿Buscas información sobre:\n\n1. Ahorro e inversión\n2. Retiro / PPR\n3. Gastos Médicos Mayores\n4. Otro tema?`;
+  return `${liaIntroLine(firstName)}\n\n¿Sobre qué te gustaría platicar?\n\n1. Ahorro e inversión\n2. Retiro / PPR\n3. Gastos Médicos Mayores\n4. Otro tema`;
 }
 
 /**
- * Fase 6B -- sent instead of buildWelcomeMessage ONLY when: this is the lead's first inbound
+ * Fase 6B/6E -- sent instead of buildWelcomeMessage ONLY when: this is the lead's first inbound
  * message, a FiscalLeadContext was recovered for this phone (see application/fiscal-lead-context.ts),
  * and the inbound text itself suggests fiscal-calculator origin (see
- * domain/fiscal-calculator-origin-detection.ts). Same menu structure as buildWelcomeMessage
- * (the qualification engine's intent classification on the NEXT turn expects it) -- only the
- * opening line changes. Acknowledges fiscal-calculator origin in general terms only -- never
- * mentions score, scoreClass, income/contribution bands, or any other internal classification.
+ * domain/fiscal-calculator-origin-detection.ts). Same menu as buildWelcomeMessage, same reasoning
+ * for keeping its digit order unchanged (see that function's doc comment) -- only the opening
+ * acknowledgment differs. Acknowledges fiscal-calculator origin in general, warm terms only --
+ * never mentions score, scoreClass, income/contribution bands, or any other internal
+ * classification.
  */
 export function buildFiscalContextWelcomeMessage(firstName?: string): string {
-  const greeting = firstName ? `Hola, ${firstName}.` : "Hola.";
-  return `${greeting} Claro, ya tengo identificado que vienes de la estimación fiscal de Baluarte Capital. Podemos revisar tu escenario y ver qué alternativas podrían tener sentido para ti.\n\n¿Buscas información sobre:\n\n1. Ahorro e inversión\n2. Retiro / PPR\n3. Gastos Médicos Mayores\n4. Otro tema?`;
+  return `${liaIntroLine(firstName)}\n\nVi que acabas de hacer tu estimación fiscal. Podemos revisar tu resultado y ver qué alternativas podrían tener sentido para ti.\n\n¿Sobre qué te gustaría platicar primero?\n\n1. Ahorro e inversión\n2. Retiro / PPR\n3. Gastos Médicos Mayores\n4. Otro tema`;
 }
 
+// Fase 6E, item 17: neither handoff message names a specific advisor (Lía never implies she IS
+// that person) and neither promises a response time -- no SLA exists. Both deliberately avoid
+// "bot"/"sistema"/"automático" and any other system-facing wording.
 export const HEALTH_HANDOFF_MESSAGE =
-  "Gracias por compartirlo. Para cuidar tu información, este caso debe revisarlo personalmente Héctor. Te ayudaremos a continuar con él.";
+  "Gracias por compartirlo. Quiero asegurarme de que recibas la orientación adecuada, así que voy a dejar esto preparado para que un asesor de Baluarte Capital pueda continuar contigo directamente.";
 
 export const OPT_OUT_CONFIRMATION_MESSAGE = "Entendido. No te enviaremos más mensajes.";
 
@@ -33,7 +43,7 @@ export const OPT_OUT_CONFIRMATION_MESSAGE = "Entendido. No te enviaremos más me
 // complaint/claim, explicit request for a human, fiscal-advice request, aggressive tone,
 // out-of-scope exception). Deliberately does not promise a response time: no SLA exists yet.
 export const QUALIFIER_HUMAN_HANDOFF_MESSAGE =
-  "Para ayudarte correctamente, prefiero que este punto lo revise directamente un asesor de Baluarte Capital. Ya dejé registrada tu solicitud para seguimiento.";
+  "Quiero asegurarme de que recibas la orientación adecuada. Voy a dejar esto preparado para que un asesor de Baluarte Capital pueda continuar contigo.";
 
 // Phase 3B -- sent when qualification completes. Deliberately does not offer time slots (that's
 // Phase 3C); A/B and C get different copy since only A/B are headed toward a meeting.
@@ -89,18 +99,28 @@ function formatSlotList(slots: OfferedSlot[], timezone: string): string {
     .join("\n");
 }
 
+/** Fase 6E, item 13: the warm lead-in for the FIRST slot offer of a booking round -- "Perfecto,
+ * [nombre]. Revisemos la agenda." Never says "agenda automática"/"sistema"/"booking" -- just
+ * moves the conversation into looking at real availability. */
+export function buildBookingStartIntro(firstName?: string): string {
+  const opener = firstName ? `Perfecto, ${firstName}. Revisemos la agenda.` : "Perfecto, revisemos la agenda.";
+  return `${opener}\n\nTengo estos horarios disponibles:`;
+}
+
 /** A. Slot offer -- also reused (with a different `intro`) for the "your slot just got taken,
- * here are new options" message (C) so the list-formatting logic is never duplicated. */
+ * here are new options" message (C) so the list-formatting logic is never duplicated. Default
+ * intro covers callers outside the qualified-lead booking flow (e.g. BOOKING_PENDING re-offers)
+ * that don't have a firstName-aware intro of their own. */
 export function buildSlotOfferMessage(
   slots: OfferedSlot[],
   timezone: string,
-  intro = "Tengo estas opciones disponibles para tu cita con Héctor:",
+  intro = "Tengo estos horarios disponibles:",
 ): string {
-  return `${intro}\n\n${formatSlotList(slots, timezone)}\n\nResponde con el número de la opción que prefieras.`;
+  return `${intro}\n\n${formatSlotList(slots, timezone)}\n\n¿Cuál te funciona mejor?`;
 }
 
 /** C. Sent after SlotUnavailableError triggers a replaceOffer() that produced a new round. */
-export const SLOT_UNAVAILABLE_INTRO = "Ese horario acaba de ocuparse. Te muestro otras opciones:";
+export const SLOT_UNAVAILABLE_INTRO = "Ese horario acaba de dejar de estar disponible. No pasa nada, aquí tienes otras opciones:";
 
 /** B. Invalid selection -- resends the SAME active slots (never a new round), with the exact
  * currently-valid position numbers spelled out (never hardcoded "1, 2 o 3": a round can have
@@ -109,22 +129,26 @@ export function buildInvalidSelectionMessage(slots: OfferedSlot[], timezone: str
   return `Por favor responde ${positionList(slots)} para elegir uno de estos horarios:\n\n${formatSlotList(slots, timezone)}`;
 }
 
-/** D. Booking confirmed. No meetingUrl is ever invented -- when the provider didn't return one,
- * a safe alternative message is used instead (see below). */
-export function buildBookingConfirmedMessage(when: string, meetingUrl?: string): string {
-  if (meetingUrl) {
-    return `Listo, tu cita quedó agendada con Héctor para el ${when}. Aquí está el enlace de la videollamada: ${meetingUrl}`;
-  }
-  return `Listo, tu cita quedó agendada con Héctor para el ${when}. Te compartiremos el enlace de la videollamada antes de la cita.`;
+/** D. Booking confirmed. No meetingUrl is ever invented -- when the provider didn't return one, a
+ * safe alternative message is used instead (see below). Fase 6E: uses the lead's first name when
+ * available (item 2 -- booking confirmation is one of the moments a name belongs), and invites a
+ * follow-up question instead of ending flatly. */
+export function buildBookingConfirmedMessage(when: string, meetingUrl?: string, firstName?: string): string {
+  const greeting = firstName ? `Listo, ${firstName}.` : "Listo.";
+  const linkLine = meetingUrl
+    ? `Aquí está el enlace de la videollamada: ${meetingUrl}`
+    : "Te compartiremos el enlace de la videollamada antes de la cita.";
+  return `${greeting} Tu asesoría con Héctor quedó agendada para el ${when}.\n\n${linkLine}\n\nTe esperamos. Si antes de la cita quieres preguntarme algo sobre retiro, ahorro o protección, puedes escribirme por aquí.`;
 }
 
 /** Idempotent-success / appointment-guard confirmation -- the lead already has a BOOKED
  * appointment (from this turn or an earlier one); same "no invented URL" rule as D. */
-export function buildExistingBookingMessage(when: string, meetingUrl?: string): string {
-  if (meetingUrl) {
-    return `Ya tienes una cita agendada con Héctor para el ${when}. Aquí está el enlace de la videollamada: ${meetingUrl}`;
-  }
-  return `Ya tienes una cita agendada con Héctor para el ${when}. Te compartiremos el enlace de la videollamada antes de la cita.`;
+export function buildExistingBookingMessage(when: string, meetingUrl?: string, firstName?: string): string {
+  const greeting = firstName ? `${firstName}, ya` : "Ya";
+  const linkLine = meetingUrl
+    ? `Aquí está el enlace de la videollamada: ${meetingUrl}`
+    : "Te compartiremos el enlace de la videollamada antes de la cita.";
+  return `${greeting} tienes una asesoría agendada con Héctor para el ${when}.\n\n${linkLine}`;
 }
 
 /** E. AppointmentService.book() found a genuinely in-progress (not-yet-stale) booking attempt
@@ -132,13 +156,14 @@ export function buildExistingBookingMessage(when: string, meetingUrl?: string): 
 export const BOOKING_IN_PROGRESS_MESSAGE = "Estoy confirmando ese horario. Dame un momento e inténtalo nuevamente.";
 
 /** F. Recoverable technical/infra failure (Calendar or otherwise) -- no state change, no new
- * round; the lead stays BOOKING_PENDING and can simply try again. */
+ * round; the lead stays BOOKING_PENDING and can simply try again. Fase 6E, item 16: never
+ * mentions Google/API/provider -- just that the agenda couldn't be checked right now. */
 export const BOOKING_TECHNICAL_ERROR_MESSAGE =
-  "Tuve un problema técnico al consultar o confirmar el horario. Puedes intentarlo nuevamente en un momento.";
+  "En este momento no pude consultar la agenda. Si quieres, podemos intentarlo nuevamente en un momento.";
 
 /** G. SlotOfferingService returned NO_AVAILABILITY -- no round was created, nothing to select. */
 export const BOOKING_NO_AVAILABILITY_MESSAGE =
-  "Por ahora no tengo horarios disponibles para ofrecerte. En cuanto haya opciones te aviso, o si lo prefieres, un asesor puede contactarte directamente.";
+  "Por ahora no tengo horarios disponibles para ofrecerte. En cuanto haya opciones te aviso, o si prefieres, un asesor de Baluarte Capital puede contactarte directamente.";
 
 /**
  * H. Shared by buildBookingPendingFallbackMessage/buildReschedulePendingFallbackMessage below --
@@ -320,54 +345,75 @@ export const PAST_BOOKED_CANCELLATION_MESSAGE =
 // WhatsAppBookingHandler itself did not act on the turn.
 // ---------------------------------------------------------------------------------------------
 export const QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE =
-  'Claro. Ya tengo parte de tu información registrada. ¿Qué te gustaría hacer ahora?\n\n1. Resolver una duda\n2. Conocer opciones\n3. Agendar una asesoría\n\nPuedes responder con el número o escribirme tu pregunta.';
+  "¿Qué te gustaría revisar?\n\n1. Resolver una duda\n2. Conocer opciones\n3. Agendar una asesoría";
 
 // ---------------------------------------------------------------------------------------------
-// Fase 6C -- qualified-lead conversation router. QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE above is
-// this menu's MAIN screen; everything below is what each of its 3 options (or the equivalent
-// free-text phrasing -- see domain/qualified-lead-intent-detection.ts) actually leads to, so a
-// reply of "1"/"2"/"3" (or "¿Cómo funciona el PPR?", "quiero agendar una cita", etc.) produces a
-// genuinely different, useful outcome instead of re-showing this same menu. No guaranteed
-// returns/benefits/tax outcomes are ever stated -- every topic explanation is deliberately
-// hedged ("dependiendo de", "sujeto a", "sin garantía"). No score/tier/HOT-WARM-NURTURE/A-B-C
-// wording anywhere in this section.
+// Fase 6C/6E -- qualified-lead conversation router. QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE above
+// is this menu's MAIN screen -- shown only when there's no clear intent yet, never repeated after
+// every turn (see item 6/10 of the Fase 6E spec). Everything below is what each of its 3 options
+// (or the equivalent free-text phrasing -- see domain/qualified-lead-intent-detection.ts)
+// actually leads to, ending in a CONTEXTUAL follow-up question rather than re-showing this menu,
+// so the conversation reads as a dialogue, not a form. No guaranteed returns/benefits/tax
+// outcomes are ever stated -- every topic explanation is deliberately hedged ("dependiendo de",
+// "sujeto a", "sin garantía"). No score/tier/HOT-WARM-NURTURE/A-B-C wording anywhere in this
+// section, and no system-facing words ("bot", "sistema", "canal", "booking", "lead",
+// "calificado", "provider", "handler").
 // ---------------------------------------------------------------------------------------------
 
 /** Option "1" (MENU_QUESTION): a bare digit carries no question content yet -- ask for one.
- * Deliberately does NOT introduce a new tracked "awaiting question" state (see
- * qualified-lead-menu-state.ts's doc comment): the lead's actual next message is checked by the
- * same topic-keyword detection as any other turn, so a real question in reply to this prompt is
- * answered directly, and anything else safely falls back to the main menu again -- no dead end. */
-export const QUALIFIED_LEAD_ASK_QUESTION_MESSAGE = "Claro. Escríbeme tu duda y la revisamos.";
+ * `hasFiscalContext` narrows the prompt to retirement when we already know that's the relevant
+ * topic (never mentions score/HOT/bands -- just uses the topic itself). Deliberately does NOT
+ * introduce a new tracked "awaiting question" state (see qualified-lead-menu-state.ts's doc
+ * comment): the lead's actual next message is checked by the same topic-keyword detection as any
+ * other turn, so a real question in reply to this prompt is answered directly, and anything else
+ * safely falls back to the main menu again -- no dead end. */
+export function buildQualifiedLeadAskQuestionMessage(hasFiscalContext: boolean): string {
+  return hasFiscalContext
+    ? "Claro. ¿Qué te gustaría saber sobre tu estrategia de retiro?"
+    : "Claro. Cuéntame qué te gustaría saber y lo revisamos.";
+}
 
 const QUALIFIED_LEAD_TOPIC_EXPLANATIONS: Record<"PPR" | "GMM" | "SAVINGS", string> = {
-  PPR: "Un PPR es una estrategia de ahorro de largo plazo orientada al retiro. Dependiendo de su estructura y de tu situación fiscal, las aportaciones pueden tener beneficios fiscales sujetos a los requisitos aplicables. La estrategia adecuada depende de tu horizonte, capacidad de aportación y régimen fiscal.",
-  GMM: "Un Seguro de Gastos Médicos Mayores (GMM) cubre gastos derivados de enfermedades o accidentes que requieren atención hospitalaria, sujeto a las condiciones, sumas aseguradas y exclusiones de la póliza contratada. La cobertura adecuada depende de tu edad, tu estado de salud y tu presupuesto.",
-  SAVINGS: "Un plan de ahorro o inversión de largo plazo busca hacer crecer tu patrimonio de forma disciplinada, sin garantía de rendimiento. El instrumento adecuado depende de tu horizonte de tiempo, tu tolerancia al riesgo y tus objetivos financieros.",
+  PPR: "Un PPR es una estrategia de ahorro de largo plazo enfocada en construir patrimonio para tu retiro. Dependiendo de su estructura y de tu situación fiscal, algunas aportaciones pueden tener beneficios fiscales sujetos a los requisitos aplicables.\n\nLo importante es revisar cuánto puedes aportar, tu horizonte y qué nivel de flexibilidad necesitas.",
+  GMM: "Un Seguro de Gastos Médicos Mayores ayuda a proteger tu patrimonio frente a gastos importantes derivados de una enfermedad o accidente.\n\nLa cobertura depende, entre otros factores, de suma asegurada, deducible, coaseguro, red hospitalaria y condiciones de la póliza.",
+  SAVINGS: "Podemos revisar estrategias de ahorro según lo que quieras lograr: construir patrimonio, preparar tu retiro, cubrir una meta futura o tener mayor protección financiera.",
+};
+
+/** The contextual follow-up question each topic ends on -- see item 6 of the Fase 6E spec. Never
+ * the generic main menu: this is what makes a topic answer feel like a real reply instead of a
+ * detour back to a form. */
+const QUALIFIED_LEAD_TOPIC_FOLLOWUPS: Record<"PPR" | "GMM" | "SAVINGS", string> = {
+  PPR: "¿Quieres que te explique primero cómo funciona el beneficio fiscal o cómo se construye el ahorro para el retiro?",
+  GMM: "¿Quieres que revisemos primero cómo funcionan deducible y coaseguro, o qué conviene comparar entre distintas opciones?",
+  SAVINGS: "¿Tienes alguna meta específica en mente?",
 };
 
 /** Answers a recognized topic (PPR/GMM/SAVINGS) with safe, hedged, non-personalized copy, then
- * re-offers the same main menu (QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE) as a natural "anything
- * else?" continuation -- reuses the existing menu copy verbatim rather than duplicating it, and
- * marks this reply as ending with the main menu (see qualified-lead-menu-state.ts) so a following
- * bare "1"/"2"/"3" is still interpretable. */
+ * ends on a contextual question about THAT topic -- never re-offers the main menu (Fase 6E, item
+ * 6: "no regresar automáticamente al menú principal salvo que realmente sea necesario"). */
 export function buildQualifiedLeadTopicAnswer(topic: "PPR" | "GMM" | "SAVINGS"): string {
-  return `${QUALIFIED_LEAD_TOPIC_EXPLANATIONS[topic]}\n\n${QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE}`;
+  return `${QUALIFIED_LEAD_TOPIC_EXPLANATIONS[topic]}\n\n${QUALIFIED_LEAD_TOPIC_FOLLOWUPS[topic]}`;
 }
 
 /** Option "2" (EXPLORE_OPTIONS): a short, non-committal list of alternatives -- no product/company
  * names, no HOT/WARM/NURTURE, no scores or bands. `prioritizeRetirement` lets the caller put
  * PPR/retiro first when a fiscal context is available (see whatsapp-inbound-service.ts) -- the
- * ONLY way fiscal context is allowed to influence this reply in this phase. */
+ * ONLY way fiscal context is allowed to influence this reply in this phase. Ends on a question,
+ * not a flat list. */
 export function buildQualifiedLeadOptionsMessage(prioritizeRetirement: boolean): string {
   const items = prioritizeRetirement
     ? ["Retiro con beneficios fiscales", "Ahorro de largo plazo", "Protección patrimonial"]
     : ["Ahorro de largo plazo", "Retiro con beneficios fiscales", "Protección patrimonial"];
-  return `Por tu consulta podemos revisar alternativas enfocadas en:\n\n${items.map((item, i) => `${i + 1}. ${item}`).join("\n")}`;
+  return `Podemos revisar alternativas enfocadas en:\n\n${items.map((item, i) => `${i + 1}. ${item}`).join("\n")}\n\n¿Cuál te interesa revisar primero?`;
 }
 
-/** Option "3" (BOOKING): WHATSAPP_BOOKING_ENABLED stays false -- never invents availability,
- * never creates an appointment/calendar event. Purely an acknowledgment that keeps the
- * conversation moving without implying an automated booking flow exists on this channel yet. */
+/** Option "3" (BOOKING) when WHATSAPP_BOOKING_ENABLED is false or bookingHandler otherwise didn't
+ * act: never invents availability, never creates an appointment/calendar event, and never says
+ * "agenda automática"/"este canal"/"habilitado" -- just that scheduling isn't self-serve here yet,
+ * framed as Lía still helping move it forward. */
 export const QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE =
-  "Con gusto. La agenda automática todavía no está habilitada en este canal, pero puedo ayudarte a continuar con el proceso para coordinar tu asesoría.";
+  "Con gusto. Todavía no puedo agendar directamente por aquí, pero puedo ayudarte a coordinar tu asesoría con el equipo.";
+
+/** Fase 6E, item 3/4: transparent answer to "¿quién eres?" / "¿eres un bot?" / "¿con quién
+ * hablo?" -- see domain/lia-identity.ts for why this never claims to be human. */
+export const QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE = LIA_IDENTITY_ANSWER;

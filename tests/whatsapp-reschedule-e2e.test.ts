@@ -295,6 +295,6 @@ describe("Phase 4C post-mortem -- item 13: the missing E2E (real booking, then r
     // the original booking round's leftover options.
     const messages = await repos.messagesRepo.listByConversationId(conversation!.id);
     const lastOutbound = messages.filter((m) => m.direction === "OUTBOUND").slice(-1)[0];
-    expect(lastOutbound.body).toContain("Responde con el número");
+    expect(lastOutbound.body).toContain("¿Cuál te funciona mejor?");
   });
 });
