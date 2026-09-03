@@ -321,10 +321,20 @@ export const CANCELLED_ALREADY_MESSAGE = "Tu cita anterior ya está cancelada.";
 // WhatsAppPastBookedRecoveryHandler.
 // ---------------------------------------------------------------------------------------------
 
-/** A. Generic inbound (no clear intent) -- explains the appointment already passed, offers a new
- * one, without starting anything or implying the old one was ever cancelled. */
+/**
+ * A. Generic inbound (no clear intent) -- explains the appointment already passed, offers a new
+ * one, without starting anything or implying the old one was ever cancelled.
+ *
+ * Fase 6E.2: no longer instructs the lead to type the exact word "agendar" -- WhatsAppPastBooked
+ * RecoveryHandler now recognizes a real question/"opciones"/booking phrasing directly (see that
+ * class's doc comment), so there is no longer a single "magic phrase" this copy needs to teach.
+ * The OLD copy ("...escribe \"agendar\"") was also the direct cause of the reported production
+ * loop: isNewBookingRequest didn't recognize a bare "agendar" reply, so the lead following this
+ * exact instruction got shown this same message again -- see new-booking-intent-detection.ts's
+ * doc comment for the fix.
+ */
 export const PAST_BOOKED_GENERIC_INBOUND_MESSAGE =
-  "¡Hola! Veo que la fecha de tu cita anterior ya pasó. Si quieres agendar una nueva, escribe \"agendar\". Si prefieres hacer una pregunta primero, escríbela aquí y con gusto te ayudamos.";
+  "Veo que tu cita anterior ya pasó. Si quieres, podemos revisar otra fecha o continuar por aquí con cualquier duda.";
 
 /** B. "Quiero reagendar" for a past appointment -- there is nothing left to move (the original
  * time already elapsed), so this is reframed as a new-booking intent, same reasoning as

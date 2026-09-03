@@ -37,7 +37,10 @@ function normalize(text: string): string {
 const PPR_KEYWORDS = ["ppr", "retiro", "jubil", "pension"];
 const GMM_KEYWORDS = ["gmm", "gastos medicos", "seguro medico", "seguro de gastos", "hospitalizacion"];
 const SAVINGS_KEYWORDS = ["ahorro", "ahorrar", "invertir", "inversion"];
-const EXPLORE_OPTIONS_KEYWORDS = ["conocer opciones", "conocer las opciones", "ver opciones", "que opciones", "conocer alternativas"];
+// Fase 6E.2: bare "opciones" added -- WhatsAppPastBookedRecoveryHandler's own spec explicitly
+// lists it as a trigger, and a lead typing just "opciones" (no "conocer"/"ver" prefix) is common
+// enough that requiring a longer phrase was an unnecessary miss, here and in the qualified router.
+const EXPLORE_OPTIONS_KEYWORDS = ["conocer opciones", "conocer las opciones", "ver opciones", "que opciones", "conocer alternativas", "opciones"];
 const BOOKING_KEYWORDS = ["agendar", "agenda", "cita", "asesoria"];
 // Fase 6E -- checked BEFORE every other keyword list: a meta-question about Lía herself must
 // never be misread as a topic/booking question, however unlikely the overlap. `normalize()`

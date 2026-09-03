@@ -93,7 +93,12 @@ export interface ReactivationTurnHandler {
  * above. WhatsAppPastBookedRecoveryHandler implements this.
  */
 export interface PastBookedRecoveryTurnHandler {
-  handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
+  handleTurn(params: {
+    lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date;
+    /** Fase 6E.2: mirrors `!!fiscalContext` for this turn -- see
+     * WhatsAppPastBookedRecoveryHandler's doc comment. Optional for backward compatibility. */
+    hasFiscalContext?: boolean;
+  }): Promise<void>;
 }
 
 export interface InboundWhatsAppText {
@@ -552,7 +557,11 @@ export async function handleInboundWhatsAppText(
         );
         if (!hasUpcomingAppointment) {
           logBranch("booked-past-appointment-recovery", true);
-          await deps.pastBookedRecoveryHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
+          // Fase 6E.2: hasFiscalContext mirrors the qualified router's own `!!fiscalContext` --
+          // fiscalContext is already resolved above for this same lead/turn, so this is the exact
+          // same signal, never re-derived differently. Only affects the ORDER of an "opciones"
+          // reply, never its content -- see WhatsAppPastBookedRecoveryHandler's doc comment.
+          await deps.pastBookedRecoveryHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date(), hasFiscalContext: !!fiscalContext });
           return;
         }
       }

@@ -2,13 +2,17 @@ import type { Lead } from "../domain/lead.js";
 import { isCancellationRequest } from "../domain/cancellation-intent-detection.js";
 import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
+import { detectQualifiedLeadIntent } from "../domain/qualified-lead-intent-detection.js";
+import { qualifiedOptionsMenuMetadata } from "../domain/qualified-lead-menu-state.js";
+import { pastBookedReactivationMetadata } from "../domain/past-booked-reactivation-state.js";
 import { sendAndPersistReply } from "./whatsapp-inbound-service.js";
 import { escalateToHuman, dispatchSlotOfferOutcome, type BookingOutcomeDeps } from "./booking-outcome-dispatch.js";
 import type { SlotOfferingService } from "./slot-offering-service.js";
 import { ActiveOfferInconsistentError, SlotOfferClaimInProgressError } from "../domain/errors.js";
 import {
   PAST_BOOKED_GENERIC_INBOUND_MESSAGE, PAST_BOOKED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE, PAST_BOOKED_CANCELLATION_MESSAGE,
-  RESCHEDULE_IN_PROGRESS_MESSAGE, RESCHEDULE_TECHNICAL_ERROR_MESSAGE,
+  RESCHEDULE_IN_PROGRESS_MESSAGE, RESCHEDULE_TECHNICAL_ERROR_MESSAGE, buildQualifiedLeadTopicAnswer, buildQualifiedLeadOptionsMessage,
+  QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE,
 } from "../domain/message-templates.js";
 import { config } from "../config.js";
 
@@ -17,7 +21,14 @@ export interface WhatsAppPastBookedRecoveryHandlerDeps extends BookingOutcomeDep
 }
 
 export interface PastBookedRecoveryTurnHandler {
-  handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
+  handleTurn(params: {
+    lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date;
+    /** Fase 6E.2: mirrors the qualified-lead router's own `!!fiscalContext` -- the ONLY thing
+     * allowed to influence the ORDER of the "opciones" reply (see buildQualifiedLeadOptionsMessage's
+     * doc comment). Never score/band/HOT-WARM-NURTURE. Optional/defaults to false so this stays
+     * backward-compatible with any caller that predates this field. */
+    hasFiscalContext?: boolean;
+  }): Promise<void>;
 }
 
 /**
@@ -58,8 +69,8 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
     private readonly advisorTimezone: string = config.ADVISOR_TIMEZONE,
   ) {}
 
-  async handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void> {
-    const { lead, conversationId, whatsappUserId, inboundText, now } = params;
+  async handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date; hasFiscalContext?: boolean }): Promise<void> {
+    const { lead, conversationId, whatsappUserId, inboundText, now, hasFiscalContext = false } = params;
 
     // Guard: this handler only ever acts on a BOOKED lead. The caller (whatsapp-inbound-service.ts)
     // already confirmed the appointment is not upcoming before dispatching here, but this guard
@@ -76,7 +87,9 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
 
       // "Quiero reagendar" -- there is nothing left to move (the old time already passed), so
       // this is explicitly reframed as a new-booking intent, with an acknowledgment sent before
-      // the slot offer so the lead understands why.
+      // the slot offer so the lead understands why. Checked BEFORE isNewBookingRequest so
+      // "reagendar" is never swallowed by the broader booking-keyword check below (both handle
+      // booking-adjacent text, but only this branch sends the acknowledgment first).
       if (isRescheduleRequest(inboundText)) {
         await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, PAST_BOOKED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE);
         await this.startNewBooking(lead, conversationId, whatsappUserId, now);
@@ -84,14 +97,53 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
       }
 
       // Explicit new-booking intent -- start the booking round directly, no extra acknowledgment
-      // needed (the intent is already unambiguous).
+      // needed (the intent is already unambiguous). Fase 6E.2: isNewBookingRequest now recognizes
+      // a bare "agendar" (see that module's doc comment) -- this is THE fix for the reported
+      // production loop, where the lead was told to type exactly this word and it was never
+      // recognized.
       if (isNewBookingRequest(inboundText)) {
         await this.startNewBooking(lead, conversationId, whatsappUserId, now);
         return;
       }
 
+      // Fase 6E.2: reuses the qualified-lead router's own deterministic keyword detection (never
+      // AI) so a past-booked lead's real question ("¿Cómo funciona el PPR?"), "conocer opciones",
+      // an equivalent booking phrasing this router's own keyword set catches, or "¿quién eres?"
+      // gets a real, useful answer -- never PAST_BOOKED_GENERIC_INBOUND_MESSAGE again. A past
+      // appointment is CONTEXT, not a routing dead end (see the Fase 6E.2 report, item 2/5). No
+      // pending-menu digit resolution is attempted here (second argument `null`): this flow never
+      // shows a numbered 1/2/3 menu, so a bare digit has no menu to resolve against and correctly
+      // falls through to UNKNOWN below (never guessed at -- item 7's "no interpretar dígitos fuera
+      // de un menú que realmente haya sido mostrado").
+      const intent = detectQualifiedLeadIntent(inboundText, null);
+      switch (intent.kind) {
+        case "QUESTION":
+          await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildQualifiedLeadTopicAnswer(intent.topic));
+          return;
+        case "EXPLORE_OPTIONS":
+          await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildQualifiedLeadOptionsMessage(hasFiscalContext), qualifiedOptionsMenuMetadata());
+          return;
+        case "BOOKING":
+          // Reached only for booking-adjacent phrasing this router's own keyword set (BOOKING_
+          // KEYWORDS) catches but isNewBookingRequest's phrase list above didn't -- same action,
+          // no separate acknowledgment (the intent is already unambiguous, same reasoning as the
+          // isNewBookingRequest branch above).
+          await this.startNewBooking(lead, conversationId, whatsappUserId, now);
+          return;
+        case "IDENTITY":
+          await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE);
+          return;
+        case "MENU_QUESTION":
+        case "UNKNOWN":
+          break; // falls through to the generic fallback below -- genuinely unrecognized text
+      }
+
       // Generic inbound, no clear intent -- informative fallback only, no state change, no offer.
-      await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, PAST_BOOKED_GENERIC_INBOUND_MESSAGE);
+      // Fase 6E.2: now marked with pastBookedReactivationMetadata() for message-history
+      // consistency with the established expectedIntent convention (see that module's doc
+      // comment) -- not currently consumed by any resolver, since every recognizable intent above
+      // already routes correctly on its own, every single turn.
+      await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, PAST_BOOKED_GENERIC_INBOUND_MESSAGE, pastBookedReactivationMetadata());
     } catch (err) {
       await this.handleError(err, lead, conversationId, whatsappUserId);
     }
