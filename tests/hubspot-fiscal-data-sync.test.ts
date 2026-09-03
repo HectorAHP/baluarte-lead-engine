@@ -5,7 +5,7 @@ import { RealHubSpotCRMProvider } from "../src/infrastructure/hubspot-crm-provid
 import { InMemoryFiscalLeadScoreRepository, InMemoryAppointmentRepository } from "../src/infrastructure/memory-repositories.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
 import { HubSpotFiscalSyncService } from "../src/application/hubspot-fiscal-sync-service.js";
-import { PPR_CALCULATOR_DEFAULT_VERSION } from "../src/domain/hubspot-fiscal-properties.js";
+import { CALCULATION_VERSION_UNKNOWN } from "../src/domain/hubspot-fiscal-properties.js";
 import { LIA_IDENTITY } from "../src/domain/lia-identity.js";
 
 /**
@@ -192,11 +192,11 @@ describe("Fase 6F -- HubSpot fiscal data sync", () => {
     expect(hubspotCrm.contacts[0].properties.bc_fiscal_submission_id).toBe(key);
   });
 
-  it("17. calculationVersion is mapped -- falls back to PPR_CALCULATOR_DEFAULT_VERSION when the caller doesn't send one, passes through when it does", async () => {
+  it("17. calculationVersion is mapped -- falls back to the honest CALCULATION_VERSION_UNKNOWN placeholder when the caller doesn't send one, passes through when it does", async () => {
     const hubspotCrm = new FakeHubSpotCRMProvider();
     const app = await buildTestApp({ hubspotCrm });
     await app.inject({ method: "POST", url: "/api/leads", payload: payload("4771000017", "sync17a@example.com") });
-    expect(hubspotCrm.contacts[0].properties.bc_fiscal_calculation_version).toBe(PPR_CALCULATOR_DEFAULT_VERSION);
+    expect(hubspotCrm.contacts[0].properties.bc_fiscal_calculation_version).toBe(CALCULATION_VERSION_UNKNOWN);
 
     await app.inject({
       method: "POST", url: "/api/leads",
@@ -279,6 +279,7 @@ describe("Fase 6F -- HubSpot fiscal data sync", () => {
         fiscalScore: { score: 50, scoreClass: "WARM", version: "fiscal_v1" },
         consentContact: true,
         privacyAcceptedAt: new Date(),
+        calculatedAt: new Date(),
       });
       const serialized = JSON.stringify(logger.warnings);
       expect(serialized).not.toContain(fakeToken);
@@ -396,6 +397,7 @@ describe("Fase 6F -- HubSpotFiscalSyncService not-configured no-op", () => {
         fiscalScore: { score: 10, scoreClass: "NURTURE", version: "fiscal_v1" },
         consentContact: false,
         privacyAcceptedAt: new Date(),
+        calculatedAt: new Date(),
       }),
     ).resolves.toBeUndefined();
     expect(logger.warnings).toHaveLength(0);

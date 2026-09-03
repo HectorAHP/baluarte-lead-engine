@@ -77,6 +77,16 @@ export interface WebLeadCaptureInput {
    * re-derived, so HubSpot's bc_fiscal_utm_* properties always match exactly what was captured
    * for this submission. */
   attribution?: HubSpotFiscalAttributionInput;
+  /**
+   * Fase 6F.1: the AUTHORITATIVE moment this submission was captured by Lead Engine -- the SAME
+   * `submittedAt` app.ts's POST /api/leads handler already generates once per request and reuses
+   * for `privacyAcceptedAt`/the leads.notes fiscal block. Modeled as its own field (not aliased to
+   * privacyAcceptedAt) because the two represent different concepts even though they share the
+   * same value today -- see the Fase 6F.1 report, item 2. Used ONLY for HubSpot's
+   * bc_fiscal_calculated_at; falls back to `new Date()` if a future caller omits it (defensive,
+   * since app.ts always supplies it for calculator submissions today).
+   */
+  submittedAt?: Date;
 }
 
 export interface WebLeadCaptureResult {
@@ -181,6 +191,9 @@ export class WebLeadCaptureService {
             attribution: input.attribution,
             consentContact: input.consentContact,
             privacyAcceptedAt: input.privacyAcceptedAt,
+            // Fase 6F.1: the authoritative submission-capture timestamp, never the sync moment --
+            // see WebLeadCaptureInput.submittedAt's doc comment.
+            calculatedAt: input.submittedAt ?? new Date(),
           });
         }
       }

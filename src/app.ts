@@ -592,6 +592,9 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
           note: noteParts.length > 0 ? noteParts.join("\n\n") : undefined,
           consentContact: body.consentContact ?? false,
           privacyAcceptedAt: submittedAt,
+          // Fase 6F.1: authoritative submission-capture moment, reused for HubSpot's
+          // bc_fiscal_calculated_at -- see WebLeadCaptureInput.submittedAt's doc comment.
+          submittedAt,
           // Fase 6A: only meaningful when source === "WEB_FISCAL_CALCULATOR" (enforced inside
           // WebLeadCaptureService, not here) -- passed through structurally, never parsed back out
           // of noteParts/notes.

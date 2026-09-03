@@ -3,7 +3,7 @@ import type { Lead } from "../domain/lead.js";
 import { HubSpotProviderError } from "../domain/errors.js";
 import {
   buildHubSpotFiscalProperties,
-  PPR_CALCULATOR_DEFAULT_VERSION,
+  CALCULATION_VERSION_UNKNOWN,
   type HubSpotFiscalAttributionInput,
   type HubSpotFiscalPropertiesInput,
   type HubSpotFiscalScoreInput,
@@ -18,6 +18,13 @@ export interface SyncFiscalCalculatorLeadInput {
   attribution?: HubSpotFiscalAttributionInput;
   consentContact: boolean;
   privacyAcceptedAt: Date;
+  /**
+   * Fase 6F.1: the AUTHORITATIVE submission-capture timestamp (app.ts's `submittedAt`) -- REQUIRED,
+   * never generated here. See HubSpotFiscalPropertiesInput.calculatedAt's doc comment; `syncedAt`
+   * (the actual sync-attempt moment) is generated fresh inside this method, below, and is always a
+   * later-or-equal instant than this one.
+   */
+  calculatedAt: Date;
 }
 
 /**
@@ -25,6 +32,23 @@ export interface SyncFiscalCalculatorLeadInput {
  * upsert. Lives in the application layer, deliberately NOT inside web-lead-capture.ts's domain
  * concerns or inside any domain/ file -- see this task's "NO acoplar lógica HubSpot al dominio"
  * instruction. Depends only on the HubSpotCRMProvider port, never a concrete adapter.
+ *
+ * DUAL WRITE (Fase 6F.1, item 4/9): this backend path (B) is NOT yet the only thing writing to
+ * HubSpot. impuestos.html's `enviarHubSpot()` (baluarte-capital/impuestos.html, ~line 907, called
+ * from the `btn-p2-calc` click handler ~line 1132, inside `Promise.allSettled([enviarHubSpot(...),
+ * submitToLeadEngine(...)])`) STILL posts directly from the browser to the HubSpot Forms API (A),
+ * independently of this class, with no code dependency between the two. Both converge on the SAME
+ * HubSpot contact (matched by email at HubSpot's own platform level for A, and by this class's own
+ * email/phone search for B) -- so there is no duplicate-CONTACT risk today, only redundant/
+ * overlapping property writes (A writes firstname/lastname/email/phone + a free-text `message`
+ * note; B writes those same 4 native fields plus every bc_fiscal_* property). This is intentionally
+ * left in place until backend sync (B) has a real QA run against live HubSpot -- see the Fase 6F.1
+ * report, item 8/9. ONCE THAT QA PASSES, retiring A means: deleting the `enviarHubSpot` function
+ * (impuestos.html ~line 907-967) AND its call site inside the `Promise.allSettled([...])` array in
+ * the `btn-p2-calc` click handler (~line 1131-1137), leaving `submitToLeadEngine(leadEnginePayload)`
+ * as the sole entry in that array. That change touches ONLY impuestos.html -- it does not require
+ * any change to Lead Engine, the form itself, attribution capture, or consent handling (all three
+ * already flow through submitToLeadEngine's own payload today, unaffected by A's removal).
  *
  * FAIL-OPEN BY CONSTRUCTION (item 11): syncFiscalCalculatorLead() NEVER throws. Every error --
  * HubSpotProviderError from the adapter, or anything else -- is caught here and only logged. This
@@ -73,8 +97,11 @@ export class HubSpotFiscalSyncService {
       const properties = buildHubSpotFiscalProperties({
         fiscalCalculator: input.fiscalCalculator,
         submissionId: input.submissionId,
-        calculatedAt: new Date(),
-        calculationVersion: input.calculationVersion ?? PPR_CALCULATOR_DEFAULT_VERSION,
+        calculatedAt: input.calculatedAt,
+        // Fase 6F.1: generated fresh, right now, right before the actual HubSpot call -- never
+        // reused from a prior attempt, never confused with calculatedAt above.
+        syncedAt: new Date(),
+        calculationVersion: input.calculationVersion ?? CALCULATION_VERSION_UNKNOWN,
         fiscalScore: input.fiscalScore,
         attribution: input.attribution,
         source: lead.source,
