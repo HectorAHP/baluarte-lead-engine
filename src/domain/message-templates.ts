@@ -321,3 +321,53 @@ export const PAST_BOOKED_CANCELLATION_MESSAGE =
 // ---------------------------------------------------------------------------------------------
 export const QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE =
   'Claro. Ya tengo parte de tu información registrada. ¿Qué te gustaría hacer ahora?\n\n1. Resolver una duda\n2. Conocer opciones\n3. Agendar una asesoría\n\nPuedes responder con el número o escribirme tu pregunta.';
+
+// ---------------------------------------------------------------------------------------------
+// Fase 6C -- qualified-lead conversation router. QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE above is
+// this menu's MAIN screen; everything below is what each of its 3 options (or the equivalent
+// free-text phrasing -- see domain/qualified-lead-intent-detection.ts) actually leads to, so a
+// reply of "1"/"2"/"3" (or "¿Cómo funciona el PPR?", "quiero agendar una cita", etc.) produces a
+// genuinely different, useful outcome instead of re-showing this same menu. No guaranteed
+// returns/benefits/tax outcomes are ever stated -- every topic explanation is deliberately
+// hedged ("dependiendo de", "sujeto a", "sin garantía"). No score/tier/HOT-WARM-NURTURE/A-B-C
+// wording anywhere in this section.
+// ---------------------------------------------------------------------------------------------
+
+/** Option "1" (MENU_QUESTION): a bare digit carries no question content yet -- ask for one.
+ * Deliberately does NOT introduce a new tracked "awaiting question" state (see
+ * qualified-lead-menu-state.ts's doc comment): the lead's actual next message is checked by the
+ * same topic-keyword detection as any other turn, so a real question in reply to this prompt is
+ * answered directly, and anything else safely falls back to the main menu again -- no dead end. */
+export const QUALIFIED_LEAD_ASK_QUESTION_MESSAGE = "Claro. Escríbeme tu duda y la revisamos.";
+
+const QUALIFIED_LEAD_TOPIC_EXPLANATIONS: Record<"PPR" | "GMM" | "SAVINGS", string> = {
+  PPR: "Un PPR es una estrategia de ahorro de largo plazo orientada al retiro. Dependiendo de su estructura y de tu situación fiscal, las aportaciones pueden tener beneficios fiscales sujetos a los requisitos aplicables. La estrategia adecuada depende de tu horizonte, capacidad de aportación y régimen fiscal.",
+  GMM: "Un Seguro de Gastos Médicos Mayores (GMM) cubre gastos derivados de enfermedades o accidentes que requieren atención hospitalaria, sujeto a las condiciones, sumas aseguradas y exclusiones de la póliza contratada. La cobertura adecuada depende de tu edad, tu estado de salud y tu presupuesto.",
+  SAVINGS: "Un plan de ahorro o inversión de largo plazo busca hacer crecer tu patrimonio de forma disciplinada, sin garantía de rendimiento. El instrumento adecuado depende de tu horizonte de tiempo, tu tolerancia al riesgo y tus objetivos financieros.",
+};
+
+/** Answers a recognized topic (PPR/GMM/SAVINGS) with safe, hedged, non-personalized copy, then
+ * re-offers the same main menu (QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE) as a natural "anything
+ * else?" continuation -- reuses the existing menu copy verbatim rather than duplicating it, and
+ * marks this reply as ending with the main menu (see qualified-lead-menu-state.ts) so a following
+ * bare "1"/"2"/"3" is still interpretable. */
+export function buildQualifiedLeadTopicAnswer(topic: "PPR" | "GMM" | "SAVINGS"): string {
+  return `${QUALIFIED_LEAD_TOPIC_EXPLANATIONS[topic]}\n\n${QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE}`;
+}
+
+/** Option "2" (EXPLORE_OPTIONS): a short, non-committal list of alternatives -- no product/company
+ * names, no HOT/WARM/NURTURE, no scores or bands. `prioritizeRetirement` lets the caller put
+ * PPR/retiro first when a fiscal context is available (see whatsapp-inbound-service.ts) -- the
+ * ONLY way fiscal context is allowed to influence this reply in this phase. */
+export function buildQualifiedLeadOptionsMessage(prioritizeRetirement: boolean): string {
+  const items = prioritizeRetirement
+    ? ["Retiro con beneficios fiscales", "Ahorro de largo plazo", "Protección patrimonial"]
+    : ["Ahorro de largo plazo", "Retiro con beneficios fiscales", "Protección patrimonial"];
+  return `Por tu consulta podemos revisar alternativas enfocadas en:\n\n${items.map((item, i) => `${i + 1}. ${item}`).join("\n")}`;
+}
+
+/** Option "3" (BOOKING): WHATSAPP_BOOKING_ENABLED stays false -- never invents availability,
+ * never creates an appointment/calendar event. Purely an acknowledgment that keeps the
+ * conversation moving without implying an automated booking flow exists on this channel yet. */
+export const QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE =
+  "Con gusto. La agenda automática todavía no está habilitada en este canal, pero puedo ayudarte a continuar con el proceso para coordinar tu asesoría.";

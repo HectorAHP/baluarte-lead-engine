@@ -10,7 +10,13 @@ import { isCancellationRequest } from "../domain/cancellation-intent-detection.j
 import { isUpcomingBooked } from "../domain/appointment-timing.js";
 import { looksLikeFiscalCalculatorOrigin } from "../domain/fiscal-calculator-origin-detection.js";
 import { isFirstWhatsAppInboundForConversation } from "../domain/whatsapp-first-inbound.js";
-import { buildWelcomeMessage, buildFiscalContextWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE, BOOKED_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE } from "../domain/message-templates.js";
+import { detectQualifiedLeadIntent } from "../domain/qualified-lead-intent-detection.js";
+import { resolvePendingQualifiedMenu, qualifiedMainMenuMetadata } from "../domain/qualified-lead-menu-state.js";
+import {
+  buildWelcomeMessage, buildFiscalContextWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE,
+  BOOKED_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_ASK_QUESTION_MESSAGE,
+  buildQualifiedLeadTopicAnswer, buildQualifiedLeadOptionsMessage, QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE,
+} from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
 import { getFiscalLeadContextForLead, type FiscalLeadContext } from "./fiscal-lead-context.js";
 
@@ -418,8 +424,41 @@ export async function handleInboundWhatsAppText(
         if (handledByBooking) {
           logBranch("qualified-or-nurture-booking", true);
         } else {
-          logBranch("qualified-or-nurture-generic-fallback", true);
-          await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+          // Fase 6C -- the generic fallback above answered EVERY non-booking message with the
+          // exact same menu, forever (production bug: "1"/"2"/"3"/a real question all re-showed
+          // it). This router makes the menu's own options actually go somewhere. Deterministic
+          // only -- no AI_PROVIDER call, no booking activation (WHATSAPP_BOOKING_ENABLED stays
+          // false; option 3 below only ever sends an acknowledgment, never books anything).
+          const priorMessages = await deps.messages.listByConversationId(conversationId);
+          const pendingMenu = resolvePendingQualifiedMenu(priorMessages);
+          const intent = detectQualifiedLeadIntent(input.text, pendingMenu);
+          switch (intent.kind) {
+            case "QUESTION":
+              logBranch(`qualified-or-nurture-question-${intent.topic.toLowerCase()}`, true);
+              // Ends with the main menu again (see buildQualifiedLeadTopicAnswer) -- marks it so
+              // a following bare "1"/"2"/"3" is still interpretable.
+              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildQualifiedLeadTopicAnswer(intent.topic), qualifiedMainMenuMetadata());
+              break;
+            case "EXPLORE_OPTIONS":
+              logBranch("qualified-or-nurture-explore-options", true);
+              // fiscalContext is the ONLY thing allowed to influence this reply, and only the
+              // ORDER of options -- never HOT/WARM/NURTURE, never score, never bands, never
+              // mentioned in the message itself.
+              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildQualifiedLeadOptionsMessage(!!fiscalContext));
+              break;
+            case "BOOKING":
+              logBranch("qualified-or-nurture-booking-fallback", true);
+              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE);
+              break;
+            case "MENU_QUESTION":
+              logBranch("qualified-or-nurture-menu-question", true);
+              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, QUALIFIED_LEAD_ASK_QUESTION_MESSAGE);
+              break;
+            case "UNKNOWN":
+              logBranch("qualified-or-nurture-generic-fallback", true);
+              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, qualifiedMainMenuMetadata());
+              break;
+          }
         }
         return;
       }
@@ -554,6 +593,10 @@ export async function sendAndPersistReply(
   conversationId: string,
   to: string,
   body: string,
+  // Fase 6C: optional, opaque state markers only (e.g. qualifiedMainMenuMetadata()) -- never
+  // PII, never a score/band. Every existing call site omits this and keeps getting `metadata: {}`
+  // exactly as before.
+  metadata: Record<string, unknown> = {},
 ): Promise<void> {
   let providerMessageId: string | undefined;
   // Pre-launch production diagnostic (temporary, redacted): never the full recipient, never the
@@ -604,6 +647,6 @@ export async function sendAndPersistReply(
     body,
     providerMessageId,
     aiGenerated: false,
-    metadata: {},
+    metadata,
   });
 }

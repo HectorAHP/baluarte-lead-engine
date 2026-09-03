@@ -7,7 +7,10 @@ import {
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeMessagingProvider } from "../src/infrastructure/fake-messaging-provider.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
-import { buildWelcomeMessage, buildFiscalContextWelcomeMessage, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE } from "../src/domain/message-templates.js";
+import {
+  buildWelcomeMessage, buildFiscalContextWelcomeMessage, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE,
+  QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE, buildQualifiedLeadTopicAnswer,
+} from "../src/domain/message-templates.js";
 import type { FiscalLeadScore } from "../src/domain/fiscal-lead-score.js";
 import type { QualificationTurnHandler } from "../src/application/whatsapp-inbound-service.js";
 
@@ -256,7 +259,7 @@ describe("Fase 6B -- WhatsApp inbound fiscal context bridge", () => {
     expect(deps.messaging.sentTexts).toHaveLength(1); // no second reply
   });
 
-  it("16. booking stays disabled (WHATSAPP_BOOKING_ENABLED off -- bookingHandler absent) even with fiscal context present -- no booking action is ever taken, but the lead still gets the generic qualified-lead fallback reply (see the QUALIFIED_A follow-up bug fix below)", async () => {
+  it("16. booking stays disabled (WHATSAPP_BOOKING_ENABLED off -- bookingHandler absent) even with fiscal context present -- no booking action is ever taken, but the lead still gets a useful reply (see the QUALIFIED_A follow-up bug fix and Fase 6C router below)", async () => {
     const deps = makeDeps();
     const fiscalLead = await deps.leadService.createLead({ phone: "4771313131", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
     await seedFiscalScore(deps.fiscalLeadScores, fiscalLead.id);
@@ -266,10 +269,13 @@ describe("Fase 6B -- WhatsApp inbound fiscal context bridge", () => {
     const result = await handleInboundWhatsAppText(depsWithoutBooking, baseInput({ whatsappUserId: "5214771313131", phoneRaw: "5214771313131", text: "quiero agendar" }));
     expect(result.outcome).toBe("PROCESSED");
     // Booking itself never activates (no bookingHandler to call, no appointment/slot logic
-    // reachable) -- but the lead is never left silent either: the pre-existing generic fallback
-    // fires instead. See QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE / f35a9f8.
+    // reachable, status never moves to BOOKING_PENDING) -- but the lead is never left silent
+    // either: Fase 6C's router recognizes the booking-intent wording and sends the safe booking
+    // fallback (never QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE's bare menu for text this specific).
     expect(deps.messaging.sentTexts).toHaveLength(1);
-    expect(deps.messaging.sentTexts[0].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+    expect(deps.messaging.sentTexts[0].body).toBe(QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE);
+    const after = await deps.leads.findById(fiscalLead.id);
+    expect(after?.status).toBe("QUALIFIED_A");
   });
 
   it("17. qualification A/B/C keeps working unchanged when fiscal context is present", async () => {
@@ -469,7 +475,9 @@ describe("Production bug fix -- QUALIFIED_A/B/NURTURE_C follow-up must reply eve
     const result = await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772222222", phoneRaw: "4772222222", providerMessageId: "wamid.followup-2", text: "¿Cómo funciona el PPR?" }));
     expect(result.outcome).toBe("PROCESSED");
     expect(deps.messaging.sentTexts).toHaveLength(2);
-    expect(deps.messaging.sentTexts[1].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+    // Fase 6C: a real PPR question gets a real PPR answer, not the bare menu -- see
+    // tests/whatsapp-qualified-lead-router.test.ts for the dedicated router coverage.
+    expect(deps.messaging.sentTexts[1].body).toBe(buildQualifiedLeadTopicAnswer("PPR"));
   });
 
   it("a second consecutive follow-up also gets a reply -- the fix is not a one-shot", async () => {
