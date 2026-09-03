@@ -40,7 +40,20 @@ export interface QualificationTurnHandler {
  * routing branch below to know whether it still owes the lead a reply of its own.
  */
 export interface BookingTurnHandler {
-  handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<boolean>;
+  handleTurn(params: {
+    lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date;
+    /**
+     * Fase 6D -- set by the QUALIFIED_A/B/NURTURE_C routing branch below when the qualified-lead
+     * conversation router (detectQualifiedLeadIntent, Fase 6C) has ALREADY determined this turn
+     * means BOOKING -- via the menu's option "3" digit, or wording its own broader keyword list
+     * recognizes. WhatsAppBookingHandler's own isNewBookingRequest check is narrower (specific
+     * phrases like "quiero agendar una cita" only -- it has no visibility into the menu-digit
+     * context, which is exclusively this router's concern), so without this override a bare "3"
+     * would never reach the real booking flow even with WHATSAPP_BOOKING_ENABLED=true. Never set
+     * for a BOOKING_PENDING turn (that branch is unconditional already, unaffected by this).
+     */
+    bookingIntentOverride?: boolean;
+  }): Promise<boolean>;
 }
 
 /**
@@ -418,20 +431,36 @@ export async function handleInboundWhatsAppText(
       // a reply; bookingHandler's presence only decides HOW that reply is produced (delegate vs.
       // the fallback directly) -- booking itself is NOT activated by this fix.
       if (lead.status === "QUALIFIED_A" || lead.status === "QUALIFIED_B" || lead.status === "NURTURE_C") {
+        // Fase 6C router: determined BEFORE calling bookingHandler (not just as its fallback) --
+        // Fase 6D needs to know here whether THIS turn already means BOOKING (e.g. a bare "3"
+        // against the main menu), so that intent can be handed to bookingHandler as
+        // bookingIntentOverride below. bookingHandler's own isNewBookingRequest check has no
+        // visibility into the menu-digit context (exclusively this router's concern), so without
+        // this the real booking flow could only ever be reached by an explicit phrase like
+        // "quiero agendar una cita", never by the menu's own option "3".
+        const priorMessages = await deps.messages.listByConversationId(conversationId);
+        const pendingMenu = resolvePendingQualifiedMenu(priorMessages);
+        const intent = detectQualifiedLeadIntent(input.text, pendingMenu);
+
         const handledByBooking = deps.bookingHandler
-          ? await deps.bookingHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() })
+          ? await deps.bookingHandler.handleTurn({
+              lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date(),
+              bookingIntentOverride: intent.kind === "BOOKING",
+            })
           : false;
         if (handledByBooking) {
+          // Fase 6D: with WHATSAPP_BOOKING_ENABLED=true, this is the REAL Google Calendar booking
+          // flow (WhatsAppBookingHandler -> SlotOfferingService -> GoogleCalendarProvider) --
+          // never QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE. With the flag false (bookingHandler
+          // absent), handledByBooking is always false and this branch is never taken -- unchanged.
           logBranch("qualified-or-nurture-booking", true);
         } else {
           // Fase 6C -- the generic fallback above answered EVERY non-booking message with the
           // exact same menu, forever (production bug: "1"/"2"/"3"/a real question all re-showed
           // it). This router makes the menu's own options actually go somewhere. Deterministic
-          // only -- no AI_PROVIDER call, no booking activation (WHATSAPP_BOOKING_ENABLED stays
-          // false; option 3 below only ever sends an acknowledgment, never books anything).
-          const priorMessages = await deps.messages.listByConversationId(conversationId);
-          const pendingMenu = resolvePendingQualifiedMenu(priorMessages);
-          const intent = detectQualifiedLeadIntent(input.text, pendingMenu);
+          // only -- no AI_PROVIDER call. Reached for BOOKING intent ONLY when bookingHandler is
+          // absent (flag off) or otherwise didn't act -- QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE
+          // never invents availability or creates anything.
           switch (intent.kind) {
             case "QUESTION":
               logBranch(`qualified-or-nurture-question-${intent.topic.toLowerCase()}`, true);

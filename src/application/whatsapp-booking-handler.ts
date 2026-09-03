@@ -67,8 +67,8 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
    * reply for a QUALIFIED_A/QUALIFIED_B/NURTURE_C lead's non-booking text, WITHOUT this handler
    * itself becoming a generic conversational handler -- it still only ever knows about booking.
    */
-  async handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<boolean> {
-    const { lead, conversationId, whatsappUserId, inboundText, now } = params;
+  async handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date; bookingIntentOverride?: boolean }): Promise<boolean> {
+    const { lead, conversationId, whatsappUserId, inboundText, now, bookingIntentOverride } = params;
 
     if (lead.status === "BOOKING_PENDING") {
       try {
@@ -88,7 +88,12 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     // handler unconditionally on status alone for these three (mirroring the CANCELLED ->
     // WhatsAppReactivationHandler precedent), so the intent check lives here, not duplicated at
     // the routing layer.
-    if ((lead.status === "QUALIFIED_A" || lead.status === "QUALIFIED_B" || lead.status === "NURTURE_C") && isNewBookingRequest(inboundText)) {
+    //
+    // Fase 6D: `bookingIntentOverride` (see BookingTurnHandler's doc comment) covers what
+    // isNewBookingRequest's narrow phrase list structurally cannot -- e.g. a bare "3" against the
+    // qualified-lead menu -- without loosening isNewBookingRequest itself (still exactly as
+    // narrow/deterministic as before, unaffected for every OTHER caller/context).
+    if ((lead.status === "QUALIFIED_A" || lead.status === "QUALIFIED_B" || lead.status === "NURTURE_C") && (isNewBookingRequest(inboundText) || bookingIntentOverride)) {
       try {
         await this.startNewBooking(lead, conversationId, whatsappUserId, now);
       } catch (err) {
