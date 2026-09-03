@@ -250,6 +250,40 @@ export interface AppointmentRescheduleRepository {
 
 export interface CalendarSlot{start:Date;end:Date;} export interface CalendarEventInput{title:string;description:string;start:Date;end:Date;attendeeEmail?:string;} export interface CalendarEventResult{eventId:string;meetingUrl?:string;}
 export interface CalendarProvider{getAvailableSlots(from:Date,to:Date,durationMinutes:number):Promise<CalendarSlot[]>;isSlotAvailable(start:Date,end:Date):Promise<boolean>;createEvent(input:CalendarEventInput):Promise<CalendarEventResult>;deleteEvent(eventId:string):Promise<void>;}
+/**
+ * Fase 6F -- HubSpot CRM sync (fiscal calculator -> HubSpot contact). Deliberately minimal: one
+ * method, matching CalendarProvider's own single-purpose-port style. `properties` is a flat,
+ * already-built HubSpot property map (see domain/hubspot-fiscal-properties.ts) -- this interface
+ * has NO knowledge of fiscal/scoring/lead concepts, only "upsert a contact identified by
+ * email/phone with these properties", so no HubSpot-specific vocabulary (portal, private app,
+ * contact ID shapes) ever needs to leak into application/domain code that depends on it -- same
+ * boundary discipline as MessagingProvider's own doc comment.
+ */
+export interface HubSpotContactUpsertInput {
+  /** Normalized email, when known. At least one of email/phone must be present -- callers never
+   * invoke this with both absent (see HubSpotFiscalSyncService). */
+  email?: string;
+  /** E.164 phone, when known. */
+  phone?: string;
+  firstName?: string;
+  lastName?: string;
+  /** Native HubSpot default properties, reused rather than shadowed with a custom duplicate --
+   * see the Fase 6F report, item 5. */
+  city?: string;
+  state?: string;
+  /** Flat bc_fiscal_* property map, see domain/hubspot-fiscal-properties.ts. */
+  properties: Record<string, string | number | boolean>;
+}
+export interface HubSpotContactUpsertResult {
+  hubspotContactId: string;
+  /** true when this call created a brand-new HubSpot contact; false when it matched and updated
+   * an existing one (by normalized email, then normalized phone -- see the real adapter's doc
+   * comment for the exact search order). */
+  created: boolean;
+}
+export interface HubSpotCRMProvider {
+  upsertContact(input: HubSpotContactUpsertInput): Promise<HubSpotContactUpsertResult>;
+}
 export interface AIProvider{generateStructured<T>(systemPrompt:string,messages:Array<{role:"user"|"assistant";content:string}>,schemaName:string):Promise<T>;}
 /** Structured warning-level logging, matching pino's `log.warn(details, message)` calling
  * convention so Fastify's `app.log` can be passed directly in production with no adapter. */

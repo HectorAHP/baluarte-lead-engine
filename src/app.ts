@@ -4,7 +4,7 @@ import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { config, hasGoogleCalendarCredentials, hasWhatsAppCredentials, corsAllowedOrigins as defaultCorsAllowedOrigins } from "./config.js";
+import { config, hasGoogleCalendarCredentials, hasWhatsAppCredentials, hasHubSpotCredentials, corsAllowedOrigins as defaultCorsAllowedOrigins } from "./config.js";
 import {
   InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository,
   InMemoryLeadScoreRepository, InMemoryConversationRepository, InMemoryMessageRepository,
@@ -34,8 +34,10 @@ import { FakeCalendarProvider } from "./infrastructure/fake-calendar.js";
 import { GoogleCalendarProvider } from "./infrastructure/google-calendar-provider.js";
 import { FakeMessagingProvider } from "./infrastructure/fake-messaging-provider.js";
 import { MetaWhatsAppProvider } from "./infrastructure/meta-whatsapp-provider.js";
+import { RealHubSpotCRMProvider } from "./infrastructure/hubspot-crm-provider.js";
 import { LeadService, AppointmentService } from "./application/services.js";
 import { WebLeadCaptureService } from "./application/web-lead-capture.js";
+import { HubSpotFiscalSyncService } from "./application/hubspot-fiscal-sync-service.js";
 import { formatFiscalCalculatorNote } from "./domain/fiscal-calculator-lead-note.js";
 import { SlotOfferingService } from "./application/slot-offering-service.js";
 import { AppointmentCancellationService } from "./application/appointment-cancellation-service.js";
@@ -60,7 +62,7 @@ import type {
   SlotOfferClaimRepository, CalendarProvider, MessagingProvider,
   LeadStatusHistoryRepository, AppointmentStatusHistoryRepository, AppointmentMessageDeliveryRepository,
   AppointmentCancellationRepository, AppointmentRescheduleRepository, ProcessedEventRepository,
-  FiscalLeadScoreRepository,
+  FiscalLeadScoreRepository, HubSpotCRMProvider,
 } from "./application/ports.js";
 
 declare module "fastify" {
@@ -128,6 +130,12 @@ export interface AppDependencies {
   appointmentReschedulesRepo?: AppointmentRescheduleRepository;
   calendar?: CalendarProvider;
   messaging?: MessagingProvider;
+  /** Fase 6F: HubSpot CRM sync for fiscal calculator submissions. `undefined` (every environment
+   * today -- see hasHubSpotCredentials in config.ts) means WebLeadCaptureService is constructed
+   * without a HubSpotFiscalSyncService, and POST /api/leads' HubSpot sync step is a silent no-op.
+   * Same override rationale as `calendar`/`messaging` above -- tests inject a FakeHubSpotCRMProvider
+   * explicitly rather than relying on any config-driven default. */
+  hubspotCrm?: HubSpotCRMProvider;
   /** Override for config.WHATSAPP_VERIFY_TOKEN -- exists so webhook verification is testable
    * without real WhatsApp credentials in the environment. */
   whatsappVerifyToken?: string;
@@ -245,9 +253,17 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   const appointmentReschedulesRepo = overrides.appointmentReschedulesRepo ?? (supabaseClient ? new SupabaseAppointmentRescheduleRepository(supabaseClient) : new InMemoryAppointmentRescheduleRepository());
   const calendar = overrides.calendar ?? (hasGoogleCalendarCredentials ? new GoogleCalendarProvider() : new FakeCalendarProvider());
   const messaging = overrides.messaging ?? (hasWhatsAppCredentials ? new MetaWhatsAppProvider() : new FakeMessagingProvider());
+  // Fase 6F: undefined whenever HUBSPOT_PRIVATE_APP_TOKEN isn't configured (every environment
+  // today) -- no fallback "fake" is constructed here (unlike calendar/messaging above) because a
+  // real HubSpot sync being silently absent is safe by design (see HubSpotFiscalSyncService's
+  // class doc comment), so there is nothing a production fallback would need to stand in for.
+  const hubspotCrm = overrides.hubspotCrm ?? (hasHubSpotCredentials ? new RealHubSpotCRMProvider(config.HUBSPOT_PRIVATE_APP_TOKEN!) : undefined);
 
   const leadService = new LeadService(leadsRepo, leadScoresRepo, leadStatusHistoryRepo, app.log);
-  const webLeadCaptureService = new WebLeadCaptureService(leadsRepo, processedEventsRepo, leadService, app.log, fiscalLeadScoresRepo);
+  // Fase 6F: always constructed (cheap, stateless) -- its own `hubspot` port being undefined is
+  // what actually gates real behavior, not a conditional construction here.
+  const hubspotFiscalSync = new HubSpotFiscalSyncService(hubspotCrm, app.log);
+  const webLeadCaptureService = new WebLeadCaptureService(leadsRepo, processedEventsRepo, leadService, app.log, fiscalLeadScoresRepo, hubspotFiscalSync);
   const appointmentService = new AppointmentService(calendar, appointmentsRepo, bookingAttemptsRepo, leadsRepo, app.log);
   // Always constructed -- cheap, stateless, and needed by both qualificationHandler (to offer
   // slots right after QUALIFIED_A/B) and bookingHandler below, each gated independently by its
@@ -476,6 +492,11 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
       annualIncome: mxnAmount, pprDeductionLimit: mxnAmount, effectivePprContribution: mxnAmount,
       otherDeductionsConsidered: mxnAmount, estimatedTaxBenefitMin: mxnAmount, estimatedTaxBenefitMax: mxnAmount,
     }),
+    // Fase 6F: optional, additive. impuestos.html does not send this today (no version tag exists
+    // anywhere in the calculator engine -- see the Fase 6F report, item 16) -- when absent,
+    // HubSpotFiscalSyncService falls back to PPR_CALCULATOR_DEFAULT_VERSION. If the frontend is
+    // ever updated to send its own, it passes through unchanged. Never read by fiscal_v1 scoring.
+    calculationVersion: z.string().max(50).optional(),
   }).optional();
   const createLeadSchema = z.object({
     firstName: z.string().min(1).max(100).optional(), lastName: z.string().min(1).max(100).optional(),
@@ -580,6 +601,36 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
                 annualContribution: fc.annualContribution,
                 filesAnnualReturn: fc.filesAnnualReturn,
                 hasPpr: fc.hasPpr,
+              }
+            : undefined,
+          // Fase 6F: the FULL fc payload (deductions, calculation, hasGmm, age, taxRegime), for
+          // HubSpot only -- never consulted by fiscal_v1 scoring (that's `fiscalCalculator` above,
+          // unchanged). Same "only meaningful when source === WEB_FISCAL_CALCULATOR" gating.
+          fiscalCalculatorSnapshot: fc
+            ? {
+                age: fc.age,
+                city: fc.city,
+                taxRegime: fc.taxRegime,
+                filesAnnualReturn: fc.filesAnnualReturn,
+                monthlyIncome: fc.monthlyIncome,
+                annualContribution: fc.annualContribution,
+                deductions: fc.deductions,
+                hasGmm: fc.hasGmm,
+                hasPpr: fc.hasPpr,
+                calculation: fc.calculation,
+              }
+            : undefined,
+          calculationVersion: fc?.calculationVersion,
+          attribution: attribution
+            ? {
+                utm_source: attribution.utm_source,
+                utm_medium: attribution.utm_medium,
+                utm_campaign: attribution.utm_campaign,
+                utm_content: attribution.utm_content,
+                utm_term: attribution.utm_term,
+                fbclid: attribution.fbclid,
+                landing_page: attribution.landing_page,
+                referrer: attribution.referrer,
               }
             : undefined,
         });

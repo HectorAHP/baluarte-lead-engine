@@ -9,6 +9,7 @@ import {
 } from "../../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../../src/infrastructure/fake-calendar.js";
 import { FakeMessagingProvider } from "../../src/infrastructure/fake-messaging-provider.js";
+import { FakeHubSpotCRMProvider } from "../../src/infrastructure/fake-hubspot-crm-provider.js";
 
 /**
  * Always supplies a COMPLETE set of in-memory/fake dependencies -- never a partial override
@@ -59,6 +60,11 @@ export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
     fiscalLeadScoresRepo: new InMemoryFiscalLeadScoreRepository(),
     calendar: new FakeCalendarProvider(),
     messaging: new FakeMessagingProvider(),
+    // Fase 6F -- same "complete set, never a config-driven default" rationale as every provider
+    // above. This repo's real .env carries no HUBSPOT_PRIVATE_APP_TOKEN today, so buildApp()'s own
+    // default would already resolve to `undefined` here -- this explicit override is what keeps
+    // that true even if a future .env change adds one, exactly like calendar/messaging above.
+    hubspotCrm: new FakeHubSpotCRMProvider(),
     whatsappVerifyToken: TEST_WHATSAPP_VERIFY_TOKEN,
     metaAppSecret: TEST_META_APP_SECRET,
     // Explicit false defaults, not left to buildApp()'s own config fallback: this repo's .env

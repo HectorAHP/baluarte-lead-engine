@@ -51,6 +51,14 @@ const schema=z.object({
   // fiscal calculator a handful of times in a minute.
   LEADS_RATE_LIMIT_MAX:z.coerce.number().int().positive().default(20),
   LEADS_RATE_LIMIT_WINDOW_MS:z.coerce.number().int().positive().default(60_000),
+  // Fase 6F -- HubSpot CRM sync. Optional: absent (the only state in every environment today --
+  // see the Fase 6F report's "variables Render" section) means hasHubSpotCredentials is false and
+  // app.ts never constructs a real HubSpotCRMProvider, so POST /api/leads' HubSpot sync step is a
+  // silent no-op everywhere until this is explicitly set. HUBSPOT_PORTAL_ID is NOT required by any
+  // API call this integration makes (a Private App token already scopes every request to its own
+  // portal) -- kept only for documentation/manual-link purposes, never read by hubspot-crm-provider.ts.
+  HUBSPOT_PRIVATE_APP_TOKEN:z.string().optional(),
+  HUBSPOT_PORTAL_ID:z.string().optional(),
 }).superRefine((cfg,ctx)=>{
   const googleFields=[cfg.GOOGLE_CLIENT_ID,cfg.GOOGLE_CLIENT_SECRET,cfg.GOOGLE_REFRESH_TOKEN];
   const setCount=googleFields.filter(Boolean).length;
@@ -61,6 +69,7 @@ const schema=z.object({
 export const config=schema.parse(process.env);
 export const hasGoogleCalendarCredentials=Boolean(config.GOOGLE_CLIENT_ID&&config.GOOGLE_CLIENT_SECRET&&config.GOOGLE_REFRESH_TOKEN);
 export const hasWhatsAppCredentials=Boolean(config.WHATSAPP_ACCESS_TOKEN&&config.WHATSAPP_PHONE_NUMBER_ID&&config.WHATSAPP_VERIFY_TOKEN&&config.META_APP_SECRET);
+export const hasHubSpotCredentials=Boolean(config.HUBSPOT_PRIVATE_APP_TOKEN);
 
 // Production hardening: CORS allowlist for the public web surface (POST /api/leads and friends --
 // PII/financial data). CORS is a browser-enforced concept; server-to-server callers (Meta's

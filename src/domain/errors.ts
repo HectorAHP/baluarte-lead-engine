@@ -185,6 +185,22 @@ export class DuplicateMessageError extends Error {
   }
 }
 
+/**
+ * Fase 6F -- thrown by HubSpotCRMProvider (the real adapter) for any non-2xx HubSpot API response
+ * or network/timeout failure. Deliberately carries only the HTTP status and a short, static
+ * category -- NEVER HubSpot's raw response body (which could echo back request fields) and NEVER
+ * the Private App token. HubSpotFiscalSyncService always catches this (fail-open, see its class
+ * doc comment) -- it is never allowed to propagate into POST /api/leads' response.
+ */
+export class HubSpotProviderError extends Error {
+  public readonly httpStatus?: number;
+  constructor(message: string, options?: { cause?: unknown; httpStatus?: number }) {
+    super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
+    this.name = "HubSpotProviderError";
+    this.httpStatus = options?.httpStatus;
+  }
+}
+
 export class MessagingProviderError extends Error {
   /** HTTP status Meta returned, when known. */
   public readonly httpStatus?: number;

@@ -4,6 +4,8 @@ import { normalizePhoneToE164 } from "../domain/phone.js";
 import type { LeadService } from "./services.js";
 import { scoreFiscalCalculatorLead } from "../domain/fiscal-lead-scoring.js";
 import type { FiscalScoreInput } from "../domain/fiscal-lead-score.js";
+import type { HubSpotFiscalSyncService } from "./hubspot-fiscal-sync-service.js";
+import type { HubSpotFiscalAttributionInput, HubSpotFiscalPropertiesInput } from "../domain/hubspot-fiscal-properties.js";
 
 /** Source value that gates fiscal_v1 scoring -- see FASE 6A. Any other `source` never runs
  * fiscal scoring, regardless of whether a `fiscalCalculator` payload happens to be present. */
@@ -59,6 +61,22 @@ export interface WebLeadCaptureInput {
    * input by design; see the class doc comment's HISTORICAL LIMITATION).
    */
   fiscalCalculator?: FiscalScoreInput;
+  /**
+   * Fase 6F: the FULL fiscal calculator payload (deductions, calculation, hasGmm, age, taxRegime
+   * -- everything `fiscalCalculator` above deliberately omits, since that field is scoped ONLY to
+   * fiscal_v1's own scoring inputs). Used exclusively to build the HubSpot contact snapshot, never
+   * to influence scoring. Same "only meaningful when source === WEB_FISCAL_CALCULATOR" gating as
+   * `fiscalCalculator` above.
+   */
+  fiscalCalculatorSnapshot?: HubSpotFiscalPropertiesInput["fiscalCalculator"];
+  /** Fase 6F: passed through from the calculator's own optional field, if ever sent -- see
+   * PPR_CALCULATOR_DEFAULT_VERSION's doc comment for the fallback used when absent. */
+  calculationVersion?: string;
+  /** Fase 6F: the SAME attribution object app.ts already parses (utm_source, utm_medium,
+   * utm_campaign, utm_content, utm_term, fbclid, landing_page, referrer) -- reused here, not
+   * re-derived, so HubSpot's bc_fiscal_utm_* properties always match exactly what was captured
+   * for this submission. */
+  attribution?: HubSpotFiscalAttributionInput;
 }
 
 export interface WebLeadCaptureResult {
@@ -105,6 +123,10 @@ export class WebLeadCaptureService {
     // absent, fiscal scoring is silently skipped (never throws) -- deliberately fail-open, since
     // scoring is additive and must never block a lead capture from succeeding.
     private readonly fiscalLeadScores?: FiscalLeadScoreRepository,
+    // Fase 6F -- optional, same rationale as fiscalLeadScores above. Undefined whenever
+    // HUBSPOT_PRIVATE_APP_TOKEN isn't configured (every environment today) -- HubSpot sync is then
+    // silently skipped, never throws, never blocks lead capture.
+    private readonly hubspotSync?: HubSpotFiscalSyncService,
   ) {}
 
   /**
@@ -143,6 +165,24 @@ export class WebLeadCaptureService {
           { leadIdLast8: lead.id.slice(-8), score: result.score, scoreClass: result.scoreClass, version: result.version },
           "lead fiscal score calculated",
         );
+
+        // Fase 6F: sync to HubSpot only on a genuine NEW fiscal_v1 row (never on an idempotent
+        // replay of an already-scored submissionId -- `persisted` is exactly that signal). Runs
+        // strictly AFTER the lead and its fiscal_v1 score are already durably persisted above --
+        // see HubSpotFiscalSyncService's class doc comment for the full "persist lead -> persist
+        // score -> sync HubSpot" ordering rationale. Never throws (fail-open by construction).
+        if (this.hubspotSync && input.fiscalCalculatorSnapshot) {
+          await this.hubspotSync.syncFiscalCalculatorLead({
+            lead,
+            submissionId: input.submissionId,
+            fiscalCalculator: input.fiscalCalculatorSnapshot,
+            calculationVersion: input.calculationVersion,
+            fiscalScore: { score: result.score, scoreClass: result.scoreClass, version: result.version },
+            attribution: input.attribution,
+            consentContact: input.consentContact,
+            privacyAcceptedAt: input.privacyAcceptedAt,
+          });
+        }
       }
     } catch (err) {
       this.logger.warn(
