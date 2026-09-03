@@ -7,7 +7,7 @@ import {
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeMessagingProvider } from "../src/infrastructure/fake-messaging-provider.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
-import { buildWelcomeMessage, buildFiscalContextWelcomeMessage } from "../src/domain/message-templates.js";
+import { buildWelcomeMessage, buildFiscalContextWelcomeMessage, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE } from "../src/domain/message-templates.js";
 import type { FiscalLeadScore } from "../src/domain/fiscal-lead-score.js";
 import type { QualificationTurnHandler } from "../src/application/whatsapp-inbound-service.js";
 
@@ -256,7 +256,7 @@ describe("Fase 6B -- WhatsApp inbound fiscal context bridge", () => {
     expect(deps.messaging.sentTexts).toHaveLength(1); // no second reply
   });
 
-  it("16. booking stays disabled (WHATSAPP_BOOKING_ENABLED off -- bookingHandler absent) even with fiscal context present", async () => {
+  it("16. booking stays disabled (WHATSAPP_BOOKING_ENABLED off -- bookingHandler absent) even with fiscal context present -- no booking action is ever taken, but the lead still gets the generic qualified-lead fallback reply (see the QUALIFIED_A follow-up bug fix below)", async () => {
     const deps = makeDeps();
     const fiscalLead = await deps.leadService.createLead({ phone: "4771313131", source: "WEB_FISCAL_CALCULATOR", consentContact: false });
     await seedFiscalScore(deps.fiscalLeadScores, fiscalLead.id);
@@ -265,7 +265,11 @@ describe("Fase 6B -- WhatsApp inbound fiscal context bridge", () => {
     const depsWithoutBooking: WhatsAppInboundDeps = { ...deps }; // bookingHandler intentionally omitted
     const result = await handleInboundWhatsAppText(depsWithoutBooking, baseInput({ whatsappUserId: "5214771313131", phoneRaw: "5214771313131", text: "quiero agendar" }));
     expect(result.outcome).toBe("PROCESSED");
-    expect(deps.messaging.sentTexts).toHaveLength(0); // no-match fallback, exactly as before this phase
+    // Booking itself never activates (no bookingHandler to call, no appointment/slot logic
+    // reachable) -- but the lead is never left silent either: the pre-existing generic fallback
+    // fires instead. See QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE / f35a9f8.
+    expect(deps.messaging.sentTexts).toHaveLength(1);
+    expect(deps.messaging.sentTexts[0].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
   });
 
   it("17. qualification A/B/C keeps working unchanged when fiscal context is present", async () => {
@@ -406,5 +410,89 @@ describe("Fase 6B.1 -- fiscal-contextual welcome uses real first-WhatsApp-inboun
     expect(lead?.qualifiedAt).toBeUndefined();
     expect(lead?.bookingStartedAt).toBeUndefined();
     expect(lead?.bookedAt).toBeUndefined();
+  });
+});
+
+/**
+ * Production bug fix -- a QUALIFIED_A/QUALIFIED_B/NURTURE_C lead's follow-up inbound went
+ * completely silent (persisted, but zero outbound) whenever WHATSAPP_BOOKING_ENABLED=false
+ * (bookingHandler absent), because the entire QUALIFIED_A / QUALIFIED_B / NURTURE_C branch -- including the
+ * f35a9f8 generic-fallback fix -- was nested inside `deps.bookingHandler && (...)`. Reproduces
+ * the exact real production shape: a fiscal-context lead that reached QUALIFIED_A (via the
+ * existing WhatsApp qualification engine, independent of fiscal HOT/WARM/NURTURE), already had
+ * its first-inbound fiscal welcome exchange, and now sends genuine follow-up messages with NO
+ * bookingHandler wired -- exactly this project's real deployed configuration.
+ */
+describe("Production bug fix -- QUALIFIED_A/B/NURTURE_C follow-up must reply even when booking is disabled", () => {
+  async function seedQualifiedAFiscalLeadWithPriorExchange(deps: ReturnType<typeof makeDeps>, phone: string, waId: string) {
+    const lead = await deps.leadService.createLead({ phone, source: "WEB_FISCAL_CALCULATOR", consentContact: false });
+    await seedFiscalScore(deps.fiscalLeadScores, lead.id, { scoreClass: "HOT", score: 90 });
+    // Reached QUALIFIED_A via the (independent) WhatsApp qualification engine -- score/scoreClass
+    // here are the A/B/C fields, deliberately different values from the fiscal HOT/90 above, to
+    // mirror the real production lead (score=78, scoreClass="A") and prove the two never mix.
+    await deps.leads.update(lead.id, { status: "QUALIFIED_A", score: 78, scoreClass: "A" });
+
+    // First WhatsApp inbound: the fiscal welcome exchange already happened.
+    await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: waId, phoneRaw: phone, providerMessageId: "wamid.fiscal-1", text: PREFILLED_TEXT }));
+    const conversation = await deps.conversations.findActiveByLeadId(lead.id);
+    return { lead, conversation: conversation! };
+  }
+
+  it("a follow-up of '2' from a QUALIFIED_A fiscal lead produces an outbound reply (no bookingHandler wired)", async () => {
+    const deps = makeDeps();
+    const { lead } = await seedQualifiedAFiscalLeadWithPriorExchange(deps, "4772222221", "5214772222221");
+    expect(deps.messaging.sentTexts).toHaveLength(1); // the fiscal welcome from message 1
+
+    // depsWithoutBooking mirrors WHATSAPP_BOOKING_ENABLED=false exactly -- deps.bookingHandler is
+    // simply never set (makeDeps() never wires one).
+    const result = await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772222221", phoneRaw: "4772222221", providerMessageId: "wamid.followup-1", text: "2" }));
+    expect(result.outcome).toBe("PROCESSED");
+
+    expect(deps.messaging.sentTexts).toHaveLength(2); // welcome + the follow-up reply
+    expect(deps.messaging.sentTexts[1].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+
+    const branchLog = deps.logger.warnings.find((w) => w.details.branch === "qualified-or-nurture-generic-fallback");
+    expect(branchLog).toBeTruthy();
+
+    // Fiscal/A-B-C separation and lifecycle stay untouched by this fix.
+    const after = await deps.leads.findById(lead.id);
+    expect(after?.status).toBe("QUALIFIED_A");
+    expect(after?.score).toBe(78);
+    expect(after?.scoreClass).toBe("A");
+  });
+
+  it("a follow-up of '¿Cómo funciona el PPR?' from the same QUALIFIED_A fiscal lead also produces a reply", async () => {
+    const deps = makeDeps();
+    await seedQualifiedAFiscalLeadWithPriorExchange(deps, "4772222222", "5214772222222");
+    expect(deps.messaging.sentTexts).toHaveLength(1);
+
+    const result = await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772222222", phoneRaw: "4772222222", providerMessageId: "wamid.followup-2", text: "¿Cómo funciona el PPR?" }));
+    expect(result.outcome).toBe("PROCESSED");
+    expect(deps.messaging.sentTexts).toHaveLength(2);
+    expect(deps.messaging.sentTexts[1].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+  });
+
+  it("a second consecutive follow-up also gets a reply -- the fix is not a one-shot", async () => {
+    const deps = makeDeps();
+    await seedQualifiedAFiscalLeadWithPriorExchange(deps, "4772222223", "5214772222223");
+    await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772222223", phoneRaw: "4772222223", providerMessageId: "wamid.followup-3a", text: "2" }));
+    await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772222223", phoneRaw: "4772222223", providerMessageId: "wamid.followup-3b", text: "¿Cuánto cuesta?" }));
+
+    expect(deps.messaging.sentTexts).toHaveLength(3); // welcome + 2 follow-up replies
+    expect(deps.messaging.sentTexts[1].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+    expect(deps.messaging.sentTexts[2].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+  });
+
+  it("when bookingHandler IS wired and reports it handled the turn, the fallback is not sent (pre-existing f35a9f8 behavior, unchanged)", async () => {
+    const deps = makeDeps();
+    await seedQualifiedAFiscalLeadWithPriorExchange(deps, "4772222224", "5214772222224");
+
+    const bookingHandler = { handleTurn: async () => true }; // simulates genuine booking intent handled
+    const depsWithBooking = { ...deps, bookingHandler };
+    const result = await handleInboundWhatsAppText(depsWithBooking, baseInput({ whatsappUserId: "5214772222224", phoneRaw: "4772222224", providerMessageId: "wamid.followup-4", text: "quiero agendar" }));
+    expect(result.outcome).toBe("PROCESSED");
+    expect(deps.messaging.sentTexts).toHaveLength(1); // only the welcome -- bookingHandler owns its own reply, not sent via sendAndPersistReply here
+    const branchLog = deps.logger.warnings.find((w) => w.details.branch === "qualified-or-nurture-booking");
+    expect(branchLog).toBeTruthy();
   });
 });

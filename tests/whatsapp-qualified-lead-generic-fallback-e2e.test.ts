@@ -189,13 +189,25 @@ describe("Pre-launch fix -- qualified/nurture lead generic conversational fallba
     expect(outbound[0].providerMessageId).toBeTruthy();
   });
 
-  it("flag-off regression: with WHATSAPP_BOOKING_ENABLED off, a QUALIFIED_A lead's generic text stays silent -- byte-for-byte the historical behavior", async () => {
+  it("flag-off fix: with WHATSAPP_BOOKING_ENABLED off, a QUALIFIED_A lead's generic text still gets the fallback reply -- no longer silent", async () => {
+    // Production bug (found via a real fiscal-context-linked QUALIFIED_A lead's WhatsApp
+    // follow-up going completely unanswered): the QUALIFIED_A/QUALIFIED_B/NURTURE_C branch
+    // used to be nested entirely inside `deps.bookingHandler && (...)`, so with booking
+    // disabled (bookingHandler absent -- this project's real deployed configuration) the
+    // fallback THIS test file exists to prove ("no silence for a qualified lead's valid free
+    // text") was itself unreachable. Fixed: status alone decides whether this lead owes a
+    // reply; bookingHandler's presence only decides HOW it's produced. Booking itself is never
+    // activated by this -- whatsappBookingEnabled stays false throughout this test.
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: false });
-    const { conversation } = await createLeadAtStatus(repos, "5214779991007", "QUALIFIED_A", { scoreClass: "A" });
+    const { lead, conversation } = await createLeadAtStatus(repos, "5214779991007", "QUALIFIED_A", { scoreClass: "A" });
 
     await send(app, "5214779991007", "wamid.q7a", "Hola, quiero información");
 
-    expect(await outboundMessages(repos, conversation.id)).toHaveLength(0);
+    const finalLead = await repos.leadsRepo.findById(lead.id);
+    expect(finalLead?.status).toBe("QUALIFIED_A"); // no state change -- still no booking activated
+    const outbound = await outboundMessages(repos, conversation.id);
+    expect(outbound).toHaveLength(1);
+    expect(outbound[0].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
   });
 });

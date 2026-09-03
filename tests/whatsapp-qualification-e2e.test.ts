@@ -10,6 +10,7 @@ import {
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import type { MessagingProvider, SendMessageResult } from "../src/application/ports.js";
 import { MessagingProviderError } from "../src/domain/errors.js";
+import { QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE } from "../src/domain/message-templates.js";
 import type { LeadStatus } from "../src/domain/lead.js";
 
 function sign(body: string, secret: string): string {
@@ -436,8 +437,8 @@ describe("Phase 3B WhatsApp qualification -- CONTACTED-orphan recovery (FIX 3)",
     expect(messaging.sentTexts).toHaveLength(0); // no automated reply, same as today
   });
 
-  it.each<LeadStatus>(["HUMAN_HANDOFF", "QUALIFIED_A", "QUALIFIED_B", "NURTURE_C", "DO_NOT_CONTACT"])(
-    "C-G: a lead already at %s is never auto-reactivated by the recovery path",
+  it.each<LeadStatus>(["HUMAN_HANDOFF", "DO_NOT_CONTACT"])(
+    "C-D: a lead already at %s is never auto-reactivated by the recovery path (suppressed earlier, no reply at all)",
     async (status) => {
       const messaging = new FakeMessagingProvider();
       const repos = buildRepos();
@@ -449,10 +450,34 @@ describe("Phase 3B WhatsApp qualification -- CONTACTED-orphan recovery (FIX 3)",
       expect(res.statusCode).toBe(200);
 
       const lead = await repos.leadsRepo.findByDedupKey({ whatsappUserId: from });
-      expect(lead?.status).toBe(status); // unchanged -- HUMAN_HANDOFF/DO_NOT_CONTACT are
-      // suppressed even earlier (wasAlreadySuppressed), before the recovery branch is ever
-      // reached; QUALIFIED_A/B/NURTURE_C simply don't match its `status === "CONTACTED"` guard.
+      // Unchanged -- HUMAN_HANDOFF/DO_NOT_CONTACT are suppressed even earlier
+      // (wasAlreadySuppressed), before the recovery branch (or any other routing branch) is ever
+      // reached.
+      expect(lead?.status).toBe(status);
       expect(messaging.sentTexts).toHaveLength(0);
+    },
+  );
+
+  it.each<LeadStatus>(["QUALIFIED_A", "QUALIFIED_B", "NURTURE_C"])(
+    "E-G: a lead already at %s is never auto-reactivated by the CONTACTED-orphan recovery path, but still gets the qualified-lead generic fallback reply (production bug fix -- see QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE)",
+    async (status) => {
+      const messaging = new FakeMessagingProvider();
+      const repos = buildRepos();
+      const app = await buildTestApp({ messaging, qualificationEngineEnabled: true, ...repos }); // whatsappBookingEnabled defaults to false -- no bookingHandler
+      const from = `5214774000${(status.length % 10).toString()}0`; // deterministic per status, fresh repos each iteration
+      await createLeadAtStatus(repos, from, status, undefined);
+
+      const res = await send(app, from, `wamid.recover.${status}`, "3");
+      expect(res.statusCode).toBe(200);
+
+      const lead = await repos.leadsRepo.findByDedupKey({ whatsappUserId: from });
+      // Unchanged -- QUALIFIED_A/B/NURTURE_C simply don't match the recovery path's
+      // `status === "CONTACTED"` guard, so it's never reactivated into QUALIFYING by it. The
+      // reply below comes from the QUALIFIED_A/B/NURTURE_C generic-fallback branch instead
+      // (a completely separate code path from the CONTACTED-orphan recovery this test targets).
+      expect(lead?.status).toBe(status);
+      expect(messaging.sentTexts).toHaveLength(1);
+      expect(messaging.sentTexts[0].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
     },
   );
 

@@ -401,8 +401,20 @@ export async function handleInboundWhatsAppText(
       // only sends its own message when the handler's return value says it did nothing.
       // WhatsAppBookingHandler itself is deliberately NOT changed into a generic handler -- it
       // still only ever knows about booking; the fallback decision and copy live here.
-      if (deps.bookingHandler && (lead.status === "QUALIFIED_A" || lead.status === "QUALIFIED_B" || lead.status === "NURTURE_C")) {
-        const handledByBooking = await deps.bookingHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
+      //
+      // Bug fix (production, fiscal-context follow-up): the condition below used to be
+      // `deps.bookingHandler && (status===...)`, nesting the ENTIRE branch -- including the
+      // generic fallback above -- inside "booking is enabled". With WHATSAPP_BOOKING_ENABLED=false
+      // (bookingHandler absent), a QUALIFIED_A/B/NURTURE_C lead's free text fell through every
+      // remaining branch straight to "no-match": inbound persisted, zero outbound, silently. The
+      // f35a9f8 fallback was correct in design but unreachable whenever booking is off -- exactly
+      // the state this project is deployed with. Status alone now decides whether this lead OWES
+      // a reply; bookingHandler's presence only decides HOW that reply is produced (delegate vs.
+      // the fallback directly) -- booking itself is NOT activated by this fix.
+      if (lead.status === "QUALIFIED_A" || lead.status === "QUALIFIED_B" || lead.status === "NURTURE_C") {
+        const handledByBooking = deps.bookingHandler
+          ? await deps.bookingHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() })
+          : false;
         if (handledByBooking) {
           logBranch("qualified-or-nurture-booking", true);
         } else {
