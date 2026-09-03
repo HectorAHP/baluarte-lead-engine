@@ -1,6 +1,7 @@
 import { zonedTimeParts } from "./timezone.js";
 import type { OfferedSlot } from "./offered-slot.js";
 import { liaIntroLine, LIA_IDENTITY_ANSWER } from "./lia-identity.js";
+import { qualifiedLeadOptionsMenuOrder, type QualifiedLeadOptionsTopic } from "./qualified-lead-options-menu.js";
 
 /**
  * Deterministic, non-AI-generated copy for Phase 2 (transport + persistence only -- no
@@ -395,16 +396,26 @@ export function buildQualifiedLeadTopicAnswer(topic: "PPR" | "GMM" | "SAVINGS"):
   return `${QUALIFIED_LEAD_TOPIC_EXPLANATIONS[topic]}\n\n${QUALIFIED_LEAD_TOPIC_FOLLOWUPS[topic]}`;
 }
 
+const QUALIFIED_LEAD_OPTIONS_LABELS: Record<QualifiedLeadOptionsTopic, string> = {
+  PPR: "Retiro con beneficios fiscales",
+  SAVINGS: "Ahorro de largo plazo",
+  GMM: "Protección patrimonial",
+};
+
 /** Option "2" (EXPLORE_OPTIONS): a short, non-committal list of alternatives -- no product/company
  * names, no HOT/WARM/NURTURE, no scores or bands. `prioritizeRetirement` lets the caller put
  * PPR/retiro first when a fiscal context is available (see whatsapp-inbound-service.ts) -- the
  * ONLY way fiscal context is allowed to influence this reply in this phase. Ends on a question,
- * not a flat list. */
+ * not a flat list.
+ *
+ * Fase 6E.1: item order now comes from qualifiedLeadOptionsMenuOrder() (shared with
+ * qualified-lead-intent-detection.ts's digit resolution) instead of a private inline array --
+ * this is what a reply digit against THIS exact message is interpreted against; see that module's
+ * doc comment for why the two must never be allowed to drift apart again. */
 export function buildQualifiedLeadOptionsMessage(prioritizeRetirement: boolean): string {
-  const items = prioritizeRetirement
-    ? ["Retiro con beneficios fiscales", "Ahorro de largo plazo", "Protección patrimonial"]
-    : ["Ahorro de largo plazo", "Retiro con beneficios fiscales", "Protección patrimonial"];
-  return `Podemos revisar alternativas enfocadas en:\n\n${items.map((item, i) => `${i + 1}. ${item}`).join("\n")}\n\n¿Cuál te interesa revisar primero?`;
+  const order = qualifiedLeadOptionsMenuOrder(prioritizeRetirement);
+  const items = order.map((topic, i) => `${i + 1}. ${QUALIFIED_LEAD_OPTIONS_LABELS[topic]}`);
+  return `Podemos revisar alternativas enfocadas en:\n\n${items.join("\n")}\n\n¿Cuál te interesa revisar primero?`;
 }
 
 /** Option "3" (BOOKING) when WHATSAPP_BOOKING_ENABLED is false or bookingHandler otherwise didn't

@@ -11,7 +11,7 @@ import { isUpcomingBooked } from "../domain/appointment-timing.js";
 import { looksLikeFiscalCalculatorOrigin } from "../domain/fiscal-calculator-origin-detection.js";
 import { isFirstWhatsAppInboundForConversation } from "../domain/whatsapp-first-inbound.js";
 import { detectQualifiedLeadIntent } from "../domain/qualified-lead-intent-detection.js";
-import { resolvePendingQualifiedMenu, qualifiedMainMenuMetadata } from "../domain/qualified-lead-menu-state.js";
+import { resolvePendingQualifiedMenu, qualifiedMainMenuMetadata, qualifiedOptionsMenuMetadata } from "../domain/qualified-lead-menu-state.js";
 import { conversationalFirstName } from "../domain/conversation-name.js";
 import {
   buildWelcomeMessage, buildFiscalContextWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE,
@@ -442,7 +442,12 @@ export async function handleInboundWhatsAppText(
         // "quiero agendar una cita", never by the menu's own option "3".
         const priorMessages = await deps.messages.listByConversationId(conversationId);
         const pendingMenu = resolvePendingQualifiedMenu(priorMessages);
-        const intent = detectQualifiedLeadIntent(input.text, pendingMenu);
+        // Fase 6E.1: re-derived here, NOT persisted in metadata -- the OPTIONS submenu's item
+        // order depends only on fiscalContext (see qualified-lead-options-menu.ts's doc comment),
+        // and fiscalContext is already resolved above for this same lead/turn, so recomputing it
+        // here is guaranteed to match exactly what the lead was shown, without adding any
+        // financial/score data to the outbound message's metadata.
+        const intent = detectQualifiedLeadIntent(input.text, pendingMenu, !!fiscalContext);
 
         const handledByBooking = deps.bookingHandler
           ? await deps.bookingHandler.handleTurn({
@@ -477,7 +482,11 @@ export async function handleInboundWhatsAppText(
               // fiscalContext is the ONLY thing allowed to influence this reply, and only the
               // ORDER of options -- never HOT/WARM/NURTURE, never score, never bands, never
               // mentioned in the message itself.
-              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildQualifiedLeadOptionsMessage(!!fiscalContext));
+              // Fase 6E.1: marks this reply as the OPTIONS pending menu (qualifiedOptionsMenuMetadata()
+              // -- an opaque state identifier only, same shape as qualifiedMainMenuMetadata()) so a
+              // bare digit reply on the NEXT turn resolves against THIS submenu instead of falling
+              // through to UNKNOWN and re-showing the main menu (the Fase 6E.1 production bug).
+              await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildQualifiedLeadOptionsMessage(!!fiscalContext), qualifiedOptionsMenuMetadata());
               break;
             case "BOOKING":
               logBranch("qualified-or-nurture-booking-fallback", true);

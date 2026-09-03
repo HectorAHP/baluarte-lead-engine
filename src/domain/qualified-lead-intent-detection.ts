@@ -1,4 +1,5 @@
 import type { QualifiedLeadPendingMenu } from "./qualified-lead-menu-state.js";
+import { qualifiedLeadOptionsMenuOrder } from "./qualified-lead-options-menu.js";
 
 /**
  * Fase 6C -- deterministic, keyword/menu-digit based routing for a QUALIFIED_A/QUALIFIED_B/
@@ -50,7 +51,19 @@ function matchBareDigit(normalized: string): 1 | 2 | 3 | null {
   return m ? (Number(m[1]) as 1 | 2 | 3) : null;
 }
 
-export function detectQualifiedLeadIntent(rawText: string, pendingMenu: QualifiedLeadPendingMenu | null): QualifiedLeadIntent {
+/**
+ * `optionsMenuPrioritizeRetirement` mirrors the EXACT same flag the OPTIONS submenu was rendered
+ * with (see message-templates.ts's buildQualifiedLeadOptionsMessage / whatsapp-inbound-service.ts's
+ * `!!fiscalContext`) -- required to correctly map a bare digit back to a topic, since that menu's
+ * item order is NOT fixed (see qualified-lead-options-menu.ts's doc comment for why). Only
+ * consulted when `pendingMenu === "OPTIONS"`; ignored otherwise, so every existing call site that
+ * only ever sees pendingMenu "MAIN" or null keeps working unchanged with the default.
+ */
+export function detectQualifiedLeadIntent(
+  rawText: string,
+  pendingMenu: QualifiedLeadPendingMenu | null,
+  optionsMenuPrioritizeRetirement = false,
+): QualifiedLeadIntent {
   const normalized = normalize(rawText);
 
   // Checked first: a meta-question about Lía herself always wins, regardless of pendingMenu.
@@ -72,6 +85,21 @@ export function detectQualifiedLeadIntent(rawText: string, pendingMenu: Qualifie
     if (digit === 1) return { kind: "MENU_QUESTION" };
     if (digit === 2) return { kind: "EXPLORE_OPTIONS" };
     if (digit === 3) return { kind: "BOOKING" };
+  }
+
+  // Fase 6E.1: the OPTIONS submenu's own digit reply -- resolved as a QUESTION for whichever
+  // topic that digit actually pointed to (same order the lead was just shown), so it's answered
+  // via the SAME existing buildQualifiedLeadTopicAnswer copy the free-text keyword path above
+  // already uses -- no new reply copy needed, and (deliberately) no qualifiedMainMenuMetadata()
+  // gets attached to that reply, so the OPTIONS state is naturally consumed: a bare digit on the
+  // turn AFTER this one is ambiguous again (falls through to UNKNOWN), never stuck answering "1"
+  // as PPR forever (item 6/7 of the Fase 6E.1 spec).
+  if (pendingMenu === "OPTIONS") {
+    const digit = matchBareDigit(normalized);
+    if (digit) {
+      const topic = qualifiedLeadOptionsMenuOrder(optionsMenuPrioritizeRetirement)[digit - 1];
+      if (topic) return { kind: "QUESTION", topic };
+    }
   }
 
   return { kind: "UNKNOWN" };
