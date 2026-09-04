@@ -200,14 +200,18 @@ describe("Fase 6E.1 -- qualified-lead OPTIONS submenu state fix", () => {
     expect(deps.messaging.sentTexts[2].body).toBe(buildQualifiedLeadAskQuestionMessage(true));
   });
 
-  it("10. a bare '1' with NO pending menu at all is not interpreted as retiro", async () => {
+  it("10. a bare '1' right after the FISCAL welcome resolves against THAT menu (Fase 6E.4: 1=SAVINGS there, never PPR) -- not the qualified router's own MAIN menu, which was never shown", async () => {
     const deps = makeDeps();
-    await seedQualifiedAFiscalLeadWithWelcome(deps, "4776500010", "5214776500010"); // welcome only, no menu shown yet
+    await seedQualifiedAFiscalLeadWithWelcome(deps, "4776500010", "5214776500010"); // fiscal welcome only, no QUALIFIED MAIN/OPTIONS menu shown yet
 
     await send(deps, "5214776500010", "4776500010", "wamid.10a", "1");
 
+    // Fase 6E.4: the fiscal welcome's own 1-4 menu (1=SAVINGS/2=PPR/3=GMM/4=OTHER) is now a real,
+    // tracked pending state -- "1" correctly resolves to SAVINGS, never guessed as PPR (digit 2
+    // there), and never the qualified router's unrelated MAIN menu (never shown for this lead).
     expect(deps.messaging.sentTexts[1].body).not.toBe(buildQualifiedLeadTopicAnswer("PPR"));
-    expect(deps.messaging.sentTexts[1].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+    expect(deps.messaging.sentTexts[1].body).not.toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+    expect(deps.messaging.sentTexts[1].body).toBe(buildQualifiedLeadTopicAnswer("SAVINGS"));
   });
 
   it("11. fiscal context (fiscal_v1 HOT/90) is untouched by the full MAIN -> OPTIONS -> topic flow", async () => {

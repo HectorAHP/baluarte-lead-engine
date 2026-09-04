@@ -376,7 +376,23 @@ export class SlotOfferingService {
       if (entry.toStatus !== "BOOKING_PENDING") continue;
       if (!latest || entry.createdAt > latest) latest = entry.createdAt;
     }
-    return latest;
+    if (!latest) return undefined;
+    // Fase 6E.4 hardening: fetchAndPersistRound persists round 1's offered_slots rows BEFORE
+    // calling ensureOfferableLeadStatus (persistence-before-state-transition, by design -- see the
+    // class doc comment's "RESIDUAL RISK" section), so round 1's own createdAt is DETERMINISTICALLY
+    // a little EARLIER than the lead_status_history row this method reads (both stamped with a
+    // fresh `new Date()` at write time, never the frozen business-time `now` param -- sequential
+    // awaited code guarantees round 1's timestamp <= the transition's, never the reverse, but the
+    // GAP between them is whatever that DB write actually takes -- sub-millisecond in memory, up
+    // to real network latency against Supabase in production). A strict `created_at >= latest`
+    // comparison therefore excludes round 1 from its OWN episode's count -- confirmed by a genuine
+    // test failure (see the Fase 6E.4 report, item on this hardening). Fixed with a safety margin
+    // generous enough to cover realistic same-request latency (a slow DB write, GC pause, etc.)
+    // while staying far shorter than the real-world gap between two SEPARATE episodes (the first
+    // appointment must actually conclude, or the lead must abandon and return, before a second
+    // episode's round 1 is ever created -- minutes to days, never single-digit seconds).
+    const EPISODE_BOUNDARY_MARGIN_MS = 2000;
+    return new Date(latest.getTime() - EPISODE_BOUNDARY_MARGIN_MS);
   }
 
   private async resolveReused(lead: Lead, now: Date, conversationId: string, activeSlots: OfferedSlot[], mode?: SlotOfferParams["mode"]): Promise<SlotOfferOutcome> {

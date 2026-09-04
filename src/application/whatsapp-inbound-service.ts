@@ -12,12 +12,14 @@ import { looksLikeFiscalCalculatorOrigin } from "../domain/fiscal-calculator-ori
 import { isFirstWhatsAppInboundForConversation } from "../domain/whatsapp-first-inbound.js";
 import { detectQualifiedLeadIntent } from "../domain/qualified-lead-intent-detection.js";
 import { resolvePendingQualifiedMenu, qualifiedMainMenuMetadata, qualifiedOptionsMenuMetadata } from "../domain/qualified-lead-menu-state.js";
+import { fiscalWelcomeMenuMetadata, resolvePendingFiscalWelcomeMenu, detectFiscalWelcomeDigit } from "../domain/fiscal-welcome-menu-state.js";
+import { topicFollowupMetadata } from "../domain/qualified-lead-topic-followup.js";
 import { conversationalFirstName } from "../domain/conversation-name.js";
 import {
   buildWelcomeMessage, buildFiscalContextWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE,
   BOOKED_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, buildQualifiedLeadAskQuestionMessage,
   buildQualifiedLeadTopicAnswer, buildQualifiedLeadOptionsMessage, QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE,
-  QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE,
+  QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE, FISCAL_WELCOME_OTHER_TOPIC_MESSAGE,
 } from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
 import { getFiscalLeadContextForLead, type FiscalLeadContext } from "./fiscal-lead-context.js";
@@ -361,10 +363,15 @@ export async function handleInboundWhatsAppText(
         // suggests fiscal-calculator origin (the prefilled CTA text or a close variant). Any
         // other combination (no fiscalContext, or a first message that doesn't mention it) sends
         // the exact same buildWelcomeMessage as before this phase -- unchanged.
-        const welcomeBody = fiscalContext && looksLikeFiscalCalculatorOrigin(input.text)
+        const isFiscalWelcome = !!(fiscalContext && looksLikeFiscalCalculatorOrigin(input.text));
+        const welcomeBody = isFiscalWelcome
           ? buildFiscalContextWelcomeMessage(conversationalFirstName(lead))
           : buildWelcomeMessage(conversationalFirstName(lead));
-        await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, welcomeBody);
+        // Fase 6E.4: marks the FISCAL variant with fiscalWelcomeMenuMetadata() so a follow-up
+        // digit/keyword reply always resolves correctly, regardless of lead.status -- see the
+        // Fase 6E.4 report's root-cause trace. Deliberately scoped to the fiscal variant only
+        // (plain buildWelcomeMessage is untouched, out of scope for this phase).
+        await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, welcomeBody, isFiscalWelcome ? fiscalWelcomeMenuMetadata() : undefined);
         if (deps.qualificationHandler) {
           await deps.qualificationHandler.beginQualification(leadId);
         }
@@ -384,8 +391,54 @@ export async function handleInboundWhatsAppText(
       // sending exactly one extra acknowledgment message, nothing else.
       if (!wasNew && fiscalContext && isFirstWhatsAppInbound && looksLikeFiscalCalculatorOrigin(input.text)) {
         logBranch("existing-lead-first-whatsapp-fiscal-welcome", true);
-        await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildFiscalContextWelcomeMessage(conversationalFirstName(lead)));
+        await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildFiscalContextWelcomeMessage(conversationalFirstName(lead)), fiscalWelcomeMenuMetadata());
         return;
+      }
+      // Fase 6E.4: resolves a reply to the fiscal welcome's own 1-4 menu -- checked BEFORE every
+      // status-based branch below, so it can never depend on which one (if any) would otherwise
+      // apply. ROOT CAUSE this closes: a fiscal-calculator lead's status at the moment of their
+      // follow-up reply can be NEW, CONTACTED (e.g. an advisor already called them via POST
+      // /api/leads/:id/contact, unrelated to WhatsApp), QUALIFYING, QUALIFIED_A/B, or NURTURE_C --
+      // and for the CONTACTED-with-productInterest-already-set shape specifically (impuestos.html's
+      // own payload always sets productInterest="Beneficio fiscal PPR"), NO branch in this pipeline
+      // ever claimed the reply before this fix (confirmed reproduced -- see the Fase 6E.4 report,
+      // item 1). Only ever reached on a turn AFTER the fiscal welcome was actually sent (never on
+      // the trigger message itself, which is handled by the two branches immediately above).
+      if (fiscalContext && !isFirstWhatsAppInbound) {
+        const priorMessagesForFiscalMenu = await deps.messages.listByConversationId(conversationId);
+        if (resolvePendingFiscalWelcomeMenu(priorMessagesForFiscalMenu)) {
+          const digitSelection = detectFiscalWelcomeDigit(input.text);
+          if (digitSelection?.kind === "TOPIC") {
+            logBranch(`fiscal-welcome-menu-${digitSelection.topic.toLowerCase()}`, true);
+            // Fase 6E.3 reuse: PPR/GMM answers end by marking topicFollowupMetadata() so a
+            // following "1"/"2"/"sí"/"ok" resolves naturally against THAT question -- same
+            // mechanism, same reasoning, as WhatsAppPastBookedRecoveryHandler. SAVINGS has no
+            // wired follow-up (its own question is open-ended, not a two-branch choice -- see
+            // qualified-lead-topic-followup.ts's doc comment), so it carries no metadata: the
+            // FISCAL_WELCOME_MENU state is simply consumed (item 8).
+            const followupMetadata = digitSelection.topic === "PPR" || digitSelection.topic === "GMM" ? topicFollowupMetadata(digitSelection.topic) : undefined;
+            await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildQualifiedLeadTopicAnswer(digitSelection.topic), followupMetadata);
+            return;
+          }
+          if (digitSelection?.kind === "OTHER") {
+            logBranch("fiscal-welcome-menu-other", true);
+            await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, FISCAL_WELCOME_OTHER_TOPIC_MESSAGE);
+            return;
+          }
+          // Fase 6E.4, item 9: free text ("quiero saber del PPR", "gastos médicos", "ahorro")
+          // resolves semantically even while this menu is pending -- reuses the qualified
+          // router's own deterministic keyword detection, never AI.
+          const freeTextIntent = detectQualifiedLeadIntent(input.text, null);
+          if (freeTextIntent.kind === "QUESTION") {
+            logBranch(`fiscal-welcome-menu-freetext-${freeTextIntent.topic.toLowerCase()}`, true);
+            const followupMetadata = freeTextIntent.topic === "PPR" || freeTextIntent.topic === "GMM" ? topicFollowupMetadata(freeTextIntent.topic) : undefined;
+            await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, buildQualifiedLeadTopicAnswer(freeTextIntent.topic), followupMetadata);
+            return;
+          }
+          // Genuinely unrecognized (neither a 1-4 digit nor a known topic keyword) -- never
+          // guessed at, never silently dropped either: falls through to whatever status-based
+          // branch below would otherwise apply (e.g. the qualification engine, if QUALIFYING).
+        }
       }
       if (deps.qualificationHandler && lead.status === "QUALIFYING") {
         logBranch("qualifying-turn", true);

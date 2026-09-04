@@ -91,8 +91,20 @@ async function outboundMessages(repos: ReturnType<typeof buildRepos>, conversati
   const messages = await repos.messagesRepo.listByConversationId(conversationId);
   return messages.filter((m) => m.direction === "OUTBOUND");
 }
-/** Seeds N DISTINCT, EXPIRED, plain-booking-mode rounds -- simulates a prior, already-concluded
- * episode's history without needing to run real booking turns first. */
+/**
+ * Seeds N DISTINCT, EXPIRED, plain-booking-mode rounds -- simulates a prior, already-concluded
+ * episode's history without needing to run real booking turns first.
+ *
+ * NOTE: InMemoryOfferedSlotRepository.createMany always stamps `createdAt` with a fresh
+ * `new Date()` at insert time (never a caller-supplied value -- `past` below only affects the
+ * business fields slotStart/slotEnd/expiresAt, matching production's real repository contract).
+ * SlotOfferingService.episodeScopedSince (Fase 6E.3.1, hardened Fase 6E.4) scopes the round cap
+ * using a 2-second safety margin against real-request timestamp skew -- so these "historical"
+ * rows must genuinely be created MORE than 2 seconds before the new episode starts, or they'd be
+ * (correctly, by design) still counted as belonging to it. The explicit wait below is what makes
+ * that true, mirroring the real-world gap (minutes to days) a genuinely concluded prior episode
+ * would always have -- never a workaround, an honest representation of it.
+ */
 async function seedHistoricalRounds(repos: ReturnType<typeof buildRepos>, conversationId: string, leadId: string, count: number) {
   const past = new Date(Date.now() - 60 * 60 * 1000);
   for (let round = 0; round < count; round++) {
@@ -102,6 +114,7 @@ async function seedHistoricalRounds(repos: ReturnType<typeof buildRepos>, conver
     }));
     await repos.offeredSlotsRepo.createMany(rows);
   }
+  await new Promise((resolve) => setTimeout(resolve, 2200)); // > episodeScopedSince's 2000ms margin
 }
 const PAST_STARTS_AT = new Date("2020-01-15T15:00:00.000Z");
 const PAST_ENDS_AT = new Date("2020-01-15T15:30:00.000Z");

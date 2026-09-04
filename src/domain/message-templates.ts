@@ -406,6 +406,10 @@ export function buildQualifiedLeadTopicAnswer(topic: "PPR" | "GMM" | "SAVINGS"):
   return `${QUALIFIED_LEAD_TOPIC_EXPLANATIONS[topic]}\n\n${QUALIFIED_LEAD_TOPIC_FOLLOWUPS[topic]}`;
 }
 
+/** Fase 6E.4: option "4" (Otro tema) of the fiscal welcome's own menu -- open-ended, never a
+ * guess at what "otro tema" means. See fiscal-welcome-menu-state.ts. */
+export const FISCAL_WELCOME_OTHER_TOPIC_MESSAGE = "Cuéntame, ¿qué tema te gustaría revisar?";
+
 const QUALIFIED_LEAD_OPTIONS_LABELS: Record<QualifiedLeadOptionsTopic, string> = {
   PPR: "Retiro con beneficios fiscales",
   SAVINGS: "Ahorro de largo plazo",

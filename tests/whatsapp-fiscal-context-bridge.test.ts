@@ -455,9 +455,13 @@ describe("Production bug fix -- QUALIFIED_A/B/NURTURE_C follow-up must reply eve
     expect(result.outcome).toBe("PROCESSED");
 
     expect(deps.messaging.sentTexts).toHaveLength(2); // welcome + the follow-up reply
-    expect(deps.messaging.sentTexts[1].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+    // Fase 6E.4: the fiscal welcome now tracks its OWN pending menu (1=SAVINGS/2=PPR/3=GMM/
+    // 4=OTHER, checked before any status-based branch) -- "2" resolves directly to a real PPR
+    // answer, never the generic qualified-router fallback (that branch is only reached once the
+    // fiscal-welcome-menu state has already been consumed -- see test below).
+    expect(deps.messaging.sentTexts[1].body).toBe(buildQualifiedLeadTopicAnswer("PPR"));
 
-    const branchLog = deps.logger.warnings.find((w) => w.details.branch === "qualified-or-nurture-generic-fallback");
+    const branchLog = deps.logger.warnings.find((w) => w.details.branch === "fiscal-welcome-menu-ppr");
     expect(branchLog).toBeTruthy();
 
     // Fiscal/A-B-C separation and lifecycle stay untouched by this fix.
@@ -487,7 +491,11 @@ describe("Production bug fix -- QUALIFIED_A/B/NURTURE_C follow-up must reply eve
     await handleInboundWhatsAppText(deps, baseInput({ whatsappUserId: "5214772222223", phoneRaw: "4772222223", providerMessageId: "wamid.followup-3b", text: "¿Cuánto cuesta?" }));
 
     expect(deps.messaging.sentTexts).toHaveLength(3); // welcome + 2 follow-up replies
-    expect(deps.messaging.sentTexts[1].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+    // Fase 6E.4: "2" resolves via the fiscal-welcome-menu state (real PPR answer), which is then
+    // CONSUMED (item 8) -- the second, genuinely unrecognized reply ("¿Cuánto cuesta?") has no
+    // fiscal-welcome-menu state left to resolve against, so it correctly falls through to the
+    // qualified router's own generic fallback -- never silent, still not a one-shot.
+    expect(deps.messaging.sentTexts[1].body).toBe(buildQualifiedLeadTopicAnswer("PPR"));
     expect(deps.messaging.sentTexts[2].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
   });
 
