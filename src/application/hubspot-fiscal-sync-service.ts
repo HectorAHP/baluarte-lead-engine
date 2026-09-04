@@ -125,7 +125,10 @@ export class HubSpotFiscalSyncService {
           leadIdLast8: lead.id.slice(-8),
           submissionIdLast8: input.submissionId.slice(-8),
           hubspotOperation: "upsert_contact",
-          hubspotOutcome: result.created ? "created" : "updated",
+          // Fase 6F.3: "conflict_recovered" is its own distinct outcome (not lumped into
+          // "updated") so a recovered 409 stays visible in observability -- see
+          // RealHubSpotCRMProvider.recoverFromConcurrentCreateConflict.
+          hubspotOutcome: result.recoveredFromConflict ? "conflict_recovered" : result.created ? "created" : "updated",
         },
         "hubspot fiscal sync succeeded",
       );

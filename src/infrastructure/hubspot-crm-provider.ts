@@ -14,6 +14,24 @@ import { HubSpotProviderError } from "../domain/errors.js";
  * values. There is therefore no separate retry/idempotency-key bookkeeping needed at this layer;
  * see HubSpotFiscalSyncService's class doc comment for the full rationale.
  *
+ * Fase 6F.3 -- CONCURRENT-CREATE (HTTP 409) RECOVERY. Confirmed production root cause: this
+ * class's own CREATE path races impuestos.html's parallel, independent Forms API call (the dual
+ * write architecture -- see HubSpotFiscalSyncService's class doc comment). Sequence observed:
+ *   1. searchContactId("email", ...) -- not found yet (Forms API hasn't landed).
+ *   2. searchContactId("phone", ...) -- also not found.
+ *   3. This class decides CREATE.
+ *   4. Forms API's own contact-creation call wins the race, landing first.
+ *   5. This class's CREATE then hits HubSpot's own duplicate-property conflict -> HTTP 409.
+ * Before this fix, that 409 propagated straight up as HubSpotProviderError, caught (fail-open) by
+ * HubSpotFiscalSyncService and only logged -- the contact existed (via Forms API) but NONE of the
+ * bc_fiscal_* properties were ever applied to it. Fixed: a 409 on CREATE specifically is treated
+ * as "someone else just created this contact" -- re-search ONCE (same email-then-phone priority,
+ * never a loop, never unbounded retries) and, if found, UPDATE it with the full property set
+ * instead. If the re-search still finds nothing, the original 409 propagates as a genuine,
+ * unrecovered error (fail-open still applies at the caller). Recovery never inspects HubSpot's
+ * response body -- only the HTTP status code (409) plus a fresh, deterministic search, matching
+ * this project's "never parse PII/tokens out of an error body" rule.
+ *
  * SECURITY: the Private App token is read once at construction from config (never logged, never
  * echoed back to any caller) and sent only as an Authorization header to api.hubapi.com. Every
  * thrown HubSpotProviderError carries only an HTTP status and a static message -- never the raw
@@ -69,6 +87,16 @@ export class RealHubSpotCRMProvider implements HubSpotCRMProvider {
     return res.results?.[0]?.id ?? null;
   }
 
+  /** Deterministic dedupe priority: normalized email, then normalized phone -- see class doc
+   * comment and the Fase 6F report, item 9. Shared by the initial lookup AND the Fase 6F.3
+   * post-409 recovery re-search -- the EXACT same order both times, never a different rule. */
+  private async findExistingContactId(input: HubSpotContactUpsertInput): Promise<string | null> {
+    let existingId: string | null = null;
+    if (input.email) existingId = await this.searchContactId("email", input.email);
+    if (!existingId && input.phone) existingId = await this.searchContactId("phone", input.phone);
+    return existingId;
+  }
+
   async upsertContact(input: HubSpotContactUpsertInput): Promise<HubSpotContactUpsertResult> {
     const properties: Record<string, string | number | boolean> = { ...input.properties };
     if (input.email) properties.email = input.email;
@@ -78,21 +106,56 @@ export class RealHubSpotCRMProvider implements HubSpotCRMProvider {
     if (input.city) properties.city = input.city;
     if (input.state) properties.state = input.state;
 
-    // Deterministic dedupe priority: normalized email, then normalized phone -- see class doc
-    // comment and the Fase 6F report, item 9.
-    let existingId: string | null = null;
-    if (input.email) existingId = await this.searchContactId("email", input.email);
-    if (!existingId && input.phone) existingId = await this.searchContactId("phone", input.phone);
+    const existingId = await this.findExistingContactId(input);
 
     if (existingId) {
       await this.request(`/crm/v3/objects/contacts/${existingId}`, { method: "PATCH", body: { properties } });
       return { hubspotContactId: existingId, created: false };
     }
 
-    const created = await this.request<{ id: string }>("/crm/v3/objects/contacts", {
-      method: "POST",
-      body: { properties },
-    });
-    return { hubspotContactId: created.id, created: true };
+    try {
+      const created = await this.request<{ id: string }>("/crm/v3/objects/contacts", {
+        method: "POST",
+        body: { properties },
+      });
+      return { hubspotContactId: created.id, created: true };
+    } catch (err) {
+      // Fase 6F.3: a 409 on CREATE specifically -- and ONLY a 409 -- is treated as "someone else
+      // (almost always impuestos.html's own parallel Forms API call) just created this exact
+      // contact between our search and our create". Any other error (network failure, 5xx,
+      // etc.) propagates unchanged, exactly as before this fix.
+      if (err instanceof HubSpotProviderError && err.httpStatus === 409) {
+        return this.recoverFromConcurrentCreateConflict(input, properties);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Bounded, one-shot recovery for a CREATE that lost the race to a concurrent contact creation
+   * (see the class doc comment for the confirmed production root cause). Re-searches ONCE, in the
+   * SAME deterministic order as the initial lookup -- never a retry loop, never a second attempt
+   * if this one also fails to locate the contact. Never inspects HubSpot's response body -- the
+   * 409 status code plus a fresh, deterministic search is the entire recovery signal (this
+   * project's "never parse PII/tokens out of an error body" rule).
+   */
+  private async recoverFromConcurrentCreateConflict(
+    input: HubSpotContactUpsertInput,
+    properties: Record<string, string | number | boolean>,
+  ): Promise<HubSpotContactUpsertResult> {
+    const recoveredId = await this.findExistingContactId(input);
+    if (!recoveredId) {
+      // The 409 said a conflicting contact exists, but our own deterministic search (by the
+      // SAME email/phone we just tried to create with) still can't find it -- a genuinely
+      // inconsistent state (e.g. a conflict on a property this search doesn't key on). Never
+      // guessed at further; surfaces as a real, unrecovered error to the caller (fail-open still
+      // applies there -- see HubSpotFiscalSyncService).
+      throw new HubSpotProviderError(
+        "HubSpot contact CREATE conflicted (409) but the follow-up search found no matching contact",
+        { httpStatus: 409 },
+      );
+    }
+    await this.request(`/crm/v3/objects/contacts/${recoveredId}`, { method: "PATCH", body: { properties } });
+    return { hubspotContactId: recoveredId, created: false, recoveredFromConflict: true };
   }
 }

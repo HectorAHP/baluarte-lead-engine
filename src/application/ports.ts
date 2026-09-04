@@ -290,6 +290,16 @@ export interface HubSpotContactUpsertResult {
    * an existing one (by normalized email, then normalized phone -- see the real adapter's doc
    * comment for the exact search order). */
   created: boolean;
+  /**
+   * Fase 6F.3: true only when the initial CREATE attempt hit an HTTP 409 (HubSpot's own
+   * duplicate/conflict signal -- almost always impuestos.html's parallel Forms API call winning
+   * the race to create the same contact first, see the dual-write architecture) and this call
+   * recovered by re-searching and updating the now-existing contact instead. Always accompanies
+   * `created: false` -- exists as its own flag purely so callers can log the more specific
+   * "conflict_recovered" outcome instead of an indistinguishable plain "updated". Never set when
+   * `created` is true, and undefined/false for every ordinary (non-conflicting) update.
+   */
+  recoveredFromConflict?: boolean;
 }
 export interface HubSpotCRMProvider {
   upsertContact(input: HubSpotContactUpsertInput): Promise<HubSpotContactUpsertResult>;
