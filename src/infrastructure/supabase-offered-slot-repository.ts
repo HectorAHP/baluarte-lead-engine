@@ -104,12 +104,14 @@ export class SupabaseOfferedSlotRepository implements OfferedSlotRepository {
    * belonging to the conversation and dedupes here, in application code. Correct (if it fetches
    * a few more values than strictly needed) beats a plausible-looking but wrong pseudo-aggregate.
    */
-  async listRoundIdsByConversationId(conversationId: string, rescheduleContextId?: string): Promise<string[]> {
+  async listRoundIdsByConversationId(conversationId: string, rescheduleContextId?: string, since?: Date): Promise<string[]> {
     let query = this.client.from("offered_slots").select("round_id").eq("conversation_id", conversationId);
     // Scoped by booking context (Phase 4C): undefined counts only booking-mode rounds
     // (reschedule_context_id IS NULL); a value counts only rounds tagged with that exact
     // reschedule context. Never a mix of both -- see ports.ts's doc comment.
     query = rescheduleContextId === undefined ? query.is("reschedule_context_id", null) : query.eq("reschedule_context_id", rescheduleContextId);
+    // Fase 6E.3.1: optional episode-start filter -- see ports.ts's doc comment.
+    if (since !== undefined) query = query.gte("created_at", since.toISOString());
     const { data, error } = await query;
     if (error) throw new Error(`SUPABASE_OFFERED_SLOT_LIST_ROUNDS_FAILED: ${error.message}`);
     return [...new Set((data as Array<{ round_id: string }>).map((row) => row.round_id))];

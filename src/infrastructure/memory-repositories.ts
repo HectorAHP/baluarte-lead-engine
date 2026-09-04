@@ -230,10 +230,10 @@ export class InMemoryOfferedSlotRepository implements OfferedSlotRepository{
       .sort((a,b)=>a.position-b.position);
   }
 
-  async listRoundIdsByConversationId(conversationId:string,rescheduleContextId?:string):Promise<string[]>{
+  async listRoundIdsByConversationId(conversationId:string,rescheduleContextId?:string,since?:Date):Promise<string[]>{
     const ids=new Set<string>();
     for(const s of this.data.values()){
-      if(s.conversationId===conversationId && s.rescheduleContextId===rescheduleContextId) ids.add(s.roundId);
+      if(s.conversationId===conversationId && s.rescheduleContextId===rescheduleContextId && (since===undefined || s.createdAt>=since)) ids.add(s.roundId);
     }
     return [...ids];
   }

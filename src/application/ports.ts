@@ -151,8 +151,18 @@ export interface OfferedSlotRepository {
    * undefined (the default, unchanged Phase 3C behavior) counts only rounds with
    * reschedule_context_id IS NULL (booking-mode rounds); passing a value counts only rounds
    * tagged with that exact reschedule_context_id. Never a mix of both.
+   *
+   * Fase 6E.3.1: `since`, when given, further restricts the count to rounds whose offered_slots
+   * rows were created AT OR AFTER that instant (`created_at >= since`) -- omitted/undefined counts
+   * every matching round ever, unchanged. Used by SlotOfferingService to scope a plain-booking-mode
+   * round's cap to the CURRENT booking episode (the most recent "-> BOOKING_PENDING" transition in
+   * lead_status_history) instead of the conversation's entire lifetime -- see that class's
+   * currentEpisodeStart() doc comment for the full root-cause/rationale. Never combined with a
+   * non-undefined rescheduleContextId in practice (reschedule already has its own, orthogonal,
+   * context-id-based scoping and has no need for a time filter too), but implementations must
+   * still honor both filters together if ever called that way.
    */
-  listRoundIdsByConversationId(conversationId:string,rescheduleContextId?:string):Promise<string[]>;
+  listRoundIdsByConversationId(conversationId:string,rescheduleContextId?:string,since?:Date):Promise<string[]>;
 }
 export interface SlotOfferClaimRepository {
   /** Wins outright (INSERT succeeds) or returns null on a PK conflict (conversation_id already

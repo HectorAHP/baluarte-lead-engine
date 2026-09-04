@@ -127,32 +127,34 @@ export interface SlotOfferParams {
    */
   mode?: { type: "RESCHEDULE"; oldAppointmentId: string };
   /**
-   * Fase 6E.3: when true, skips the `roundIds.length >= MAX_OFFER_ROUNDS` check for THIS call
-   * only. ONLY ever passed by WhatsAppPastBookedRecoveryHandler.startNewBooking.
+   * Fase 6E.3, narrowed by Fase 6E.3.1: when true, skips the round-cap check for THIS call only.
+   * ONLY ever passed by WhatsAppPastBookedRecoveryHandler.startNewBooking, for round 1 of a brand
+   * new booking episode.
    *
-   * ROOT CAUSE this closes: MAX_OFFER_ROUNDS (offered_slots.round_id, counted via
-   * listRoundIdsByConversationId) is scoped per CONVERSATION, cumulatively, forever -- it never
-   * resets, and it counts every round ever offered in plain booking mode, INCLUDING the rounds
-   * that led to a lead's ORIGINAL, now-already-concluded appointment. A lead whose first booking
-   * took 2-3 rounds to land on a slot they liked had therefore already exhausted (or nearly
-   * exhausted) that budget before ever attempting to rebook after their appointment passed -- their
-   * very first post-appointment "agendar" could immediately return MAX_ROUNDS_REACHED, which
-   * booking-outcome-dispatch.ts escalates straight to HUMAN_HANDOFF. This is the confirmed cause
-   * of the Fase 6E.3 report's item C ("Agendar" landing on HUMAN_HANDOFF instead of real
-   * availability).
+   * Fase 6E.3.1 UPDATE -- this is now only HALF the fix, not the whole one. The round-cap check
+   * itself (see getOrCreateOffer/replaceOffer below) is now scoped to the CURRENT booking episode
+   * via episodeScopedSince() -- see that method's doc comment for the full episode definition and
+   * root-cause trace. `skipRoundCap` remains necessary ONLY for a new episode's very FIRST round:
+   * at that exact moment the episode's own "-> BOOKING_PENDING" transition hasn't been recorded
+   * yet (it's recorded AFTER this check, as part of creating that very round), so
+   * episodeScopedSince() would still resolve to the PREVIOUS episode's boundary and incorrectly
+   * count its rounds. Every round AFTER the first, within the SAME episode, goes through
+   * WhatsAppBookingHandler.replaceOffer() -- which never passes this flag -- and is fully
+   * protected by the now-episode-scoped MAX_OFFER_ROUNDS cap (see the Fase 6E.3.1 report's round
+   * 1/2/3/4 test matrix for proof this is not an indefinite bypass).
    *
-   * A context-id-based fix (mirroring RESCHEDULE's `oldAppointmentId` scoping) was tried first and
-   * reverted: it requires every offered_slots row for this episode to carry a non-null
-   * reschedule_context_id, but WhatsAppBookingHandler's slot-selection lookup
+   * A context-id-based fix (mirroring RESCHEDULE's `oldAppointmentId` scoping) was tried first
+   * (Fase 6E.3) and reverted: it requires every offered_slots row for this episode to carry a
+   * non-null reschedule_context_id, but WhatsAppBookingHandler's slot-selection lookup
    * (listActiveByConversationId(conversationId, now), no context argument) only ever looks at
    * context-id-NULL rows -- so a context-scoped round would become invisible to slot selection,
    * silently breaking the booking it was supposed to enable. `skipRoundCap` avoids that failure
    * mode entirely: it changes NOTHING about what gets persisted (offered_slots.reschedule_context_id
    * stays exactly what plain booking mode would set it to -- null), so WhatsAppBookingHandler's
    * slot-selection lookup is completely unaffected. Every other caller (initial QUALIFIED_A/B
-   * booking, reschedule, CANCELLED reactivation) always omits this and keeps the existing cap,
-   * unchanged -- MAX_OFFER_ROUNDS itself, CalendarProvider, and the ALREADY_BOOKED anti-double-
-   * booking guard (still evaluated normally, see getOrCreateOffer below) are all untouched.
+   * booking, reschedule, CANCELLED reactivation) always omits this and keeps the existing
+   * (now episode-scoped) cap -- CalendarProvider and the ALREADY_BOOKED anti-double-booking guard
+   * (still evaluated normally, see getOrCreateOffer below) are untouched.
    */
   skipRoundCap?: boolean;
 }
@@ -258,7 +260,8 @@ export class SlotOfferingService {
     if (activeSlots.length > 0) return this.resolveReused(lead, now, conversationId, activeSlots, mode);
 
     if (!skipRoundCap) {
-      const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode));
+      const since = await this.episodeScopedSince(lead.id, mode);
+      const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode), since);
       if (roundIds.length >= MAX_OFFER_ROUNDS) return { type: "MAX_ROUNDS_REACHED" };
     }
 
@@ -301,7 +304,8 @@ export class SlotOfferingService {
     const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now, rescheduleContextIdOf(mode));
     assertSingleActiveRound(conversationId, activeSlots); // refuse to replace an already-inconsistent offer
 
-    const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode));
+    const since = await this.episodeScopedSince(lead.id, mode);
+    const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode), since);
     if (roundIds.length >= MAX_OFFER_ROUNDS) return { type: "MAX_ROUNDS_REACHED" };
 
     const availabilityResult = await this.claimAndCreateRound(lead, conversationId, now, mode);
@@ -321,6 +325,58 @@ export class SlotOfferingService {
     if (!allowed) {
       throw new LeadNotOfferableError(lead.id, lead.status);
     }
+  }
+
+  /**
+   * Fase 6E.3.1 -- BOOKING EPISODE definition and round-cap scoping.
+   *
+   * A "booking episode" is bounded by the lead's own persisted lifecycle, never inferred from
+   * message text: it BEGINS the moment ensureOfferableLeadStatus below performs a REAL transition
+   * into BOOKING_PENDING (recorded exactly once, as a lead_status_history row with
+   * eventType "BOOKING_OFFER_STARTED" -- see recordLeadStatusTransition), and implicitly ENDS
+   * whenever the lead later leaves BOOKING_PENDING for any reason (BOOKED on a successful
+   * selection, NURTURE_C/CANCELLED/etc. on abandonment) -- the NEXT transition back into
+   * BOOKING_PENDING starts a new episode with its own fresh boundary. No new column/table: this
+   * reuses lead_status_history exactly as it already exists (Phase 4A), never a migration.
+   *
+   * ROOT CAUSE this closes (Fase 6E.3.1): MAX_OFFER_ROUNDS was being enforced by counting EVERY
+   * offered_slots round ever created in plain booking mode for a conversation, with no time
+   * boundary -- so a round used by an already-CONCLUDED prior episode (e.g. the original booking
+   * that led to a now-past appointment) still counted against a LATER, unrelated episode's budget.
+   * skipRoundCap (Fase 6E.3) only ever patched this for the FIRST round of a new episode
+   * (WhatsAppPastBookedRecoveryHandler.startNewBooking) -- the SECOND, THIRD, ... round of that
+   * SAME new episode still went through WhatsAppBookingHandler's ordinary replaceOffer() call,
+   * which had no episode-scoping at all and could immediately re-trigger MAX_ROUNDS_REACHED
+   * (confirmed by a reproduction test BEFORE this fix -- see the Fase 6E.3.1 report, item 1).
+   *
+   * Fix: every plain-booking-mode round-count check (getOrCreateOffer AND replaceOffer) now
+   * passes `since` = the most recent "-> BOOKING_PENDING" lead_status_history timestamp, so
+   * MAX_OFFER_ROUNDS counts ONLY rounds created since the CURRENT episode began. `skipRoundCap`
+   * is still needed, unchanged, for round 1 specifically: at the moment that round's cap check
+   * would run, the NEW episode's own BOOKING_PENDING transition hasn't been recorded yet (it's
+   * recorded AFTER this check, inside claimAndCreateRound -> ensureOfferableLeadStatus), so
+   * `since` would still resolve to the OLD episode's boundary and incorrectly count the old
+   * episode's rounds -- skipRoundCap remains the correct, minimal way to let a genuinely NEW
+   * episode's first round through regardless of history. It can never be exploited to bypass the
+   * cap "indefinitely": every subsequent round within that same episode goes through
+   * WhatsAppBookingHandler's replaceOffer() (never skipRoundCap), which is now correctly
+   * episode-scoped and still enforces MAX_OFFER_ROUNDS=3 within the new episode (see the Fase
+   * 6E.3.1 report's round 1/2/3/4 test matrix).
+   *
+   * RESCHEDULE mode is deliberately untouched (`since` stays undefined for it): its round-cap is
+   * already correctly scoped by reschedule_context_id (a stable, per-episode identifier -- see
+   * SlotOfferParams.mode's doc comment), an orthogonal mechanism that predates this fix and needs
+   * no time filter on top of it.
+   */
+  private async episodeScopedSince(leadId: string, mode?: SlotOfferParams["mode"]): Promise<Date | undefined> {
+    if (mode?.type === "RESCHEDULE") return undefined;
+    const history = await this.leadStatusHistory.listByLeadId(leadId);
+    let latest: Date | undefined;
+    for (const entry of history) {
+      if (entry.toStatus !== "BOOKING_PENDING") continue;
+      if (!latest || entry.createdAt > latest) latest = entry.createdAt;
+    }
+    return latest;
   }
 
   private async resolveReused(lead: Lead, now: Date, conversationId: string, activeSlots: OfferedSlot[], mode?: SlotOfferParams["mode"]): Promise<SlotOfferOutcome> {
