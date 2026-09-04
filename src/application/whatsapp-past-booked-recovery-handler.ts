@@ -3,8 +3,12 @@ import { isCancellationRequest } from "../domain/cancellation-intent-detection.j
 import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
 import { detectQualifiedLeadIntent } from "../domain/qualified-lead-intent-detection.js";
-import { qualifiedOptionsMenuMetadata } from "../domain/qualified-lead-menu-state.js";
-import { pastBookedReactivationMetadata } from "../domain/past-booked-reactivation-state.js";
+import { qualifiedMainMenuMetadata, qualifiedOptionsMenuMetadata } from "../domain/qualified-lead-menu-state.js";
+import { pastBookedReactivationMetadata, hasPastBookedReactivationBeenShown } from "../domain/past-booked-reactivation-state.js";
+import {
+  resolvePendingTopicFollowup, detectFollowupBranch, buildFollowupBranchAnswer, buildFollowupClarifyMessage,
+  classifyShortResponse, topicFollowupMetadata, FOLLOWUP_CLOSING_MESSAGE, type QualifiedLeadFollowupTopic,
+} from "../domain/qualified-lead-topic-followup.js";
 import { sendAndPersistReply } from "./whatsapp-inbound-service.js";
 import { escalateToHuman, dispatchSlotOfferOutcome, type BookingOutcomeDeps } from "./booking-outcome-dispatch.js";
 import type { SlotOfferingService } from "./slot-offering-service.js";
@@ -12,7 +16,7 @@ import { ActiveOfferInconsistentError, SlotOfferClaimInProgressError } from "../
 import {
   PAST_BOOKED_GENERIC_INBOUND_MESSAGE, PAST_BOOKED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE, PAST_BOOKED_CANCELLATION_MESSAGE,
   RESCHEDULE_IN_PROGRESS_MESSAGE, RESCHEDULE_TECHNICAL_ERROR_MESSAGE, buildQualifiedLeadTopicAnswer, buildQualifiedLeadOptionsMessage,
-  QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE,
+  QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE,
 } from "../domain/message-templates.js";
 import { config } from "../config.js";
 
@@ -69,7 +73,10 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
     private readonly advisorTimezone: string = config.ADVISOR_TIMEZONE,
   ) {}
 
-  async handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date; hasFiscalContext?: boolean }): Promise<void> {
+  async handleTurn(params: {
+    lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date;
+    hasFiscalContext?: boolean;
+  }): Promise<void> {
     const { lead, conversationId, whatsappUserId, inboundText, now, hasFiscalContext = false } = params;
 
     // Guard: this handler only ever acts on a BOOKED lead. The caller (whatsapp-inbound-service.ts)
@@ -79,7 +86,8 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
 
     try {
       // Cancellation-intent -- non-destructive, idempotent: nothing exists to cancel. Checked
-      // FIRST so it can never be misread as anything else.
+      // FIRST so it can never be misread as anything else -- an explicit "cancelar" always wins,
+      // even mid-followup.
       if (isCancellationRequest(inboundText)) {
         await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, PAST_BOOKED_CANCELLATION_MESSAGE);
         return;
@@ -100,10 +108,49 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
       // needed (the intent is already unambiguous). Fase 6E.2: isNewBookingRequest now recognizes
       // a bare "agendar" (see that module's doc comment) -- this is THE fix for the reported
       // production loop, where the lead was told to type exactly this word and it was never
-      // recognized.
+      // recognized. Fase 6E.3: startNewBooking now passes skipRoundCap (see that method's doc
+      // comment) -- this is THE fix for "agendar" landing on HUMAN_HANDOFF instead of real
+      // availability.
       if (isNewBookingRequest(inboundText)) {
         await this.startNewBooking(lead, conversationId, whatsappUserId, now);
         return;
+      }
+
+      // Fase 6E.3: a pending topic-followup (e.g. PPR's "¿Quieres que te explique primero cómo
+      // funciona el beneficio fiscal o cómo se construye el ahorro para el retiro?") takes
+      // priority over generic intent detection, so a short reply ("1", "beneficio fiscal", "Sí",
+      // "Ok") resolves against THAT specific question instead of falling through to UNKNOWN and
+      // re-triggering PAST_BOOKED_GENERIC_INBOUND_MESSAGE -- the exact reported bug. Checked here
+      // (after the unambiguous cancellation/reschedule/booking keywords, before the generic
+      // detectQualifiedLeadIntent pass) because a genuinely unambiguous "cancelar"/"agendar" must
+      // always win, but a short/ambiguous reply must be interpreted against the pending question,
+      // never against a stale/nonexistent numbered menu.
+      const priorMessages = await this.deps.messages.listByConversationId(conversationId);
+      const pendingFollowup = resolvePendingTopicFollowup(priorMessages);
+      if (pendingFollowup) {
+        const branch = detectFollowupBranch(pendingFollowup, inboundText);
+        switch (branch) {
+          case "PRIMARY":
+          case "SECONDARY":
+            // Resolved -- state naturally consumed: this reply carries no followup metadata, so a
+            // LATER bare "1" is genuinely ambiguous again (item 7's "no interpretar dígitos fuera
+            // de contexto"), never reinterpreted as this same branch indefinitely.
+            await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildFollowupBranchAnswer(pendingFollowup, branch));
+            return;
+          case "CLARIFY_EXPLICIT":
+          case "CLARIFY_GENERIC":
+            // "Sí"/"Ok" -- ambiguous between the two branches on offer, so ask which one,
+            // KEEPING the same pending state (item 4: "Mantener el mismo pending state").
+            await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildFollowupClarifyMessage(pendingFollowup, branch), topicFollowupMetadata(pendingFollowup));
+            return;
+          case "CLOSING":
+            // "No"/"gracias" -- a closing remark, not a request for more detail. Consumes the
+            // pending state (no metadata on this reply), never past-booked.
+            await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, FOLLOWUP_CLOSING_MESSAGE);
+            return;
+          case "UNKNOWN":
+            break; // falls through to normal keyword detection below
+        }
       }
 
       // Fase 6E.2: reuses the qualified-lead router's own deterministic keyword detection (never
@@ -117,9 +164,18 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
       // de un menú que realmente haya sido mostrado").
       const intent = detectQualifiedLeadIntent(inboundText, null);
       switch (intent.kind) {
-        case "QUESTION":
-          await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildQualifiedLeadTopicAnswer(intent.topic));
+        case "QUESTION": {
+          // Fase 6E.3: PPR/GMM answers now END by marking topicFollowupMetadata() -- see that
+          // module's doc comment for why SAVINGS is deliberately excluded (its own follow-up
+          // question is open-ended, not a two-branch choice).
+          const followupTopic: QualifiedLeadFollowupTopic | undefined = intent.topic === "PPR" || intent.topic === "GMM" ? intent.topic : undefined;
+          await sendAndPersistReply(
+            this.deps, lead.id, conversationId, whatsappUserId,
+            buildQualifiedLeadTopicAnswer(intent.topic),
+            followupTopic ? topicFollowupMetadata(followupTopic) : undefined,
+          );
           return;
+        }
         case "EXPLORE_OPTIONS":
           await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildQualifiedLeadOptionsMessage(hasFiscalContext), qualifiedOptionsMenuMetadata());
           return;
@@ -135,27 +191,56 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
           return;
         case "MENU_QUESTION":
         case "UNKNOWN":
-          break; // falls through to the generic fallback below -- genuinely unrecognized text
+          break; // falls through to the short-response/generic fallback below
       }
 
-      // Generic inbound, no clear intent -- informative fallback only, no state change, no offer.
-      // Fase 6E.2: now marked with pastBookedReactivationMetadata() for message-history
-      // consistency with the established expectedIntent convention (see that module's doc
-      // comment) -- not currently consumed by any resolver, since every recognizable intent above
-      // already routes correctly on its own, every single turn.
-      await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, PAST_BOOKED_GENERIC_INBOUND_MESSAGE, pastBookedReactivationMetadata());
+      // Fase 6E.3, item 10: a short reply with NO pending followup state (sí/ok/va/perfecto or
+      // no/gracias) never falls back to PAST_BOOKED_GENERIC_INBOUND_MESSAGE -- these carry no
+      // content to explain the past appointment against. An affirmative-but-unspecified reply
+      // gets the same topic-agnostic redirect as an already-shown episode (below); a closing
+      // remark gets the shared closer, no metadata.
+      const shortResponse = classifyShortResponse(inboundText);
+      if (shortResponse === "CLOSING") {
+        await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, FOLLOWUP_CLOSING_MESSAGE);
+        return;
+      }
+      if (shortResponse === "AFFIRMATIVE") {
+        await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, qualifiedMainMenuMetadata());
+        return;
+      }
+
+      // Genuinely unrecognized text (never a short-response token). Fase 6E.3, item 6:
+      // PAST_BOOKED_GENERIC_INBOUND_MESSAGE is shown at most ONCE per reactivation episode -- once
+      // it has already appeared anywhere in this conversation's history, a LATER unrecognized
+      // reply gets the topic-agnostic QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE instead (never
+      // repeats "tu cita anterior ya pasó" after the lead has already engaged normally).
+      if (hasPastBookedReactivationBeenShown(priorMessages)) {
+        await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, qualifiedMainMenuMetadata());
+      } else {
+        await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, PAST_BOOKED_GENERIC_INBOUND_MESSAGE, pastBookedReactivationMetadata());
+      }
     } catch (err) {
       await this.handleError(err, lead, conversationId, whatsappUserId);
     }
   }
 
-  /** Reuses SlotOfferingService's BOOKED -> BOOKING_PENDING transition + audit event (see the
-   * class doc comment above) -- no bespoke transition-writing logic here. mode is omitted
-   * (booking mode, the default): the new offered_slots round gets reschedule_context_id IS NULL,
-   * a genuinely independent new booking, never counted against any prior round budget. The stale
-   * appointment row is never referenced, restored, or touched by any of this. */
+  /**
+   * Reuses SlotOfferingService's BOOKED -> BOOKING_PENDING transition + audit event (see the
+   * class doc comment above) -- no bespoke transition-writing logic here. mode is omitted (plain
+   * booking mode): the new offered_slots round gets reschedule_context_id IS NULL, exactly what
+   * WhatsAppBookingHandler's own slot-selection lookup expects to find -- unchanged from before
+   * Fase 6E.3. The stale appointment row is never referenced, restored, or touched by any of this.
+   *
+   * Fase 6E.3: passes `skipRoundCap: true` -- see SlotOfferParams.skipRoundCap's doc comment in
+   * slot-offering-service.ts for the full root-cause this closes (a rebooking attempt was
+   * inheriting the ORIGINAL, already-concluded booking's round count, which could immediately
+   * exhaust MAX_OFFER_ROUNDS and escalate straight to HUMAN_HANDOFF). Every call into this method
+   * is, by construction, a past-booked rebooking (the class-level `lead.status !== "BOOKED"`
+   * guard above already ensures that), so `skipRoundCap: true` is unconditional here -- there is
+   * no other kind of call this method ever makes.
+   */
   private async startNewBooking(lead: Lead, conversationId: string, whatsappUserId: string, now: Date): Promise<void> {
-    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now });
+    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, skipRoundCap: true });
     await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
   }
 

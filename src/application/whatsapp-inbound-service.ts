@@ -561,7 +561,10 @@ export async function handleInboundWhatsAppText(
           // fiscalContext is already resolved above for this same lead/turn, so this is the exact
           // same signal, never re-derived differently. Only affects the ORDER of an "opciones"
           // reply, never its content -- see WhatsAppPastBookedRecoveryHandler's doc comment.
-          await deps.pastBookedRecoveryHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date(), hasFiscalContext: !!fiscalContext });
+          await deps.pastBookedRecoveryHandler.handleTurn({
+            lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date(),
+            hasFiscalContext: !!fiscalContext,
+          });
           return;
         }
       }

@@ -126,6 +126,35 @@ export interface SlotOfferParams {
    * WhatsAppRescheduleHandler.handleIntentTurn finds the target appointment.
    */
   mode?: { type: "RESCHEDULE"; oldAppointmentId: string };
+  /**
+   * Fase 6E.3: when true, skips the `roundIds.length >= MAX_OFFER_ROUNDS` check for THIS call
+   * only. ONLY ever passed by WhatsAppPastBookedRecoveryHandler.startNewBooking.
+   *
+   * ROOT CAUSE this closes: MAX_OFFER_ROUNDS (offered_slots.round_id, counted via
+   * listRoundIdsByConversationId) is scoped per CONVERSATION, cumulatively, forever -- it never
+   * resets, and it counts every round ever offered in plain booking mode, INCLUDING the rounds
+   * that led to a lead's ORIGINAL, now-already-concluded appointment. A lead whose first booking
+   * took 2-3 rounds to land on a slot they liked had therefore already exhausted (or nearly
+   * exhausted) that budget before ever attempting to rebook after their appointment passed -- their
+   * very first post-appointment "agendar" could immediately return MAX_ROUNDS_REACHED, which
+   * booking-outcome-dispatch.ts escalates straight to HUMAN_HANDOFF. This is the confirmed cause
+   * of the Fase 6E.3 report's item C ("Agendar" landing on HUMAN_HANDOFF instead of real
+   * availability).
+   *
+   * A context-id-based fix (mirroring RESCHEDULE's `oldAppointmentId` scoping) was tried first and
+   * reverted: it requires every offered_slots row for this episode to carry a non-null
+   * reschedule_context_id, but WhatsAppBookingHandler's slot-selection lookup
+   * (listActiveByConversationId(conversationId, now), no context argument) only ever looks at
+   * context-id-NULL rows -- so a context-scoped round would become invisible to slot selection,
+   * silently breaking the booking it was supposed to enable. `skipRoundCap` avoids that failure
+   * mode entirely: it changes NOTHING about what gets persisted (offered_slots.reschedule_context_id
+   * stays exactly what plain booking mode would set it to -- null), so WhatsAppBookingHandler's
+   * slot-selection lookup is completely unaffected. Every other caller (initial QUALIFIED_A/B
+   * booking, reschedule, CANCELLED reactivation) always omits this and keeps the existing cap,
+   * unchanged -- MAX_OFFER_ROUNDS itself, CalendarProvider, and the ALREADY_BOOKED anti-double-
+   * booking guard (still evaluated normally, see getOrCreateOffer below) are all untouched.
+   */
+  skipRoundCap?: boolean;
 }
 
 /** Extracts the round-counting/tagging context id from a SlotOfferParams["mode"] -- undefined for
@@ -210,7 +239,7 @@ export class SlotOfferingService {
    * against MAX_OFFER_ROUNDS -- only an actual new round (Calendar query + createMany) does.
    */
   async getOrCreateOffer(params: SlotOfferParams): Promise<SlotOfferOutcome> {
-    const { lead, conversationId, now, mode } = params;
+    const { lead, conversationId, now, mode, skipRoundCap } = params;
     this.assertOfferable(lead, mode);
 
     if (mode?.type !== "RESCHEDULE") {
@@ -228,8 +257,10 @@ export class SlotOfferingService {
     const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now, rescheduleContextIdOf(mode));
     if (activeSlots.length > 0) return this.resolveReused(lead, now, conversationId, activeSlots, mode);
 
-    const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode));
-    if (roundIds.length >= MAX_OFFER_ROUNDS) return { type: "MAX_ROUNDS_REACHED" };
+    if (!skipRoundCap) {
+      const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode));
+      if (roundIds.length >= MAX_OFFER_ROUNDS) return { type: "MAX_ROUNDS_REACHED" };
+    }
 
     return this.claimAndCreateRound(lead, conversationId, now, mode);
   }

@@ -1,23 +1,36 @@
+import type { Message } from "./message.js";
+
 /**
  * Fase 6E.2 -- opaque outbound-message marker for the past-booked-recovery flow's generic
  * fallback (PAST_BOOKED_GENERIC_INBOUND_MESSAGE), mirroring qualified-lead-menu-state.ts's
  * qualifiedMainMenuMetadata()/qualifiedOptionsMenuMetadata() exactly: same `expectedIntent` key,
  * never PII, never score/band data.
  *
- * Unlike the qualified-lead router's MAIN/OPTIONS markers, nothing in this codebase currently
- * RESOLVES this marker back into pending-menu state: WhatsAppPastBookedRecoveryHandler's keyword
- * detection (isCancellationRequest / isRescheduleRequest / isNewBookingRequest /
- * detectQualifiedLeadIntent) runs unconditionally on every turn, because this flow never shows a
- * numbered 1/2/3 menu that would create bare-digit ambiguity (see that handler's doc comment) --
- * so there is no pending-menu state to reconstruct. This marker exists purely so the outbound
- * message history stays consistent with the established "every state-relevant reply carries an
- * opaque expectedIntent marker" convention, and so a future phase that DOES need to distinguish
- * "was this turn a reply to the past-booked prompt specifically" has it available without a schema
- * change.
+ * Fase 6E.3: NOW consumed by hasPastBookedReactivationBeenShown() below, which is what makes
+ * "show PAST_BOOKED_GENERIC_INBOUND_MESSAGE only once per reactivation episode" possible (Fase
+ * 6E.3 spec, item 6) -- see that function's doc comment. Fase 6E.2's own doc comment here
+ * originally said nothing resolves this marker; that's now out of date.
  */
 const EXPECTED_INTENT_KEY = "expectedIntent";
 const PAST_BOOKED_REACTIVATION_MARKER = "PAST_BOOKED_REACTIVATION";
 
 export function pastBookedReactivationMetadata(): Record<string, unknown> {
   return { [EXPECTED_INTENT_KEY]: PAST_BOOKED_REACTIVATION_MARKER };
+}
+
+/**
+ * Fase 6E.3 -- scans the FULL outbound history (never just the last message -- contrast with
+ * resolvePendingQualifiedMenu/resolvePendingTopicFollowup, which only need the immediately
+ * preceding turn) for ANY prior PAST_BOOKED_GENERIC_INBOUND_MESSAGE, so the lead is shown that
+ * message at most once per reactivation episode: once they've engaged with ANYTHING else
+ * (a real question, "opciones", "agendar"), a LATER genuinely-unrecognized reply falls back to
+ * the topic-agnostic QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE instead of repeating "tu cita anterior
+ * ya pasó" -- see WhatsAppPastBookedRecoveryHandler and the Fase 6E.3 report, item 6.
+ *
+ * No new table/column: message history already carries this signal via the existing metadata
+ * convention (task instruction: "No agregar columnas ni migraciones si puede resolverse con
+ * metadata").
+ */
+export function hasPastBookedReactivationBeenShown(messages: readonly Message[]): boolean {
+  return messages.some((m) => m.direction === "OUTBOUND" && m.metadata?.[EXPECTED_INTENT_KEY] === PAST_BOOKED_REACTIVATION_MARKER);
 }
