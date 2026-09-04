@@ -406,7 +406,18 @@ export async function handleInboundWhatsAppText(
       // the trigger message itself, which is handled by the two branches immediately above).
       if (fiscalContext && !isFirstWhatsAppInbound) {
         const priorMessagesForFiscalMenu = await deps.messages.listByConversationId(conversationId);
-        if (resolvePendingFiscalWelcomeMenu(priorMessagesForFiscalMenu)) {
+        const fiscalMenuPending = resolvePendingFiscalWelcomeMenu(priorMessagesForFiscalMenu);
+        // Fase 6E.5, item 9: safe, PII-free observability for exactly this resolution step -- so a
+        // future "silent branch" report can be diagnosed from logs alone, without needing to
+        // reconstruct message history by hand. `pendingMenu` is the ONLY value ever logged here
+        // (an opaque marker name, never message content); `pendingMenuResolved` is added below,
+        // only once a digit/keyword lookup actually runs, to distinguish "no menu was pending" from
+        // "a menu was pending but this reply didn't match anything recognizable".
+        deps.logger.warn(
+          { messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), pendingMenu: fiscalMenuPending ? "FISCAL_WELCOME_MENU" : null },
+          "whatsapp inbound checkpoint 12d: fiscal welcome menu pending-state resolved",
+        );
+        if (fiscalMenuPending) {
           const digitSelection = detectFiscalWelcomeDigit(input.text);
           if (digitSelection?.kind === "TOPIC") {
             logBranch(`fiscal-welcome-menu-${digitSelection.topic.toLowerCase()}`, true);
@@ -438,6 +449,10 @@ export async function handleInboundWhatsAppText(
           // Genuinely unrecognized (neither a 1-4 digit nor a known topic keyword) -- never
           // guessed at, never silently dropped either: falls through to whatever status-based
           // branch below would otherwise apply (e.g. the qualification engine, if QUALIFYING).
+          deps.logger.warn(
+            { messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), pendingMenu: "FISCAL_WELCOME_MENU", pendingMenuResolved: false },
+            "whatsapp inbound checkpoint 12e: fiscal welcome menu was pending but this reply did not resolve against it",
+          );
         }
       }
       if (deps.qualificationHandler && lead.status === "QUALIFYING") {
