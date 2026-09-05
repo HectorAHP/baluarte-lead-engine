@@ -174,6 +174,40 @@ export interface WhatsAppInboundDeps {
    * used to write leads/lead_scores/fiscal_lead_scores.
    */
   fiscalLeadScores?: FiscalLeadScoreRepository;
+  /** Fase 7B -- gates the passive WhatsApp phone-verification step below (spec item 34/36).
+   * Absent/false (the default): byte-for-byte unchanged behavior, no extra read/write, same as
+   * every other flag in this project. */
+  leadIntegrityEnabled?: boolean;
+}
+
+/**
+ * Fase 7B spec item 34 -- "verificación pasiva por WhatsApp": an inbound message actually arriving
+ * FROM a lead's own phoneE164 is real, channel-level evidence that number is theirs -- no code
+ * anywhere else in this codebase has an equally strong signal for phone ownership. Never
+ * overwrites a DIFFERENT phone already on file (that would risk silently reassigning a real
+ * commercial record to the wrong number) -- flags identityConflict instead, once, and leaves it
+ * for manual review. Never exposed to the lead (spec item 36). Idempotent: a lead already
+ * phoneVerifiedAt, or already identityConflict, is left untouched on every later turn.
+ */
+async function applyPassiveWhatsAppPhoneVerification(
+  deps: Pick<WhatsAppInboundDeps, "leads" | "logger">,
+  lead: Lead,
+  phoneE164: string | undefined,
+): Promise<Lead> {
+  if (!phoneE164) return lead;
+  if (!lead.phoneE164) {
+    return deps.leads.update(lead.id, { phoneE164, phoneQuality: "VERIFIED", phoneVerifiedAt: new Date() });
+  }
+  if (lead.phoneE164 === phoneE164) {
+    if (lead.phoneVerifiedAt) return lead;
+    return deps.leads.update(lead.id, { phoneQuality: "VERIFIED", phoneVerifiedAt: new Date() });
+  }
+  if (lead.identityConflict) return lead;
+  deps.logger.warn(
+    { leadIdLast8: lead.id.slice(-8) },
+    "whatsapp inbound: inbound phone differs from the lead's phoneE164 on file -- flagging identity conflict, never overwriting",
+  );
+  return deps.leads.update(lead.id, { identityConflict: true });
 }
 
 export type WhatsAppInboundOutcome = "DUPLICATE" | "PROCESSED";
@@ -240,6 +274,13 @@ export async function handleInboundWhatsAppText(
     { messageIdLast8: msgIdLast8, leadIdLast8: lead.id.slice(-8), durationMs: Date.now() - stepStart, isNewLeadRecord, leadStatusBefore: lead.status },
     "whatsapp inbound checkpoint 05: lead resolved",
   );
+
+  // Fase 7B: passive phone verification -- see applyPassiveWhatsAppPhoneVerification's doc
+  // comment. Gated on leadIntegrityEnabled (present only when LEAD_INTEGRITY_ENABLED is true, see
+  // app.ts) -- absent, this extra read/write is skipped entirely, byte-for-byte unchanged.
+  if (deps.leadIntegrityEnabled) {
+    lead = await applyPassiveWhatsAppPhoneVerification(deps, lead, phoneE164);
+  }
 
   // Captured before recordInboundContact mutates status/timestamps, since the decision logic
   // below needs to know what was true *before* this message.

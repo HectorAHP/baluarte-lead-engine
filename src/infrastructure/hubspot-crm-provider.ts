@@ -36,12 +36,33 @@ import { HubSpotProviderError } from "../domain/errors.js";
  * echoed back to any caller) and sent only as an Authorization header to api.hubapi.com. Every
  * thrown HubSpotProviderError carries only an HTTP status and a static message -- never the raw
  * response body (which could otherwise land in a log line via app.log.error's `err` field).
+ *
+ * Fase 7B -- IDENTITY-CONFLICT SAFETY (spec §36/§38). The dedupe strategy above ("search email,
+ * then phone") had a real identity-conflation bug: when `input.email` is a genuinely NEW address
+ * not yet in HubSpot, the phone fallback search could still find a DIFFERENT, unrelated contact
+ * (e.g. a shared household/office line, or a recycled number) and this method would silently PATCH
+ * that OLD contact's `email` property to the NEW lead's address -- merging two different people's
+ * identities into one HubSpot contact. Fixed: `findExistingContactId` now fetches the phone-matched
+ * contact's OWN email (a second, cheap read) and treats a genuine mismatch as `identityConflict`,
+ * never as a match to update. `upsertContact` then creates a SEPARATE contact for the new email
+ * instead (two HubSpot contacts may legitimately share one phone property -- far safer than
+ * silently overwriting one person's identity with another's). See ports.ts's
+ * HubSpotContactUpsertResult.identityConflict doc comment for exactly what callers observe.
  */
 const HUBSPOT_API_BASE = "https://api.hubapi.com";
 const HUBSPOT_REQUEST_TIMEOUT_MS = 8000;
 
 interface HubSpotSearchResponse {
   results?: Array<{ id: string }>;
+}
+
+interface HubSpotContactReadResponse {
+  properties?: { email?: string | null };
+}
+
+function normalizedEmailsMatch(a: string | undefined | null, b: string | undefined | null): boolean {
+  if (!a || !b) return true; // one side missing an email is never treated as a contradiction -- see class doc comment
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
 export class RealHubSpotCRMProvider implements HubSpotCRMProvider {
@@ -87,14 +108,40 @@ export class RealHubSpotCRMProvider implements HubSpotCRMProvider {
     return res.results?.[0]?.id ?? null;
   }
 
-  /** Deterministic dedupe priority: normalized email, then normalized phone -- see class doc
+  private async fetchContactEmail(id: string): Promise<string | undefined> {
+    const res = await this.request<HubSpotContactReadResponse>(`/crm/v3/objects/contacts/${id}?properties=email`, { method: "GET" });
+    return res.properties?.email ?? undefined;
+  }
+
+  /**
+   * Deterministic dedupe priority: normalized email, then normalized phone -- see class doc
    * comment and the Fase 6F report, item 9. Shared by the initial lookup AND the Fase 6F.3
-   * post-409 recovery re-search -- the EXACT same order both times, never a different rule. */
-  private async findExistingContactId(input: HubSpotContactUpsertInput): Promise<string | null> {
-    let existingId: string | null = null;
-    if (input.email) existingId = await this.searchContactId("email", input.email);
-    if (!existingId && input.phone) existingId = await this.searchContactId("phone", input.phone);
-    return existingId;
+   * post-409 recovery re-search -- the EXACT same order both times, never a different rule.
+   *
+   * Fase 7B: when the email search finds nothing but the phone fallback finds a DIFFERENT contact
+   * that already has its OWN, DIFFERENT email on file, this is `identityConflict: true` and `id`
+   * is null -- the caller must never patch that contact. A phone match against a contact with NO
+   * email on file, or the SAME email, is a genuine, safe match (id returned, no conflict) --
+   * see normalizedEmailsMatch's doc comment for why "one side missing" is never a contradiction.
+   */
+  private async findExistingContactId(input: HubSpotContactUpsertInput): Promise<{ id: string | null; identityConflict: boolean }> {
+    if (input.email) {
+      const byEmail = await this.searchContactId("email", input.email);
+      if (byEmail) return { id: byEmail, identityConflict: false };
+    }
+    if (input.phone) {
+      const byPhone = await this.searchContactId("phone", input.phone);
+      if (byPhone) {
+        if (input.email) {
+          const phoneContactEmail = await this.fetchContactEmail(byPhone);
+          if (!normalizedEmailsMatch(phoneContactEmail, input.email)) {
+            return { id: null, identityConflict: true };
+          }
+        }
+        return { id: byPhone, identityConflict: false };
+      }
+    }
+    return { id: null, identityConflict: false };
   }
 
   async upsertContact(input: HubSpotContactUpsertInput): Promise<HubSpotContactUpsertResult> {
@@ -106,7 +153,7 @@ export class RealHubSpotCRMProvider implements HubSpotCRMProvider {
     if (input.city) properties.city = input.city;
     if (input.state) properties.state = input.state;
 
-    const existingId = await this.findExistingContactId(input);
+    const { id: existingId, identityConflict } = await this.findExistingContactId(input);
 
     if (existingId) {
       await this.request(`/crm/v3/objects/contacts/${existingId}`, { method: "PATCH", body: { properties } });
@@ -118,14 +165,14 @@ export class RealHubSpotCRMProvider implements HubSpotCRMProvider {
         method: "POST",
         body: { properties },
       });
-      return { hubspotContactId: created.id, created: true };
+      return { hubspotContactId: created.id, created: true, identityConflict: identityConflict || undefined };
     } catch (err) {
       // Fase 6F.3: a 409 on CREATE specifically -- and ONLY a 409 -- is treated as "someone else
       // (almost always impuestos.html's own parallel Forms API call) just created this exact
       // contact between our search and our create". Any other error (network failure, 5xx,
       // etc.) propagates unchanged, exactly as before this fix.
       if (err instanceof HubSpotProviderError && err.httpStatus === 409) {
-        return this.recoverFromConcurrentCreateConflict(input, properties);
+        return this.recoverFromConcurrentCreateConflict(input, properties, identityConflict);
       }
       throw err;
     }
@@ -138,12 +185,22 @@ export class RealHubSpotCRMProvider implements HubSpotCRMProvider {
    * if this one also fails to locate the contact. Never inspects HubSpot's response body -- the
    * 409 status code plus a fresh, deterministic search is the entire recovery signal (this
    * project's "never parse PII/tokens out of an error body" rule).
+   *
+   * Fase 7B: when the ORIGINAL lookup already found an identity conflict (phone matched a
+   * different contact with a different email), the re-search here is scoped to EMAIL ONLY --
+   * never falls back to the conflicting phone match again, which would just rediscover the same
+   * contact this method must never silently update. If a genuinely new contact for this email
+   * still isn't found, the 409 surfaces as a real, unrecovered error (fail-open still applies at
+   * the caller).
    */
   private async recoverFromConcurrentCreateConflict(
     input: HubSpotContactUpsertInput,
     properties: Record<string, string | number | boolean>,
+    identityConflict: boolean,
   ): Promise<HubSpotContactUpsertResult> {
-    const recoveredId = await this.findExistingContactId(input);
+    const recoveredId = identityConflict
+      ? (input.email ? await this.searchContactId("email", input.email) : null)
+      : (await this.findExistingContactId(input)).id;
     if (!recoveredId) {
       // The 409 said a conflicting contact exists, but our own deterministic search (by the
       // SAME email/phone we just tried to create with) still can't find it -- a genuinely
@@ -156,6 +213,6 @@ export class RealHubSpotCRMProvider implements HubSpotCRMProvider {
       );
     }
     await this.request(`/crm/v3/objects/contacts/${recoveredId}`, { method: "PATCH", body: { properties } });
-    return { hubspotContactId: recoveredId, created: false, recoveredFromConflict: true };
+    return { hubspotContactId: recoveredId, created: false, recoveredFromConflict: true, identityConflict: identityConflict || undefined };
   }
 }

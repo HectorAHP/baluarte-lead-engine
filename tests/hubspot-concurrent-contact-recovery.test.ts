@@ -94,6 +94,10 @@ describe("Fase 6F.3 -- RealHubSpotCRMProvider concurrent-create (409) recovery",
       CONFLICT, // create -> 409
       EMPTY_SEARCH, // recovery: email still not found
       foundSearch("recovered-2"), // recovery: phone finds it
+      // Fase 7B: identity-conflict guard -- since input.email is present, the phone-matched
+      // contact's OWN email is fetched and compared. No email on file there -> not a
+      // contradiction (see normalizedEmailsMatch's doc comment) -> proceeds to update as before.
+      { status: 200, body: { properties: {} } },
       PATCH_OK,
     ]);
     globalThis.fetch = fetchMock as unknown as typeof fetch;
@@ -101,8 +105,25 @@ describe("Fase 6F.3 -- RealHubSpotCRMProvider concurrent-create (409) recovery",
 
     const result = await provider.upsertContact({ email: "d@example.com", phone: "+521112", properties: { bc_fiscal_score: 40 } });
 
-    expect(result).toEqual({ hubspotContactId: "recovered-2", created: false, recoveredFromConflict: true });
-    expect(calls).toHaveLength(6);
+    expect(result).toEqual({ hubspotContactId: "recovered-2", created: false, recoveredFromConflict: true, identityConflict: undefined });
+    expect(calls).toHaveLength(7);
+  });
+
+  it("4b (Fase 7B): 409 -> recovery phone search finds a contact with a DIFFERENT email -> identity conflict, never merged", async () => {
+    const { fetchMock, calls } = mockFetchSequence([
+      EMPTY_SEARCH, EMPTY_SEARCH, // initial search: email, phone -- both empty, so identityConflict is false going into CREATE
+      CONFLICT, // create -> 409
+      EMPTY_SEARCH, // recovery: email still not found
+      foundSearch("someone-elses-contact"), // recovery: phone finds a DIFFERENT person
+      { status: 200, body: { properties: { email: "someone-else@example.com" } } }, // that contact's own, different email
+    ]);
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const provider = new RealHubSpotCRMProvider("fake-token");
+
+    await expect(
+      provider.upsertContact({ email: "d@example.com", phone: "+521112", properties: { bc_fiscal_score: 40 } }),
+    ).rejects.toThrow(HubSpotProviderError); // no contact found for THIS email -> the original 409 surfaces, unrecovered
+    expect(calls).toHaveLength(6); // never PATCHes "someone-elses-contact"
   });
 
   it("5. 409 -> recovery re-search still finds nothing -> controlled, bounded failure (no infinite retry)", async () => {

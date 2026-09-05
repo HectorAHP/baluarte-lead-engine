@@ -207,6 +207,8 @@ describe("SlotOfferingService.getOrCreateOffer", () => {
       create: (input) => realLeads.create(input),
       findById: (id) => realLeads.findById(id),
       findByDedupKey: (key) => realLeads.findByDedupKey(key),
+      findByEmail: (email) => realLeads.findByEmail(email),
+      findByPhoneE164: (phoneE164) => realLeads.findByPhoneE164(phoneE164),
       update: (id, patch) => {
         if (failNextUpdate) {
           failNextUpdate = false;

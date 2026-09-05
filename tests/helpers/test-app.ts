@@ -10,6 +10,7 @@ import {
 import { FakeCalendarProvider } from "../../src/infrastructure/fake-calendar.js";
 import { FakeMessagingProvider } from "../../src/infrastructure/fake-messaging-provider.js";
 import { FakeHubSpotCRMProvider } from "../../src/infrastructure/fake-hubspot-crm-provider.js";
+import { FakeEmailDomainChecker } from "../../src/infrastructure/fake-email-domain-checker.js";
 
 /**
  * Always supplies a COMPLETE set of in-memory/fake dependencies -- never a partial override
@@ -90,6 +91,17 @@ export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
     // real posture whenever the corresponding env var is unset.
     reminderRunnerSecret: undefined,
     adminApiToken: undefined,
+    // Fase 7B -- same deterministic-false-unless-asked rationale as every flag above. Every
+    // computation this whole feature adds (email/phone quality, DNS check, honeypot enforcement,
+    // WhatsApp passive verification) stays completely OFF by default in every test, exactly
+    // matching production's own real default. emailDomainChecker defaults to a Fake that never
+    // performs real DNS I/O -- never buildApp()'s own DnsEmailDomainChecker fallback, same
+    // rationale as calendar/messaging/hubspotCrm above.
+    leadIntegrityEnabled: false,
+    emailDnsValidationEnabled: false,
+    disposableEmailCheckEnabled: false,
+    honeypotEnabled: false,
+    emailDomainChecker: new FakeEmailDomainChecker(),
     ...overrides,
   });
 }

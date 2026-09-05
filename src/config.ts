@@ -81,6 +81,40 @@ const schema=z.object({
   // REMINDER_RUNNER_SECRET above. Minimal viable admin auth, exactly as docs/PHASE4-DESIGN.md §18
   // already flagged as the accepted risk pending a stronger scheme if this project's needs grow.
   ADMIN_API_TOKEN:z.string().optional(),
+
+  // Fase 7B -- lead integrity / anti-fake-lead feature flags. ALL default false ("passive" per the
+  // Fase 7B rollout plan, Phase A) -- with every one false, POST /api/leads' behavior is
+  // byte-for-byte unchanged from before this phase: no email/phone quality is computed or stored,
+  // no honeypot field is enforced, no DNS lookup ever runs. A low score / a detected issue NEVER
+  // blocks a real lead, changes its status/fiscal_v1/HOT-WARM-NURTURE, or gates WhatsApp messaging
+  // eligibility on its own -- see domain/lead-integrity-score.ts's class doc comment for the full
+  // list of things this must never be used to decide.
+  LEAD_INTEGRITY_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Independent of LEAD_INTEGRITY_ENABLED's other computations -- gates ONLY the optional DNS
+  // domain-existence check (see infrastructure/dns-email-domain-checker.ts). Off by default: a DNS
+  // lookup is the one piece of this phase with real external-network/latency risk, so it needs its
+  // own explicit opt-in even after LEAD_INTEGRITY_ENABLED is on.
+  EMAIL_DNS_VALIDATION_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Gates whether classifyEmailQuality ever checks the disposable-domain denylist at all -- off by
+  // default so a real disposable-provider user is never even tagged until this is deliberately
+  // turned on (Fase 7B rollout Phase B).
+  DISPOSABLE_EMAIL_CHECK_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Extra disposable domains to merge with DEFAULT_DISPOSABLE_EMAIL_DOMAINS (email-quality.ts) --
+  // comma-separated, e.g. "example-temp.com,another.net". Optional; empty/unset adds nothing.
+  EMAIL_DISPOSABLE_DOMAINS_EXTRA:z.string().optional(),
+  // Gates whether POST /api/leads' honeypot field (see app.ts) is actually enforced. Off by
+  // default: the field is always ACCEPTED (a real browser never fills it either way), but with
+  // this false, a filled honeypot is simply ignored -- no different from any other field -- rather
+  // than short-circuiting the request. Fase 7B rollout Phase B.
+  HONEYPOT_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Reserved for a future slice that would require phone/WhatsApp verification (or an equivalent
+  // trust signal) before an automated booking action -- no code reads this yet (see the Fase 7B
+  // report's explicit "not built" list, same "flag added, nothing wired yet" precedent as
+  // NO_SHOW_DETECTION_ENABLED in Fase 7A). Deliberately NOT wired into WhatsAppBookingHandler/
+  // SlotOfferingService in this phase -- doing so without real QA risks breaking the
+  // well-tested, already-working booking flow, which this task's "NO romper ningún flujo
+  // funcional existente" rule takes priority over.
+  STRICT_BOOKING_INTEGRITY_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
   // Production hardening (web lead capture / POST /api/leads). Comma-separated origin allowlist
   // for @fastify/cors -- optional because a sensible NODE_ENV-based default (see
   // corsAllowedOrigins below) covers the common case without requiring an env var in every
@@ -124,3 +158,8 @@ const DEFAULT_DEV_CORS_ORIGINS=["http://localhost:3000","http://127.0.0.1:3000",
 export const corsAllowedOrigins:string[]=config.CORS_ALLOWED_ORIGINS
   ? config.CORS_ALLOWED_ORIGINS.split(",").map((o)=>o.trim()).filter(Boolean)
   : config.NODE_ENV==="production" ? DEFAULT_PROD_CORS_ORIGINS : DEFAULT_DEV_CORS_ORIGINS;
+
+// Fase 7B -- see EMAIL_DISPOSABLE_DOMAINS_EXTRA's own doc comment above.
+export const extraDisposableEmailDomains:ReadonlySet<string> = config.EMAIL_DISPOSABLE_DOMAINS_EXTRA
+  ? new Set(config.EMAIL_DISPOSABLE_DOMAINS_EXTRA.split(",").map((d)=>d.trim().toLowerCase()).filter(Boolean))
+  : new Set();

@@ -1,7 +1,23 @@
 import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment, AppointmentStatus } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js"; import type { LeadStatusHistoryEntry } from "../domain/lead-status-history.js"; import type { AppointmentStatusHistoryEntry } from "../domain/appointment-status-history.js"; import type { AppointmentMessageDelivery } from "../domain/appointment-message-delivery.js"; import type { AppointmentCancellation } from "../domain/appointment-cancellation.js"; import type { AppointmentReschedule } from "../domain/appointment-reschedule.js";
 import type { ProcessedEvent } from "../domain/processed-event.js";
 import type { FiscalLeadScore } from "../domain/fiscal-lead-score.js";
-export interface LeadRepository { create(input:Omit<Lead,"id"|"createdAt"|"updatedAt">):Promise<Lead>; findById(id:string):Promise<Lead|null>; update(id:string,patch:Partial<Lead>):Promise<Lead>; findByDedupKey(key:LeadDedupKey):Promise<Lead|null>; }
+export interface LeadRepository {
+  create(input:Omit<Lead,"id"|"createdAt"|"updatedAt">):Promise<Lead>;
+  findById(id:string):Promise<Lead|null>;
+  update(id:string,patch:Partial<Lead>):Promise<Lead>;
+  findByDedupKey(key:LeadDedupKey):Promise<Lead|null>;
+  /**
+   * Fase 7B -- a single, granular lookup by normalized email ONLY (never phone, never any other
+   * key). Additive: findByDedupKey's own priority-ordered contract is untouched and still used
+   * unchanged by whatsapp-inbound-service.ts / fiscal-lead-context.ts. This exists specifically so
+   * WebLeadCaptureService.resolveExistingLead can implement the safer "email first, then phone,
+   * detect contradiction" hierarchy (Fase 7B spec §36/§39) without email ever being shadowed by a
+   * coincidental phone match, or vice versa.
+   */
+  findByEmail(email:string):Promise<Lead|null>;
+  /** Fase 7B -- same rationale as findByEmail above, scoped to phoneE164 only. */
+  findByPhoneE164(phoneE164:string):Promise<Lead|null>;
+}
 /**
  * Generic (provider, event_id) idempotency guard, backed by the `processed_events` table
  * (existing since migration 001, previously unused by any application code). Same tryCreate
@@ -318,11 +334,32 @@ export interface HubSpotContactUpsertResult {
    * `created` is true, and undefined/false for every ordinary (non-conflicting) update.
    */
   recoveredFromConflict?: boolean;
+  /**
+   * Fase 7B -- true when the input's email did NOT match any existing contact, but its phone
+   * matched a DIFFERENT contact that already has a DIFFERENT email on file. The adapter never
+   * updates that other contact in this case (see RealHubSpotCRMProvider.findExistingContactId's
+   * doc comment) -- `hubspotContactId` here is a freshly created (or, on a genuine concurrent
+   * create, recovered) contact for the NEW email, never the old phone-matched one. Surfaced so
+   * callers can log this distinctly (Fase 7B spec §36/§38) without ever needing to inspect emails/
+   * phones themselves.
+   */
+  identityConflict?: boolean;
 }
 export interface HubSpotCRMProvider {
   upsertContact(input: HubSpotContactUpsertInput): Promise<HubSpotContactUpsertResult>;
 }
 export interface AIProvider{generateStructured<T>(systemPrompt:string,messages:Array<{role:"user"|"assistant";content:string}>,schemaName:string):Promise<T>;}
+/**
+ * Fase 7B -- optional email-domain existence check (spec item 32). Deliberately answers ONLY
+ * "domainExists" (MX, or A/AAAA fallback) -- NEVER "mailboxExists" (that requires an SMTP
+ * handshake this project does not attempt, which is unreliable and often blocked/rate-limited by
+ * mail providers anyway). `null` means the check itself failed or timed out -- ALWAYS fail-open
+ * (treat as "unknown", never as "domain doesn't exist") -- see DnsEmailDomainChecker's doc
+ * comment for the bounded timeout that guarantees this never blocks a request for long.
+ */
+export interface EmailDomainChecker {
+  domainHasMailExchanger(domain: string): Promise<boolean | null>;
+}
 /** Structured warning-level logging, matching pino's `log.warn(details, message)` calling
  * convention so Fastify's `app.log` can be passed directly in production with no adapter. */
 export interface Logger{warn(details:Record<string,unknown>,message:string):void;}

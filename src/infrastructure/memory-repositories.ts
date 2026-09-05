@@ -33,6 +33,13 @@ export class InMemoryLeadRepository implements LeadRepository{
     if(key.email){const normalized=key.email.toLowerCase();const m=all.find(l=>l.email?.toLowerCase()===normalized);if(m)return m;}
     return null;
   }
+  async findByEmail(email:string):Promise<Lead|null>{
+    const normalized=email.toLowerCase();
+    return [...this.data.values()].find(l=>l.email?.toLowerCase()===normalized)??null;
+  }
+  async findByPhoneE164(phoneE164:string):Promise<Lead|null>{
+    return [...this.data.values()].find(l=>l.phoneE164===phoneE164)??null;
+  }
 }
 
 export class InMemoryAppointmentRepository implements AppointmentRepository{

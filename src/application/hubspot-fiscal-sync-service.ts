@@ -127,8 +127,18 @@ export class HubSpotFiscalSyncService {
           hubspotOperation: "upsert_contact",
           // Fase 6F.3: "conflict_recovered" is its own distinct outcome (not lumped into
           // "updated") so a recovered 409 stays visible in observability -- see
-          // RealHubSpotCRMProvider.recoverFromConcurrentCreateConflict.
-          hubspotOutcome: result.recoveredFromConflict ? "conflict_recovered" : result.created ? "created" : "updated",
+          // RealHubSpotCRMProvider.recoverFromConcurrentCreateConflict. Fase 7B:
+          // "created_identity_conflict" is ALSO distinct -- it means a phone match against a
+          // different email was deliberately NOT merged (see identityConflict's doc comment in
+          // ports.ts); never lumped into a plain "created" so this stays visible without ever
+          // logging the actual email/phone involved.
+          hubspotOutcome: result.identityConflict
+            ? "created_identity_conflict"
+            : result.recoveredFromConflict
+              ? "conflict_recovered"
+              : result.created
+                ? "created"
+                : "updated",
         },
         "hubspot fiscal sync succeeded",
       );

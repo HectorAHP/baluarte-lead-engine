@@ -142,6 +142,8 @@ describe("POST /api/leads -- web lead capture (fiscal calculator)", () => {
         findById: async () => null,
         update: async () => { throw new Error("unused"); },
         findByDedupKey: async () => null,
+        findByEmail: async () => null,
+        findByPhoneE164: async () => null,
       },
     });
     const res = await app.inject({ method: "POST", url: "/api/leads", payload: basePayload() });

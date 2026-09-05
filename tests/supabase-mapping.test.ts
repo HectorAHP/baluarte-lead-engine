@@ -42,6 +42,14 @@ const leadRow: LeadRow = {
   booked_at: null,
   meeting_at: null,
   closed_at: null,
+  email_quality: null,
+  phone_quality: null,
+  phone_verified_at: null,
+  email_verified_at: null,
+  identity_conflict: null,
+  suspected_automation: null,
+  lead_integrity_score: null,
+  lead_integrity_version: null,
 };
 
 describe("supabase lead mapping", () => {

@@ -4,7 +4,9 @@ import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { config, hasGoogleCalendarCredentials, hasWhatsAppCredentials, hasHubSpotCredentials, corsAllowedOrigins as defaultCorsAllowedOrigins } from "./config.js";
+import { config, hasGoogleCalendarCredentials, hasWhatsAppCredentials, hasHubSpotCredentials, corsAllowedOrigins as defaultCorsAllowedOrigins, extraDisposableEmailDomains } from "./config.js";
+import { isHoneypotTriggered } from "./domain/honeypot.js";
+import { DnsEmailDomainChecker } from "./infrastructure/dns-email-domain-checker.js";
 import {
   InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository,
   InMemoryLeadScoreRepository, InMemoryConversationRepository, InMemoryMessageRepository,
@@ -65,7 +67,7 @@ import type {
   SlotOfferClaimRepository, CalendarProvider, MessagingProvider,
   LeadStatusHistoryRepository, AppointmentStatusHistoryRepository, AppointmentMessageDeliveryRepository,
   AppointmentCancellationRepository, AppointmentRescheduleRepository, ProcessedEventRepository,
-  FiscalLeadScoreRepository, HubSpotCRMProvider,
+  FiscalLeadScoreRepository, HubSpotCRMProvider, EmailDomainChecker,
 } from "./application/ports.js";
 
 declare module "fastify" {
@@ -177,6 +179,15 @@ export interface AppDependencies {
   /** Override for config.ADMIN_API_TOKEN -- exists so the mark-completed/mark-no-show admin
    * endpoints are testable without a real token in the environment. */
   adminApiToken?: string;
+  /** Fase 7B overrides -- same "explicit override wins, else config, else false" precedence as
+   * every flag above. */
+  leadIntegrityEnabled?: boolean;
+  emailDnsValidationEnabled?: boolean;
+  disposableEmailCheckEnabled?: boolean;
+  honeypotEnabled?: boolean;
+  /** Override for the real DNS-backed checker -- tests inject a FakeEmailDomainChecker instead of
+   * ever performing real DNS I/O, same override rationale as calendar/messaging above. */
+  emailDomainChecker?: EmailDomainChecker;
   /** Production hardening (POST /api/leads). Override for config's computed corsAllowedOrigins --
    * lets a test assert prod-like allow/reject behavior without actually setting NODE_ENV=production
    * for the whole process. undefined (the only production path) uses config's own computed list. */
@@ -186,6 +197,27 @@ export interface AppDependencies {
   leadsRateLimitMax?: number;
   /** Override for config.LEADS_RATE_LIMIT_WINDOW_MS -- same rationale as leadsRateLimitMax. */
   leadsRateLimitWindowMs?: number;
+}
+
+/**
+ * Fase 7B -- shared per-route rate-limit config, same minimal-body errorResponseBuilder
+ * convention POST /api/leads already established (see app.setErrorHandler's statusCode===429
+ * branch below, which is what actually renders that body). Each call site below picks its own
+ * max/timeWindow -- deliberately NOT one blanket limit for every route (spec item 6: "No usar el
+ * mismo límite para todos").
+ */
+function routeRateLimit(max: number, timeWindowMs: number) {
+  return {
+    rateLimit: {
+      max,
+      timeWindow: timeWindowMs,
+      errorResponseBuilder: (_req: unknown, context: { statusCode: number }) => {
+        const err = new Error("rate_limited") as Error & { statusCode: number };
+        err.statusCode = context.statusCode;
+        return err;
+      },
+    },
+  };
 }
 
 export async function buildApp(overrides: AppDependencies = {}): Promise<FastifyInstance> {
@@ -217,6 +249,36 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // instance; do not swap for a distributed store without first confirming this ever runs as more
   // than one process (see this task's "no inventes infraestructura distribuida" instruction).
   await app.register(rateLimit, { global: false, keyGenerator: (req) => req.ip });
+
+  // Fase 7B -- baseline security headers, applied to EVERY response (this is a JSON API backend,
+  // never HTML, so most of these are defense-in-depth rather than load-bearing for a browser
+  // rendering this backend's own output -- the CSP/frame-ancestors that actually matters for a
+  // browser is the STATIC SITE's (baluartecapital.com.mx, hosted on Hostinger, outside this repo
+  // -- see docs/security/HOSTINGER-HEADERS.md for that snippet). Kept minimal and universally safe
+  // -- none of these can break a legitimate JSON API consumer or CORS-permitted browser call.
+  //   - Strict-Transport-Security: safe to always send -- Render terminates TLS and this backend
+  //     has no non-HTTPS-only endpoint; a plain-HTTP client simply never sees this header at all.
+  //   - X-Content-Type-Options: nosniff -- prevents a browser from MIME-sniffing a JSON response
+  //     as something executable.
+  //   - Referrer-Policy: no-referrer -- this API never needs the caller's own Referer forwarded
+  //     anywhere, and nothing here depends on receiving one either.
+  //   - Permissions-Policy: blanket-denies browser features this backend's responses never need
+  //     (it returns JSON, never a renderable page that could invoke them).
+  //   - X-Frame-Options / frame-ancestors 'none': this API is never meant to be framed. Both sent
+  //     together (frame-ancestors is CSP's modern replacement -- some older UAs only honor
+  //     X-Frame-Options) -- redundant by design, never conflicting.
+  //   - A minimal, restrictive Content-Security-Policy: this backend never serves HTML, so
+  //     default-src 'none' is safe for every real response; guards only against an accidental
+  //     framework-generated HTML error page ever being treated as executable content.
+  app.addHook("onSend", async (_req, reply, payload) => {
+    reply.header("Strict-Transport-Security", "max-age=15552000"); // 180 days -- includeSubDomains/preload deliberately omitted, see the Fase 7B report's HSTS section
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.header("Referrer-Policy", "no-referrer");
+    reply.header("Permissions-Policy", "geolocation=(), camera=(), microphone=(), payment=(), usb=()");
+    reply.header("X-Frame-Options", "DENY");
+    reply.header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+    return payload;
+  });
 
   // Captures the exact raw bytes of every JSON body, needed to verify Meta's HMAC signature
   // (which is computed over the raw payload, not a re-serialization of the parsed object).
@@ -275,11 +337,26 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // class doc comment), so there is nothing a production fallback would need to stand in for.
   const hubspotCrm = overrides.hubspotCrm ?? (hasHubSpotCredentials ? new RealHubSpotCRMProvider(config.HUBSPOT_PRIVATE_APP_TOKEN!) : undefined);
 
+  // Fase 7B feature flags -- resolved here (ahead of every WhatsApp Phase 3B+ flag below, which
+  // stays in its own established block) because webLeadCaptureService needs them immediately.
+  // Independent of every other flag in this file and of each other.
+  const leadIntegrityEnabled = overrides.leadIntegrityEnabled ?? config.LEAD_INTEGRITY_ENABLED;
+  const emailDnsValidationEnabled = overrides.emailDnsValidationEnabled ?? config.EMAIL_DNS_VALIDATION_ENABLED;
+  const disposableEmailCheckEnabled = overrides.disposableEmailCheckEnabled ?? config.DISPOSABLE_EMAIL_CHECK_ENABLED;
+  const honeypotEnabled = overrides.honeypotEnabled ?? config.HONEYPOT_ENABLED;
+  // Always constructed -- cheap, stateless (no DNS lookup happens at construction time) -- only
+  // ever actually queried when BOTH leadIntegrityEnabled and emailDnsValidationEnabled are true
+  // (see WebLeadCaptureService.computeIntegritySignals).
+  const emailDomainChecker = overrides.emailDomainChecker ?? new DnsEmailDomainChecker();
+
   const leadService = new LeadService(leadsRepo, leadScoresRepo, leadStatusHistoryRepo, app.log);
   // Fase 6F: always constructed (cheap, stateless) -- its own `hubspot` port being undefined is
   // what actually gates real behavior, not a conditional construction here.
   const hubspotFiscalSync = new HubSpotFiscalSyncService(hubspotCrm, app.log);
-  const webLeadCaptureService = new WebLeadCaptureService(leadsRepo, processedEventsRepo, leadService, app.log, fiscalLeadScoresRepo, hubspotFiscalSync);
+  const webLeadCaptureService = new WebLeadCaptureService(
+    leadsRepo, processedEventsRepo, leadService, app.log, fiscalLeadScoresRepo, hubspotFiscalSync,
+    { leadIntegrityEnabled, emailDomainChecker, emailDnsValidationEnabled, disposableEmailCheckEnabled, extraDisposableDomains: extraDisposableEmailDomains },
+  );
   const appointmentService = new AppointmentService(calendar, appointmentsRepo, bookingAttemptsRepo, leadsRepo, app.log);
   // Always constructed -- cheap, stateless, and needed by both qualificationHandler (to offer
   // slots right after QUALIFIED_A/B) and bookingHandler below, each gated independently by its
@@ -501,8 +578,10 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
       qualificationEngineEnabled, whatsappBookingEnabled, whatsappCancellationEnabled, whatsappRescheduleEnabled,
       appointmentRemindersEnabled, postMeetingFollowupEnabled, appointmentConfirmationEnabled,
       noShowDetectionEnabled: config.NO_SHOW_DETECTION_ENABLED,
+      leadIntegrityEnabled, emailDnsValidationEnabled, disposableEmailCheckEnabled, honeypotEnabled,
+      strictBookingIntegrityEnabled: config.STRICT_BOOKING_INTEGRITY_ENABLED,
     },
-    "Phase 3B/3C/4B/4C/7A WhatsApp feature flags",
+    "Phase 3B/3C/4B/4C/7A/7B feature flags",
   );
 
   // Sanitized boot-time fingerprint of the loaded WhatsApp config -- only the last 4 characters
@@ -578,6 +657,14 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
     productInterest: z.string().max(200).optional(), notes: z.string().max(4000).optional(),
     privacyAccepted: z.literal(true), consentContact: z.boolean().optional(),
     attribution: attributionSchema, fiscalCalculator: fiscalCalculatorSchema,
+    // Fase 7B item 22/24 -- honeypot + form-timing anti-bot signals. Both ALWAYS accepted by the
+    // schema (so a real browser sending them is never a validation error) regardless of
+    // HONEYPOT_ENABLED/LEAD_INTEGRITY_ENABLED -- only the ROUTE HANDLER below decides whether
+    // either is actually acted on. `website` is deliberately a generic, plausible-sounding name
+    // (spec item 22) -- the frontend hides it from real users via CSS, never via `type="hidden"`
+    // (a hidden input is trivially skipped by unsophisticated bots, defeating the point).
+    website: z.string().max(500).optional(),
+    formStartedAt: z.coerce.date().optional(),
   });
   // Idempotency-Key stays OPTIONAL at the schema level for backwards compatibility with any caller
   // that predates this change (see the doc comment above) -- impuestos.html itself is required, by
@@ -592,24 +679,16 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
       // anything megabyte-scale outright -- independent of, and much tighter than, Fastify's global
       // default (1MB) which still governs every other route.
       bodyLimit: 24_000,
-      config: {
-        rateLimit: {
-          max: overrides.leadsRateLimitMax ?? config.LEADS_RATE_LIMIT_MAX,
-          timeWindow: overrides.leadsRateLimitWindowMs ?? config.LEADS_RATE_LIMIT_WINDOW_MS,
-          // @fastify/rate-limit's own internals `throw params.errorResponseBuilder(...)` -- it
-          // MUST return a real Error (with .statusCode set), exactly mirroring the plugin's own
-          // defaultErrorResponse, or the thrown value falls through to app.setErrorHandler's
-          // generic catch-all as an unrecognized error (500, wrong status). The minimal
-          // {ok:false,error:"rate_limited"} body itself (task requirement, never the plugin's
-          // default shape which would include the caller's IP and retry-after phrasing) is sent
-          // by the statusCode===429 branch in app.setErrorHandler below.
-          errorResponseBuilder: (_req, context) => {
-            const err = new Error("rate_limited") as Error & { statusCode: number };
-            err.statusCode = context.statusCode;
-            return err;
-          },
-        },
-      },
+      // @fastify/rate-limit's own internals `throw params.errorResponseBuilder(...)` -- it MUST
+      // return a real Error (with .statusCode set), exactly mirroring the plugin's own
+      // defaultErrorResponse, or the thrown value falls through to app.setErrorHandler's generic
+      // catch-all as an unrecognized error (500, wrong status). The minimal
+      // {ok:false,error:"rate_limited"} body itself (task requirement, never the plugin's default
+      // shape which would include the caller's IP and retry-after phrasing) is sent by the
+      // statusCode===429 branch in app.setErrorHandler below -- see routeRateLimit's own doc
+      // comment (Fase 7B: extracted here so every other rate-limited route below shares the exact
+      // same errorResponseBuilder, never a second, divergent shape).
+      config: routeRateLimit(overrides.leadsRateLimitMax ?? config.LEADS_RATE_LIMIT_MAX, overrides.leadsRateLimitWindowMs ?? config.LEADS_RATE_LIMIT_WINDOW_MS),
     },
     async (req, reply) => {
       let body: z.infer<typeof createLeadSchema>;
@@ -628,6 +707,16 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
       // a literal double-send of the exact same request. Falls back to a fresh, request-scoped id --
       // never reused across requests, so it can never collide with (or replay-protect) anything.
       const submissionId = idempotencyKey ?? randomUUID();
+
+      // Fase 7B item 22: a filled honeypot NEVER persists a lead, NEVER syncs to HubSpot, NEVER
+      // triggers WhatsApp -- responds with the SAME shape/status a real success would (a random,
+      // never-persisted id), so nothing about this response reveals detection happened. Gated on
+      // honeypotEnabled -- with it false (the default), a filled `website` field is simply ignored
+      // like any other unused field, same as before this field existed.
+      if (honeypotEnabled && isHoneypotTriggered(body.website)) {
+        app.log.warn({ submissionIdLast8: submissionId.slice(-8), outcome: "honeypot_triggered" }, "web lead ingestion: honeypot triggered, not persisted");
+        return reply.code(201).send({ ok: true, leadId: randomUUID() });
+      }
 
       try {
         const attribution = body.attribution;
@@ -665,6 +754,10 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
           note: noteParts.length > 0 ? noteParts.join("\n\n") : undefined,
           consentContact: body.consentContact ?? false,
           privacyAcceptedAt: submittedAt,
+          // Fase 7B item 25 -- see domain/form-timing.ts. Absent when the caller doesn't send it
+          // (every caller predating this field) -- WebLeadCaptureService then simply computes no
+          // timing signal at all, same as today.
+          formStartedAt: body.formStartedAt,
           // Fase 6F.1: authoritative submission-capture moment, reused for HubSpot's
           // bc_fiscal_calculated_at -- see WebLeadCaptureInput.submittedAt's doc comment.
           submittedAt,
@@ -730,13 +823,19 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   const g = z.object({ vertical: z.literal("GMM"), renewalWindow: z.enum(["LE_30", "31_60", "61_90", "GT_90"]).optional(), wantsNewPolicyThisMonth: z.boolean().optional(), concreteNeed: z.boolean(), completeInfo: z.boolean(), acceptsMeeting: z.boolean() });
   app.post("/api/leads/:id/score", async (req) => { const { id } = z.object({ id: z.string().uuid() }).parse(req.params); const raw = z.discriminatedUnion("vertical", [p, g]).parse(req.body); if (raw.vertical === "PATRIMONIAL") { const { vertical, ...input } = raw; return leadService.scorePatrimonialLead(id, input); } const { vertical, ...input } = raw; return leadService.scoreGmmLead(id, input); });
 
-  app.get("/api/availability", async (req) => { const q = z.object({ from: z.coerce.date(), to: z.coerce.date(), duration: z.coerce.number().int().positive().default(config.MEETING_DURATION_MINUTES) }).parse(req.query); return { timezone: config.ADVISOR_TIMEZONE, slots: await appointmentService.getAvailability(q.from, q.to, q.duration) }; });
+  // Fase 7B item 6: read-only, no PII, but a public GET with no auth can still be cheaply
+  // scraped/hammered -- a light limit, well above any real usage pattern.
+  app.get("/api/availability", { config: routeRateLimit(60, 60_000) }, async (req) => { const q = z.object({ from: z.coerce.date(), to: z.coerce.date(), duration: z.coerce.number().int().positive().default(config.MEETING_DURATION_MINUTES) }).parse(req.query); return { timezone: config.ADVISOR_TIMEZONE, slots: await appointmentService.getAvailability(q.from, q.to, q.duration) }; });
 
   app.get("/api/appointments/:id", async (req, reply) => { const { id } = z.object({ id: z.string().uuid() }).parse(req.params); const appointment = await appointmentsRepo.findById(id); return appointment ?? reply.code(404).send({ error: "APPOINTMENT_NOT_FOUND" }); });
 
   const book = z.object({ leadId: z.string().uuid(), title: z.string().min(1), description: z.string().default(""), start: z.coerce.date(), end: z.coerce.date(), attendeeEmail: z.string().email().optional() });
   const idempotencyHeaders = z.object({ "idempotency-key": z.string().min(1) });
-  app.post("/api/appointments", async (req, reply) => {
+  // Fase 7B item 6/41: this endpoint has no verified-caller concept today (no auth) -- a rate
+  // limit is the one cheap guard against a script hammering it to create bogus appointments.
+  // Idempotency-Key + Calendar-slot revalidation (AppointmentService.book) remain the real
+  // correctness guards; this is only about request VOLUME.
+  app.post("/api/appointments", { config: routeRateLimit(30, 60_000) }, async (req, reply) => {
     const { "idempotency-key": idempotencyKey } = idempotencyHeaders.parse(req.headers);
     const body = book.parse(req.body);
     const appointment = await appointmentService.book({ ...body, timezone: config.ADVISOR_TIMEZONE }, idempotencyKey);
@@ -757,7 +856,11 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
     return reply.code(403).send();
   });
 
-  app.post("/webhooks/whatsapp", async (req, reply) => {
+  // Fase 7B item 6: deliberately generous (Meta's real delivery volume/burst pattern for a single
+  // WhatsApp Business number is nowhere near this) -- the signature check below remains the real
+  // authorization guard; this rate limit exists only to bound abuse from a caller that doesn't
+  // even have a valid signature, before it ever reaches that check.
+  app.post("/webhooks/whatsapp", { config: routeRateLimit(300, 60_000) }, async (req, reply) => {
     // Ack fast, reject clearly: without META_APP_SECRET there is no way to validate a
     // signature, so no request can be trusted -- fail closed rather than skip validation.
     if (!metaAppSecret) return reply.code(401).send();
@@ -826,7 +929,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
         "whatsapp webhook parsed inbound message",
       );
       await handleInboundWhatsAppText(
-        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler, confirmationHandler, reactivationHandler, pastBookedRecoveryHandler, appointments: appointmentsRepo, fiscalLeadScores: fiscalLeadScoresRepo },
+        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler, confirmationHandler, reactivationHandler, pastBookedRecoveryHandler, appointments: appointmentsRepo, fiscalLeadScores: fiscalLeadScoresRepo, leadIntegrityEnabled },
         message,
       );
     }
@@ -841,7 +944,12 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // Fase 7A report). Stateless and idempotent: every call is a fresh DB sweep (see
   // AppointmentReminderService's class doc comment), so a missed, delayed, or duplicated call
   // from the scheduler is always safe.
-  app.post("/internal/reminders/run", async (req, reply) => {
+  // Fase 7B item 9/10: small body limit (this route never reads req.body -- see below -- so
+  // anything beyond a trivial size is rejected before even being buffered) and its OWN rate limit,
+  // independent of every other route's -- "limitar abuso incluso con secreto válido" (a valid
+  // secret being reused far faster than any real scheduler ever would is itself a signal worth
+  // bounding).
+  app.post("/internal/reminders/run", { bodyLimit: 2048, config: routeRateLimit(20, 60_000) }, async (req, reply) => {
     // Fail closed: without a configured secret, no caller can be trusted -- same posture as the
     // WhatsApp webhook's own metaAppSecret check above.
     if (!reminderRunnerSecret) return reply.code(401).send({ error: "NOT_CONFIGURED" });
@@ -849,6 +957,10 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
     const provided = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : "";
     if (!timingSafeEqualStrings(provided, reminderRunnerSecret)) return reply.code(401).send({ error: "UNAUTHORIZED" });
 
+    // Fase 7B item 9 (§18/19): this route never reads req.body at all -- the sweep's every
+    // parameter (which templates, which flags, which windows) comes exclusively from `config`/the
+    // constructed appointmentReminderService, never from the request. A caller cannot influence
+    // WHICH template is sent or WHICH appointment is touched via any request field.
     const summary = await appointmentReminderService.run(new Date(), {
       enableReminders: appointmentRemindersEnabled,
       enablePostMeetingFollowup: postMeetingFollowupEnabled,
@@ -878,7 +990,12 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // Fase 7A spec item 9 / docs/PHASE4-DESIGN.md §9: no-show/completed is NEVER inferred
   // automatically -- these two endpoints are the ONLY way an appointment ever reaches COMPLETED or
   // NO_SHOW, both driven exclusively by Héctor's own explicit action.
-  app.post("/api/appointments/:id/mark-completed", async (req, reply) => {
+  // Fase 7B item 9/10: same small-body/own-rate-limit posture as /internal/reminders/run above.
+  // The target appointment and destination status are NEVER taken from the body -- :id is the
+  // only input, and the destination status is hardcoded per route (COMPLETED / NO_SHOW
+  // respectively) inside AppointmentCompletionService, never caller-supplied (spec item 12: "no
+  // permitir cambio de estado arbitrario").
+  app.post("/api/appointments/:id/mark-completed", { bodyLimit: 2048, config: routeRateLimit(20, 60_000) }, async (req, reply) => {
     if (!requireAdminToken(req, reply)) return;
     const { id } = appointmentIdParam.parse(req.params);
     const outcome = await appointmentCompletionService.markCompleted(id);
@@ -887,7 +1004,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
     return reply.code(200).send(outcome.appointment);
   });
 
-  app.post("/api/appointments/:id/mark-no-show", async (req, reply) => {
+  app.post("/api/appointments/:id/mark-no-show", { bodyLimit: 2048, config: routeRateLimit(20, 60_000) }, async (req, reply) => {
     if (!requireAdminToken(req, reply)) return;
     const { id } = appointmentIdParam.parse(req.params);
     const outcome = await appointmentCompletionService.markNoShow(id);

@@ -1,4 +1,4 @@
-import type { LeadRepository, ProcessedEventRepository, Logger, FiscalLeadScoreRepository } from "./ports.js";
+import type { LeadRepository, ProcessedEventRepository, Logger, FiscalLeadScoreRepository, EmailDomainChecker } from "./ports.js";
 import type { Lead, Vertical } from "../domain/lead.js";
 import { normalizePhoneToE164 } from "../domain/phone.js";
 import type { LeadService } from "./services.js";
@@ -6,6 +6,10 @@ import { scoreFiscalCalculatorLead } from "../domain/fiscal-lead-scoring.js";
 import type { FiscalScoreInput } from "../domain/fiscal-lead-score.js";
 import type { HubSpotFiscalSyncService } from "./hubspot-fiscal-sync-service.js";
 import type { HubSpotFiscalAttributionInput, HubSpotFiscalPropertiesInput } from "../domain/hubspot-fiscal-properties.js";
+import { classifyEmailQuality, normalizeEmail, DEFAULT_DISPOSABLE_EMAIL_DOMAINS } from "../domain/email-quality.js";
+import { classifyPhoneQuality } from "../domain/phone-quality.js";
+import { isSuspiciouslyFastSubmission } from "../domain/form-timing.js";
+import { computeLeadIntegrityScore, type LeadIntegritySignals } from "../domain/lead-integrity-score.js";
 
 /** Source value that gates fiscal_v1 scoring -- see FASE 6A. Any other `source` never runs
  * fiscal scoring, regardless of whether a `fiscalCalculator` payload happens to be present. */
@@ -87,6 +91,37 @@ export interface WebLeadCaptureInput {
    * since app.ts always supplies it for calculator submissions today).
    */
   submittedAt?: Date;
+  /** Fase 7B -- when the frontend form was first rendered/started, if known. Compared against
+   * `submittedAt` (see domain/form-timing.ts) to compute `suspectedAutomation` -- only when
+   * LEAD_INTEGRITY_ENABLED is true (see WebLeadCaptureServiceOptions). Absent is never itself
+   * suspicious -- a caller/form that doesn't send this simply gets no timing signal, same as
+   * today. */
+  formStartedAt?: Date;
+}
+
+/**
+ * Fase 7B -- all optional; every one defaults to "off" / absent, which reproduces this class's
+ * exact pre-Fase-7B behavior byte-for-byte (no lead-integrity computation, no new fields ever
+ * written) -- same "flag off means unchanged behavior" guarantee as every other flag in this
+ * project. See config.ts for where these are actually sourced from in app.ts.
+ */
+export interface WebLeadCaptureServiceOptions {
+  /** Gates ALL lead-integrity computation below (email/phone quality, suspectedAutomation,
+   * identityConflict persistence, leadIntegrityScore) -- see LEAD_INTEGRITY_ENABLED's doc comment
+   * in config.ts for the full list of things a low score must NEVER be used to do. */
+  leadIntegrityEnabled?: boolean;
+  /** Optional DNS-backed domain checker (see infrastructure/dns-email-domain-checker.ts) -- only
+   * ever consulted when BOTH leadIntegrityEnabled and emailDnsValidationEnabled are true. Absent
+   * (even with both flags on) simply skips the DNS step -- emailQuality then never reaches VALID,
+   * only UNVERIFIED/INVALID/DISPOSABLE (see email-quality.ts's own doc comment on why that's a
+   * safe, honest default, never a broken one).
+   */
+  emailDomainChecker?: EmailDomainChecker;
+  emailDnsValidationEnabled?: boolean;
+  disposableEmailCheckEnabled?: boolean;
+  /** Merged with DEFAULT_DISPOSABLE_EMAIL_DOMAINS -- see config.ts's
+   * EMAIL_DISPOSABLE_DOMAINS_EXTRA. */
+  extraDisposableDomains?: ReadonlySet<string>;
 }
 
 export interface WebLeadCaptureResult {
@@ -137,7 +172,86 @@ export class WebLeadCaptureService {
     // HUBSPOT_PRIVATE_APP_TOKEN isn't configured (every environment today) -- HubSpot sync is then
     // silently skipped, never throws, never blocks lead capture.
     private readonly hubspotSync?: HubSpotFiscalSyncService,
+    // Fase 7B -- see WebLeadCaptureServiceOptions' own doc comment. Defaults to {} (every flag
+    // undefined/falsy), which is byte-for-byte today's pre-Fase-7B behavior.
+    private readonly integrityOptions: WebLeadCaptureServiceOptions = {},
   ) {}
+
+  /**
+   * Fase 7B spec §36/§39 -- the SAME safe hierarchy now used by RealHubSpotCRMProvider, applied to
+   * the Lead Engine's own dedupe (independent of, and upstream from, HubSpot's): email match wins
+   * outright; a phone-only match is used ONLY if it doesn't contradict a genuinely different email
+   * already present on that record. A phone match against a lead with no email on file, or the
+   * SAME email, is a safe, ordinary match (this is also how a WhatsApp-first lead with no email
+   * yet correctly gets enriched by a later web submission). Never merges two contradictory
+   * identities -- see the class doc comment's "Fase 7B" note and the Fase 7B report §37/38.
+   */
+  private async resolveExistingLead(phoneE164: string | undefined, email: string | undefined): Promise<{ lead: Lead | null; identityConflict: boolean }> {
+    if (email) {
+      const byEmail = await this.leads.findByEmail(email);
+      if (byEmail) return { lead: byEmail, identityConflict: false };
+      if (phoneE164) {
+        const byPhone = await this.leads.findByPhoneE164(phoneE164);
+        if (byPhone) {
+          if (byPhone.email && byPhone.email.toLowerCase() !== email.toLowerCase()) {
+            return { lead: null, identityConflict: true };
+          }
+          return { lead: byPhone, identityConflict: false };
+        }
+      }
+      return { lead: null, identityConflict: false };
+    }
+    if (phoneE164) {
+      const byPhone = await this.leads.findByPhoneE164(phoneE164);
+      if (byPhone) return { lead: byPhone, identityConflict: false };
+    }
+    return { lead: null, identityConflict: false };
+  }
+
+  /**
+   * Fase 7B -- pure computation, no I/O beyond the optional DNS check. NEVER touches
+   * status/score/scoreClass/assignedAdvisor/conversation/appointment/consentContact -- see
+   * domain/lead-integrity-score.ts's own "kept separate from" list. Returns {} (nothing to patch)
+   * when leadIntegrityEnabled is false, so a caller can always spread the result into a patch/
+   * insert object unconditionally.
+   */
+  private async computeIntegritySignals(input: { phoneRaw?: string; phoneE164?: string; email?: string; identityConflict: boolean; formStartedAt?: Date; submittedAt: Date }): Promise<Partial<Lead>> {
+    if (!this.integrityOptions.leadIntegrityEnabled) return {};
+
+    const emailQuality = input.email
+      ? classifyEmailQuality(input.email, {
+          checkDisposable: this.integrityOptions.disposableEmailCheckEnabled,
+          disposableDomains: this.integrityOptions.extraDisposableDomains
+            ? new Set([...DEFAULT_DISPOSABLE_EMAIL_DOMAINS, ...this.integrityOptions.extraDisposableDomains])
+            : undefined,
+          domainConfirmedByDns:
+            this.integrityOptions.emailDnsValidationEnabled && this.integrityOptions.emailDomainChecker
+              ? (await this.integrityOptions.emailDomainChecker.domainHasMailExchanger(normalizeEmail(input.email).split("@")[1])) === true
+              : false,
+        })
+      : undefined;
+    // Fase 7B: classified whenever a raw phone STRING was submitted, not only when normalization
+    // succeeded -- classifyPhoneQuality(undefined) already returns "INVALID", which is exactly the
+    // right technical signal for "the caller tried to give us a phone and it didn't work out",
+    // never silently omitted just because normalizePhoneToE164 returned null.
+    const phoneQuality = input.phoneRaw ? classifyPhoneQuality(input.phoneE164) : undefined;
+    const suspectedAutomation = input.formStartedAt ? isSuspiciouslyFastSubmission(input.formStartedAt, input.submittedAt) : undefined;
+
+    const signals: LeadIntegritySignals = {
+      emailQuality,
+      phoneQuality,
+      suspectedAutomation,
+      identityConflict: input.identityConflict,
+    };
+    const { score, version } = computeLeadIntegrityScore(signals);
+
+    const patch: Partial<Lead> = { leadIntegrityScore: score, leadIntegrityVersion: version };
+    if (emailQuality !== undefined) patch.emailQuality = emailQuality;
+    if (phoneQuality !== undefined) patch.phoneQuality = phoneQuality;
+    if (suspectedAutomation !== undefined) patch.suspectedAutomation = suspectedAutomation;
+    if (input.identityConflict) patch.identityConflict = true;
+    return patch;
+  }
 
   /**
    * Fase 6A: scores + persists a fiscal_v1 row for `lead`'s current submission, when eligible.
@@ -210,21 +324,25 @@ export class WebLeadCaptureService {
     const idempotentReplay = claim === null;
 
     const phoneE164 = normalizePhoneToE164(input.phone) ?? undefined;
+    const normalizedEmail = input.email ? normalizeEmail(input.email) : undefined;
 
     if (idempotentReplay) {
       // Not a technical error -- a resubmitted/retried request with the same submissionId. Never
       // logs phone/email/financial figures, only an opaque id fragment, per this task's logging
       // constraints.
       this.logger.warn({ submissionIdLast8: input.submissionId.slice(-8) }, "web lead ingestion idempotent duplicate");
-      const existing = await this.leads.findByDedupKey({ phoneE164, email: input.email });
+      const { lead: existing } = await this.resolveExistingLead(phoneE164, normalizedEmail);
       if (existing) return { lead: existing, matchedExisting: true, idempotentReplay: true };
       // First attempt's processed_events row won the race but its lead write never landed (crash
       // mid-request, or this really is the very first attempt racing a retry sent before any
-      // response came back). Fall through and capture normally -- safe because leads themselves
-      // are ALSO deduped by phone/email below, independent of the processed_events guard.
+      // response came back), OR the resolved identity is contradictory (see resolveExistingLead)
+      // and there is genuinely no safe existing lead to return. Either way, fall through and
+      // capture normally -- safe because leads themselves are ALSO deduped below, independent of
+      // the processed_events guard.
     }
 
-    const existing = await this.leads.findByDedupKey({ phoneE164, email: input.email });
+    const submittedAt = input.submittedAt ?? new Date();
+    const { lead: existing, identityConflict } = await this.resolveExistingLead(phoneE164, normalizedEmail);
 
     if (existing) {
       const patch: Partial<Lead> = {};
@@ -242,12 +360,24 @@ export class WebLeadCaptureService {
       const mergedNotes = appendNote(existing.notes, input.note);
       if (mergedNotes !== existing.notes) patch.notes = mergedNotes;
 
+      Object.assign(patch, await this.computeIntegritySignals({ phoneRaw: input.phone, phoneE164, email: normalizedEmail, identityConflict: false, formStartedAt: input.formStartedAt, submittedAt }));
+
       const lead = Object.keys(patch).length > 0 ? await this.leads.update(existing.id, patch) : existing;
       await this.scoreFiscalCalculatorSubmission(lead, input);
       return { lead, matchedExisting: true, idempotentReplay };
     }
 
-    const lead = await this.leadService.createLead({
+    // identityConflict === true here means: a genuinely new email, whose phone nonetheless
+    // matches a DIFFERENT existing lead's own, different email (see resolveExistingLead's doc
+    // comment). Never merged into that other lead -- this submission becomes its OWN new lead,
+    // tagged identityConflict so it's visible for manual review, never silently contaminating the
+    // other record's data (Fase 7B spec §26/§37).
+    const integritySignals = await this.computeIntegritySignals({ phoneRaw: input.phone, phoneE164, email: normalizedEmail, identityConflict, formStartedAt: input.formStartedAt, submittedAt });
+    if (identityConflict) {
+      this.logger.warn({ submissionIdLast8: input.submissionId.slice(-8) }, "web lead capture: phone matched a different lead's email -- creating a separate lead instead of merging");
+    }
+
+    const created = await this.leadService.createLead({
       firstName: input.firstName,
       lastName: input.lastName,
       phone: input.phone,
@@ -262,6 +392,11 @@ export class WebLeadCaptureService {
       notes: input.note,
       privacyAcceptedAt: input.privacyAcceptedAt,
     });
+    // createLead()'s own input type is a fixed, narrow shape shared by every caller in this
+    // codebase (whatsapp-inbound-service.ts included) -- deliberately NOT widened for Fase 7B's
+    // handful of fields, which apply only to a web submission. A second, targeted update is a
+    // smaller, safer change than growing that shared contract.
+    const lead = Object.keys(integritySignals).length > 0 ? await this.leads.update(created.id, integritySignals) : created;
     await this.scoreFiscalCalculatorSubmission(lead, input);
     return { lead, matchedExisting: false, idempotentReplay };
   }

@@ -10,8 +10,9 @@ interface FakeContact {
 
 /**
  * In-memory HubSpot double for tests. Mirrors RealHubSpotCRMProvider's exact dedupe contract
- * (email first, then phone) and idempotent-upsert semantics (a second call with the same
- * email/phone updates the SAME contact, never creates a second one), without any network call.
+ * (email first, then phone, WITH Fase 7B's identity-conflict guard -- see that class's doc
+ * comment) and idempotent-upsert semantics (a second call with the same email/phone updates the
+ * SAME contact, never creates a second one), without any network call.
  *
  * `shouldFail` lets a test simulate a HubSpot outage/error to exercise fail-open behavior --
  * throws HubSpotProviderError, exactly like the real adapter would for a non-2xx response.
@@ -34,8 +35,22 @@ export class FakeHubSpotCRMProvider implements HubSpotCRMProvider {
     if (input.city) properties.city = input.city;
     if (input.state) properties.state = input.state;
 
-    let existing = input.email ? this.contacts.find((c) => c.email === input.email) : undefined;
-    if (!existing && input.phone) existing = this.contacts.find((c) => c.phone === input.phone);
+    const byEmail = input.email ? this.contacts.find((c) => c.email === input.email) : undefined;
+    let identityConflict = false;
+    let existing = byEmail;
+    if (!existing && input.phone) {
+      const byPhone = this.contacts.find((c) => c.phone === input.phone);
+      if (byPhone) {
+        // Fase 7B: same contradiction rule as RealHubSpotCRMProvider.findExistingContactId --
+        // a phone match against a contact with NO email on file, or the SAME email, is safe;
+        // a phone match against a DIFFERENT email is a conflict, never silently merged.
+        if (input.email && byPhone.email && byPhone.email !== input.email) {
+          identityConflict = true;
+        } else {
+          existing = byPhone;
+        }
+      }
+    }
 
     if (existing) {
       existing.properties = { ...existing.properties, ...properties };
@@ -51,6 +66,6 @@ export class FakeHubSpotCRMProvider implements HubSpotCRMProvider {
       properties,
     };
     this.contacts.push(contact);
-    return { hubspotContactId: contact.id, created: true };
+    return { hubspotContactId: contact.id, created: true, identityConflict: identityConflict || undefined };
   }
 }

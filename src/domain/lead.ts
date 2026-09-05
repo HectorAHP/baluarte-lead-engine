@@ -1,3 +1,6 @@
+import type { EmailQuality } from "./email-quality.js";
+import type { PhoneQuality } from "./phone-quality.js";
+
 export type Vertical = "PATRIMONIAL" | "GMM" | "UNKNOWN";
 
 export type LeadStatus =
@@ -42,6 +45,41 @@ export interface Lead {
    */
   qualifiedAt?: Date;
   bookingStartedAt?: Date; bookedAt?: Date; meetingAt?: Date; closedAt?: Date;
+  /**
+   * Fase 7B -- lead integrity / anti-fake-lead fields (migration 019_lead_integrity.sql). ALL
+   * optional/nullable, additive, and computed ONLY when LEAD_INTEGRITY_ENABLED is true (see
+   * config.ts) -- absent on every lead created before this phase, and absent on every new one
+   * while the flag stays false. Deliberately never read by fiscal_v1, scoring.ts,
+   * state-machine.ts, or any WhatsApp handler's routing decision -- see
+   * lead-integrity-score.ts's own doc comment for the full "kept separate from" list.
+   */
+  emailQuality?: EmailQuality;
+  phoneQuality?: PhoneQuality;
+  /** Set once, the first time an inbound WhatsApp message is actually received from this lead's
+   * own phoneE164 -- see whatsapp-inbound-service.ts. Never set by anything else; a phone that is
+   * merely syntactically VALID is never VERIFIED by that fact alone. */
+  phoneVerifiedAt?: Date;
+  /** Reserved for a future confirmation-link email flow (Fase 7B spec item 33) -- no code writes
+   * this yet; see the Fase 7B report for why that flow isn't built in this phase (no email
+   * provider configured). */
+  emailVerifiedAt?: Date;
+  /** True when a NEW submission's phone/email pair contradicted an EXISTING lead's identity (one
+   * matched, the other didn't) rather than being silently merged into it -- see
+   * WebLeadCaptureService.resolveExistingLead and RealHubSpotCRMProvider's own identity-conflict
+   * detection. Never exposed to the lead/end user (Fase 7B spec item 34). */
+  identityConflict?: boolean;
+  /** True when the web submission that created/updated this lead completed in an implausibly
+   * short time after the form was rendered (see domain/form-timing.ts) -- a signal only, never a
+   * block by itself. */
+  suspectedAutomation?: boolean;
+  /** 0-100, see domain/lead-integrity-score.ts. Recomputed on every web-capture submission while
+   * the feature flag is on; never on a WhatsApp-only lead (no equivalent submission event exists
+   * for one). */
+  leadIntegrityScore?: number;
+  /** Always "lead_integrity_v1" for now (LEAD_INTEGRITY_VERSION) -- stored alongside the score so
+   * a future scoring-rule change never silently reinterprets an old score under new rules, same
+   * versioning discipline as fiscal_v1's own `version` field. */
+  leadIntegrityVersion?: string;
 }
 
 /** Priority order for deduplicating an inbound lead against existing records: exact

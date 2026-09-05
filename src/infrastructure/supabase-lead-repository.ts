@@ -40,6 +40,14 @@ export interface LeadRow {
   booked_at: string | null;
   meeting_at: string | null;
   closed_at: string | null;
+  email_quality: string | null;
+  phone_quality: string | null;
+  phone_verified_at: string | null;
+  email_verified_at: string | null;
+  identity_conflict: boolean | null;
+  suspected_automation: boolean | null;
+  lead_integrity_score: number | null;
+  lead_integrity_version: string | null;
 }
 
 function toDateOrUndefined(value: string | null): Date | undefined {
@@ -85,6 +93,14 @@ export function mapRowToLead(row: LeadRow): Lead {
     bookedAt: toDateOrUndefined(row.booked_at),
     meetingAt: toDateOrUndefined(row.meeting_at),
     closedAt: toDateOrUndefined(row.closed_at),
+    emailQuality: (row.email_quality as Lead["emailQuality"]) ?? undefined,
+    phoneQuality: (row.phone_quality as Lead["phoneQuality"]) ?? undefined,
+    phoneVerifiedAt: toDateOrUndefined(row.phone_verified_at),
+    emailVerifiedAt: toDateOrUndefined(row.email_verified_at),
+    identityConflict: row.identity_conflict ?? undefined,
+    suspectedAutomation: row.suspected_automation ?? undefined,
+    leadIntegrityScore: row.lead_integrity_score ?? undefined,
+    leadIntegrityVersion: row.lead_integrity_version ?? undefined,
   };
 }
 
@@ -124,6 +140,14 @@ export function mapLeadToInsertRow(input: Omit<Lead, "id" | "createdAt" | "updat
     booked_at: input.bookedAt?.toISOString() ?? null,
     meeting_at: input.meetingAt?.toISOString() ?? null,
     closed_at: input.closedAt?.toISOString() ?? null,
+    email_quality: input.emailQuality ?? null,
+    phone_quality: input.phoneQuality ?? null,
+    phone_verified_at: input.phoneVerifiedAt?.toISOString() ?? null,
+    email_verified_at: input.emailVerifiedAt?.toISOString() ?? null,
+    identity_conflict: input.identityConflict ?? null,
+    suspected_automation: input.suspectedAutomation ?? null,
+    lead_integrity_score: input.leadIntegrityScore ?? null,
+    lead_integrity_version: input.leadIntegrityVersion ?? null,
   };
 }
 
@@ -163,6 +187,14 @@ export function mapLeadPatchToRow(patch: Partial<Lead>): Record<string, unknown>
   if (patch.bookedAt !== undefined) row.booked_at = patch.bookedAt.toISOString();
   if (patch.meetingAt !== undefined) row.meeting_at = patch.meetingAt.toISOString();
   if (patch.closedAt !== undefined) row.closed_at = patch.closedAt.toISOString();
+  if (patch.emailQuality !== undefined) row.email_quality = patch.emailQuality;
+  if (patch.phoneQuality !== undefined) row.phone_quality = patch.phoneQuality;
+  if (patch.phoneVerifiedAt !== undefined) row.phone_verified_at = patch.phoneVerifiedAt.toISOString();
+  if (patch.emailVerifiedAt !== undefined) row.email_verified_at = patch.emailVerifiedAt.toISOString();
+  if (patch.identityConflict !== undefined) row.identity_conflict = patch.identityConflict;
+  if (patch.suspectedAutomation !== undefined) row.suspected_automation = patch.suspectedAutomation;
+  if (patch.leadIntegrityScore !== undefined) row.lead_integrity_score = patch.leadIntegrityScore;
+  if (patch.leadIntegrityVersion !== undefined) row.lead_integrity_version = patch.leadIntegrityVersion;
   return row;
 }
 
@@ -231,5 +263,17 @@ export class SupabaseLeadRepository implements LeadRepository {
     const { data, error } = await this.client.from("leads").select().eq(column, value).limit(1).maybeSingle();
     if (error) throw new Error(`SUPABASE_LEAD_DEDUP_FAILED: ${error.message}`);
     return data ? mapRowToLead(data as LeadRow) : null;
+  }
+
+  /** Fase 7B -- see LeadRepository.findByEmail's doc comment in ports.ts. */
+  async findByEmail(email: string): Promise<Lead | null> {
+    const { data, error } = await this.client.from("leads").select().ilike("email", email).limit(1).maybeSingle();
+    if (error) throw new Error(`SUPABASE_LEAD_FIND_BY_EMAIL_FAILED: ${error.message}`);
+    return data ? mapRowToLead(data as LeadRow) : null;
+  }
+
+  /** Fase 7B -- see LeadRepository.findByPhoneE164's doc comment in ports.ts. */
+  async findByPhoneE164(phoneE164: string): Promise<Lead | null> {
+    return this.findOneByColumn("phone_e164", phoneE164);
   }
 }
