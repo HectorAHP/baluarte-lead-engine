@@ -21,6 +21,10 @@ import { FakeHubSpotCRMProvider } from "../../src/infrastructure/fake-hubspot-cr
  */
 export const TEST_WHATSAPP_VERIFY_TOKEN = "test-verify-token";
 export const TEST_META_APP_SECRET = "test-app-secret";
+// Fase 7A -- same "a fixed test value, never buildApp()'s own config fallback" rationale as the
+// two constants above.
+export const TEST_REMINDER_RUNNER_SECRET = "test-reminder-runner-secret";
+export const TEST_ADMIN_API_TOKEN = "test-admin-api-token";
 
 export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
   return buildApp({
@@ -76,6 +80,16 @@ export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
     whatsappBookingEnabled: false,
     whatsappCancellationEnabled: false,
     whatsappRescheduleEnabled: false,
+    // Fase 7A -- same deterministic-false-unless-asked rationale as every flag above.
+    appointmentRemindersEnabled: false,
+    postMeetingFollowupEnabled: false,
+    appointmentConfirmationEnabled: false,
+    // Fase 7A -- undefined by default (not TEST_REMINDER_RUNNER_SECRET/TEST_ADMIN_API_TOKEN): a
+    // test must opt IN to a configured secret to exercise the authorized path, so the default
+    // posture for every other test is "these endpoints fail closed", exactly production's
+    // real posture whenever the corresponding env var is unset.
+    reminderRunnerSecret: undefined,
+    adminApiToken: undefined,
     ...overrides,
   });
 }

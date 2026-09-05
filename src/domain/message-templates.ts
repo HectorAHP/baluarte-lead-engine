@@ -442,3 +442,97 @@ export const QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE =
 /** Fase 6E, item 3/4: transparent answer to "¿quién eres?" / "¿eres un bot?" / "¿con quién
  * hablo?" -- see domain/lia-identity.ts for why this never claims to be human. */
 export const QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE = LIA_IDENTITY_ANSWER;
+
+// ---------------------------------------------------------------------------------------------
+// Fase 7A -- reminders / confirmation / post-meeting follow-up / no-show copy.
+//
+// The four *Template() builders below are for messages sent OUTSIDE an active 24h customer-service
+// window (WhatsApp/Meta requires a pre-approved Message Template for those -- see
+// MessagingProvider.sendTemplate). Each returns { body, params }: `body` is the exact rendered
+// text (persisted as the outbound message's own body, same as every sendAndPersistReply call, and
+// what the lead will actually see once Meta renders the template) and `params` is the ordered
+// variable-value array sendTemplate expects -- both derived from the SAME inputs so they can never
+// drift apart. The template's own fixed wording lives ONLY here (never duplicated into
+// appointment-reminder-service.ts or the admin endpoints) so a copy change is always one edit.
+//
+// buildAppointmentConfirmedReplyMessage, below the four, is a plain free-text reply -- sent via
+// sendText, never sendTemplate -- because it only ever fires in direct response to an inbound
+// message the lead just sent (see WhatsAppAppointmentConfirmationHandler), which is always inside
+// the 24h window by construction.
+//
+// No message here ever mentions score/scoreClass/HOT-WARM-NURTURE/income/deductions/tax regime/
+// medical content -- only what's needed to talk about the appointment itself (Fase 7A spec, item
+// 16).
+// ---------------------------------------------------------------------------------------------
+
+/** Fallback used in every template param below when the lead has no `firstName` on file --
+ * Meta template bodies have a FIXED number of variable slots, so (unlike buildWelcomeMessage's
+ * "Hola." / "Hola, Juan." branch) there is no way to omit the name slot entirely when absent. */
+function templateGreetingName(firstName: string | undefined): string {
+  return firstName ?? "Estimado(a) cliente";
+}
+
+export interface AppointmentTemplatePayload {
+  body: string;
+  params: string[];
+}
+
+/** REMINDER_24H -- sent ~24h before the appointment, and is ALSO the turn that opens the
+ * confirmation flow (see appointmentConfirmationMetadata, attached by the caller to this exact
+ * outbound message). Two variables: name, when (formatSlotForDisplay's single combined
+ * weekday+time string -- same convention as every other appointment message in this file). */
+export function buildAppointmentReminder24hMessage(firstName: string | undefined, when: string): AppointmentTemplatePayload {
+  const name = templateGreetingName(firstName);
+  return {
+    body: `Hola, ${name}. Te recuerdo tu asesoría con Héctor: ${when}. ¿Confirmas que podrás asistir? Responde a este mensaje para confirmar, reagendar o cancelar.`,
+    params: [name, when],
+  };
+}
+
+/** REMINDER_2H -- sent ~2h before the appointment. Deliberately the SAME copy whether or not the
+ * lead confirmed via the 24h reminder (Fase 7A spec item 7 explicitly allows "copy neutral" --
+ * differentiating would require a second Meta-approved template for no real benefit at this
+ * volume). Two variables: name, when. */
+export function buildAppointmentReminder2hMessage(firstName: string | undefined, when: string): AppointmentTemplatePayload {
+  const name = templateGreetingName(firstName);
+  return {
+    body: `Hola, ${name}. Tu asesoría con Héctor es hoy: ${when}. Te esperamos.`,
+    params: [name, when],
+  };
+}
+
+/** POST_MEETING_FOLLOWUP -- sent after appointments.status = COMPLETED (Héctor's own
+ * mark-completed action, never inferred automatically). One variable: name. Deliberately makes no
+ * assumption about the commercial outcome of the meeting (Fase 7A spec item 8). */
+export function buildPostMeetingFollowupMessage(firstName: string | undefined): AppointmentTemplatePayload {
+  const name = templateGreetingName(firstName);
+  return {
+    body: `Hola, ${name}. Gracias por tu tiempo hoy. Si tienes alguna duda sobre lo que revisamos, escríbeme por aquí.`,
+    params: [name],
+  };
+}
+
+/** NO_SHOW_NUDGE -- sent once, synchronously, the moment Héctor marks an appointment NO_SHOW
+ * (never from the periodic sweep -- see AppointmentCompletionService). One variable: name. */
+export function buildNoShowNudgeMessage(firstName: string | undefined): AppointmentTemplatePayload {
+  const name = templateGreetingName(firstName);
+  return {
+    body: `Hola, ${name}. Notamos que no pudimos conectar en tu cita de hoy. Si quieres, podemos buscar otro horario.`,
+    params: [name],
+  };
+}
+
+/** Sent via sendText (free-form, always inside the 24h window -- see the section doc comment
+ * above) once WhatsAppAppointmentConfirmationHandler durably transitions the appointment/lead to
+ * CONFIRMED. Mirrors buildWelcomeMessage's "omit the comma when no name" convention -- this one is
+ * a plain reply, not a template, so the graceful-omission branch IS available here. */
+export function buildAppointmentConfirmedReplyMessage(firstName: string | undefined): string {
+  const greeting = firstName ? `Perfecto, ${firstName}.` : "Perfecto.";
+  return `${greeting} Tu cita queda confirmada. Te esperamos.`;
+}
+
+/** Recoverable technical/infra failure while processing a confirmation reply -- no state change,
+ * the lead can simply reply again. Deliberately distinct copy from CANCELLATION_TECHNICAL_ERROR_MESSAGE
+ * (never mentions "cancelación" for a confirmation-flow failure). */
+export const APPOINTMENT_CONFIRMATION_TECHNICAL_ERROR_MESSAGE =
+  "Tuve un problema técnico al procesar tu confirmación. Puedes intentarlo nuevamente en un momento.";

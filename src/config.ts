@@ -41,6 +41,46 @@ const schema=z.object({
   // to WhatsAppRescheduleHandler only ever activates when this is explicitly "true". Same safe-
   // parsing rationale: never z.coerce.boolean().
   WHATSAPP_RESCHEDULE_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Fase 7A feature flags -- independent of every flag above and of each other, same safe-parsing
+  // rationale (never z.coerce.boolean()). false (default) leaves the entire reminders/confirmation/
+  // follow-up/no-show surface byte-for-byte inert: no sweep runs, no confirmation branch is ever
+  // checked, no admin transition sends a message. See docs/PHASE4-DESIGN.md and the Fase 7A report.
+  APPOINTMENT_REMINDERS_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  POST_MEETING_FOLLOWUP_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Reserved for a future *automatic nudge to Héctor* on an unconfirmed past appointment -- no
+  // code reads this yet (see AppointmentCompletionService's class doc comment: mark-completed/
+  // mark-no-show are Héctor-driven, not gated by this flag at all). Added now, per the Fase 7A
+  // spec, so the env surface for the eventual automatic-nudge slice is already reserved.
+  NO_SHOW_DETECTION_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Gates WhatsAppAppointmentConfirmationHandler (see whatsapp-inbound-service.ts) -- independent
+  // of APPOINTMENT_REMINDERS_ENABLED because a confirmation reply can only ever be interpreted
+  // AFTER a 24h reminder was actually sent; leaving them separately toggleable lets a future
+  // rollout enable reminders without yet trusting the confirmation-reply parser, or vice versa.
+  APPOINTMENT_CONFIRMATION_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Fase 7A -- Meta Message Template names (WhatsApp Business requires a pre-approved template for
+  // any business-initiated message sent outside the 24h customer-service window -- see
+  // MessagingProvider.sendTemplate). Configurable by design (Fase 7A spec item 3: "no hardcodear
+  // necesariamente nombres de producción") -- defaults match the exact names proposed for Héctor to
+  // submit to Meta Business Manager (see the Fase 7A report), but never assumed approved: sending
+  // fails loudly (MessagingProviderError, delivery row left FAILED) until Meta actually approves
+  // whatever name ends up configured here.
+  WHATSAPP_TEMPLATE_REMINDER_24H:z.string().default("recordatorio_24h"),
+  WHATSAPP_TEMPLATE_REMINDER_2H:z.string().default("recordatorio_2h"),
+  WHATSAPP_TEMPLATE_POST_MEETING:z.string().default("seguimiento_post_cita"),
+  WHATSAPP_TEMPLATE_NO_SHOW:z.string().default("no_show_nudge"),
+  // Meta locale code for every template above -- "es_MX" (not "es"/"es-MX") is Meta's own
+  // documented format for Mexican Spanish in the Template API.
+  WHATSAPP_TEMPLATE_LANGUAGE:z.string().default("es_MX"),
+  // Fase 7A -- static bearer secret for POST /internal/reminders/run (Fase 7A spec item 10:
+  // "Authorization: Bearer <REMINDER_RUNNER_SECRET>"). Optional/undefined fails the route closed
+  // (401, same "no secret configured -> nothing can be trusted" posture as META_APP_SECRET's own
+  // webhook check in app.ts) -- never a default value, since a default would BE the shared secret.
+  REMINDER_RUNNER_SECRET:z.string().optional(),
+  // Fase 7A -- static header token (`x-admin-token`, compared via timingSafeEqualStrings) for the
+  // two admin endpoints (mark-completed/mark-no-show). Same fail-closed-when-unset posture as
+  // REMINDER_RUNNER_SECRET above. Minimal viable admin auth, exactly as docs/PHASE4-DESIGN.md §18
+  // already flagged as the accepted risk pending a stronger scheme if this project's needs grow.
+  ADMIN_API_TOKEN:z.string().optional(),
   // Production hardening (web lead capture / POST /api/leads). Comma-separated origin allowlist
   // for @fastify/cors -- optional because a sensible NODE_ENV-based default (see
   // corsAllowedOrigins below) covers the common case without requiring an env var in every

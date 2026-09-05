@@ -72,6 +72,12 @@ export class InMemoryAppointmentRepository implements AppointmentRepository{
   async listAllByLeadId(leadId:string):Promise<Appointment[]>{
     return [...this.data.values()].filter(a=>a.leadId===leadId);
   }
+  async listActiveStartingBetween(from:Date,to:Date):Promise<Appointment[]>{
+    return [...this.data.values()].filter(a=>(a.status==="BOOKED"||a.status==="CONFIRMED")&&a.startsAt>=from&&a.startsAt<to);
+  }
+  async listCompletedEndingBetween(from:Date,to:Date):Promise<Appointment[]>{
+    return [...this.data.values()].filter(a=>a.status==="COMPLETED"&&a.endsAt>=from&&a.endsAt<to);
+  }
 }
 
 /**

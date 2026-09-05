@@ -154,6 +154,21 @@ export class AppointmentRescheduleInconsistentError extends Error {
 }
 
 /**
+ * Fase 7A -- thrown by WhatsAppAppointmentConfirmationHandler when the source of truth
+ * (appointments table, never inferred from messages) doesn't match what a confirmation reply
+ * requires: no BOOKED appointment exists for the lead, or more than one does (data-consistency
+ * violation, never silently picks one). Same escalate-to-HUMAN_HANDOFF posture as
+ * AppointmentCancellationInconsistentError/AppointmentRescheduleInconsistentError above -- never
+ * auto-retried, never silently ignored.
+ */
+export class AppointmentConfirmationInconsistentError extends Error {
+  constructor(public readonly leadId: string, public readonly reason: "NO_APPOINTMENT" | "MULTIPLE_APPOINTMENTS") {
+    super(`Appointment confirmation inconsistency for lead ${leadId}: ${reason}`);
+    this.name = "AppointmentConfirmationInconsistentError";
+  }
+}
+
+/**
  * Thrown when a reschedule operation row (appointment_reschedules, keyed by
  * `whatsapp-reschedule:{leadId}:{oldAppointmentId}:{offeredSlotId}`) is genuinely owned by another
  * request right now -- the row exists but its new appointment hasn't been persisted yet. Mirrors

@@ -69,6 +69,24 @@ export interface AppointmentRepository {
    * findActiveByLeadId returns. Same rationale/precedent as
    * BookingAttemptRepository.listByLeadId. */
   listAllByLeadId(leadId:string):Promise<Appointment[]>;
+  /**
+   * Fase 7A -- reminder sweep source query. Every appointment "still a live commitment" (status
+   * BOOKED or CONFIRMED -- CONFIRMED counts too: the 2h reminder must still go out to a lead who
+   * already confirmed via the 24h one, see docs/PHASE4-DESIGN.md §8/Fase 7A spec item 7) whose
+   * `startsAt` falls in `[from, to)`. Never CANCELLED/RESCHEDULED/NO_SHOW/COMPLETED -- those are
+   * never "starting soon" in any meaningful sense. Used by AppointmentReminderService for both the
+   * REMINDER_24H and REMINDER_2H sweeps (same method, two different [from, to) windows) --
+   * de-duplication against an already-sent reminder is entirely appointment_message_deliveries'
+   * job (idempotency_key), never this query's.
+   */
+  listActiveStartingBetween(from:Date,to:Date):Promise<Appointment[]>;
+  /**
+   * Fase 7A -- post-meeting follow-up sweep source query. Every appointment whose status is
+   * exactly COMPLETED (set only by Héctor's own mark-completed admin action -- never inferred
+   * automatically, see AppointmentCompletionService) and whose `endsAt` falls in `[from, to)`.
+   * Never NO_SHOW (Fase 7A spec item 8: no follow-up is ever sent for a no-show).
+   */
+  listCompletedEndingBetween(from:Date,to:Date):Promise<Appointment[]>;
 }
 export interface BookingAttemptRepository {
   findByKey(idempotencyKey:string):Promise<BookingAttempt|null>;

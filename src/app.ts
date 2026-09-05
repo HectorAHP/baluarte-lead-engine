@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest, type FastifyReply } from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
@@ -42,11 +42,14 @@ import { formatFiscalCalculatorNote } from "./domain/fiscal-calculator-lead-note
 import { SlotOfferingService } from "./application/slot-offering-service.js";
 import { AppointmentCancellationService } from "./application/appointment-cancellation-service.js";
 import { AppointmentRescheduleService } from "./application/appointment-reschedule-service.js";
+import { AppointmentReminderService } from "./application/appointment-reminder-service.js";
+import { AppointmentCompletionService } from "./application/appointment-completion-service.js";
 import { handleInboundWhatsAppText } from "./application/whatsapp-inbound-service.js";
 import { WhatsAppQualificationHandler } from "./application/whatsapp-qualification-handler.js";
 import { WhatsAppBookingHandler } from "./application/whatsapp-booking-handler.js";
 import { WhatsAppCancellationHandler } from "./application/whatsapp-cancellation-handler.js";
 import { WhatsAppRescheduleHandler } from "./application/whatsapp-reschedule-handler.js";
+import { WhatsAppAppointmentConfirmationHandler } from "./application/whatsapp-appointment-confirmation-handler.js";
 import { WhatsAppReactivationHandler } from "./application/whatsapp-reactivation-handler.js";
 import { WhatsAppPastBookedRecoveryHandler } from "./application/whatsapp-past-booked-recovery-handler.js";
 import { extractWhatsAppMessages } from "./domain/whatsapp-webhook-payload.js";
@@ -163,6 +166,17 @@ export interface AppDependencies {
   /** Override for config.WHATSAPP_RESCHEDULE_ENABLED -- same rationale and precedence as
    * whatsappCancellationEnabled above, kept fully independent. */
   whatsappRescheduleEnabled?: boolean;
+  /** Fase 7A overrides -- same "explicit override wins, else config, else false" precedence as
+   * every flag above, each fully independent. */
+  appointmentRemindersEnabled?: boolean;
+  postMeetingFollowupEnabled?: boolean;
+  appointmentConfirmationEnabled?: boolean;
+  /** Override for config.REMINDER_RUNNER_SECRET -- exists so POST /internal/reminders/run is
+   * testable without a real secret in the environment. */
+  reminderRunnerSecret?: string;
+  /** Override for config.ADMIN_API_TOKEN -- exists so the mark-completed/mark-no-show admin
+   * endpoints are testable without a real token in the environment. */
+  adminApiToken?: string;
   /** Production hardening (POST /api/leads). Override for config's computed corsAllowedOrigins --
    * lets a test assert prod-like allow/reject behavior without actually setting NODE_ENV=production
    * for the whole process. undefined (the only production path) uses config's own computed list. */
@@ -244,8 +258,10 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // constructed and injectable but has no consumer yet (see AppDependencies' doc comments above).
   const leadStatusHistoryRepo = overrides.leadStatusHistoryRepo ?? (supabaseClient ? new SupabaseLeadStatusHistoryRepository(supabaseClient) : new InMemoryLeadStatusHistoryRepository());
   const appointmentStatusHistoryRepo = overrides.appointmentStatusHistoryRepo ?? (supabaseClient ? new SupabaseAppointmentStatusHistoryRepository(supabaseClient) : new InMemoryAppointmentStatusHistoryRepository());
+  // Fase 7A: appointmentMessageDeliveryRepo now HAS real consumers -- AppointmentReminderService
+  // (24h/2h/post-meeting sweeps) and AppointmentCompletionService (the synchronous NO_SHOW_NUDGE
+  // send) -- the earlier "unused, future Phase 4D/4E wiring" placeholder no longer applies.
   const appointmentMessageDeliveryRepo = overrides.appointmentMessageDeliveryRepo ?? (supabaseClient ? new SupabaseAppointmentMessageDeliveryRepository(supabaseClient) : new InMemoryAppointmentMessageDeliveryRepository());
-  void appointmentMessageDeliveryRepo; // constructed for future Phase 4D/4E wiring; unused in 4B
   // Phase 4B: appointment_status_history now HAS a real consumer (AppointmentCancellationService
   // below) -- the earlier "unused in 4A" placeholder no longer applies to this one.
   const appointmentCancellationsRepo = overrides.appointmentCancellationsRepo ?? (supabaseClient ? new SupabaseAppointmentCancellationRepository(supabaseClient) : new InMemoryAppointmentCancellationRepository());
@@ -276,6 +292,30 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // Depends on cancellationService itself (reused wholesale for the double-booking-race rollback
   // path -- see AppointmentRescheduleService's class doc comment).
   const rescheduleService = new AppointmentRescheduleService(calendar, appointmentsRepo, appointmentReschedulesRepo, appointmentStatusHistoryRepo, cancellationService, app.log);
+
+  // Fase 7A: always constructed -- cheap, stateless, same rationale as cancellationService/
+  // rescheduleService above. Both flags below independently gate ONLY whether POST
+  // /internal/reminders/run's sweep call actually does anything for that delivery type (see
+  // AppointmentReminderService.run) -- the service and route always exist, so the route is safe
+  // to wire into a scheduler ahead of ever setting either flag to true.
+  const appointmentReminderService = new AppointmentReminderService(
+    { appointments: appointmentsRepo, leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, messaging, appointmentMessageDeliveries: appointmentMessageDeliveryRepo, logger: app.log },
+    {
+      reminder24h: config.WHATSAPP_TEMPLATE_REMINDER_24H,
+      reminder2h: config.WHATSAPP_TEMPLATE_REMINDER_2H,
+      postMeeting: config.WHATSAPP_TEMPLATE_POST_MEETING,
+      languageCode: config.WHATSAPP_TEMPLATE_LANGUAGE,
+    },
+    config.ADVISOR_TIMEZONE,
+  );
+  // Fase 7A: always constructed -- the mark-completed/mark-no-show admin endpoints are inert until
+  // Héctor calls them regardless of any feature flag (docs/PHASE4-DESIGN.md §9's own note, restated
+  // in the Fase 7A spec item 9) -- NO_SHOW_DETECTION_ENABLED gates nothing here, see config.ts.
+  const appointmentCompletionService = new AppointmentCompletionService(
+    appointmentsRepo, leadsRepo, conversationsRepo, messagesRepo, messaging,
+    appointmentStatusHistoryRepo, leadStatusHistoryRepo, appointmentMessageDeliveryRepo,
+    config.WHATSAPP_TEMPLATE_NO_SHOW, config.WHATSAPP_TEMPLATE_LANGUAGE, app.log,
+  );
 
   // "fake" only when a test/dev caller explicitly passed a FakeMessagingProvider override --
   // NOT whenever the resolved `messaging` instance happens to be one, since the normal
@@ -313,6 +353,16 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // for a lead already BOOKED/RESCHEDULE_REQUESTED, statuses a lead can only reach via the
   // booking flow -- this flag alone can never let a pre-booking lead skip ahead into reschedule.
   const whatsappRescheduleEnabled = overrides.whatsappRescheduleEnabled ?? config.WHATSAPP_RESCHEDULE_ENABLED;
+
+  // Fase 7A feature flags -- independent of every flag above and of each other.
+  const appointmentRemindersEnabled = overrides.appointmentRemindersEnabled ?? config.APPOINTMENT_REMINDERS_ENABLED;
+  const postMeetingFollowupEnabled = overrides.postMeetingFollowupEnabled ?? config.POST_MEETING_FOLLOWUP_ENABLED;
+  // Independent of appointmentRemindersEnabled: a confirmation reply can only ever be interpreted
+  // AFTER a 24h reminder was actually sent, but the flags are still separately toggleable (see
+  // config.ts's doc comment on APPOINTMENT_CONFIRMATION_ENABLED).
+  const appointmentConfirmationEnabled = overrides.appointmentConfirmationEnabled ?? config.APPOINTMENT_CONFIRMATION_ENABLED;
+  const reminderRunnerSecret = overrides.reminderRunnerSecret ?? config.REMINDER_RUNNER_SECRET;
+  const adminApiToken = overrides.adminApiToken ?? config.ADMIN_API_TOKEN;
 
   const qualificationHandler = qualificationEngineEnabled
     ? new WhatsAppQualificationHandler({
@@ -392,6 +442,22 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
       )
     : undefined;
 
+  // Fase 7A: only constructed when the flag is on. undefined keeps the pending-appointment-
+  // confirmation check in whatsapp-inbound-service.ts untaken -- Phase 4C behavior is unchanged
+  // with this flag off, exactly like cancellationHandler/rescheduleHandler above.
+  const confirmationHandler = appointmentConfirmationEnabled
+    ? new WhatsAppAppointmentConfirmationHandler({
+        leads: leadsRepo,
+        conversations: conversationsRepo,
+        appointments: appointmentsRepo,
+        appointmentStatusHistory: appointmentStatusHistoryRepo,
+        messaging,
+        messages: messagesRepo,
+        leadStatusHistory: leadStatusHistoryRepo,
+        logger: app.log,
+      })
+    : undefined;
+
   // Pre-launch hardening: reactivates a CANCELLED lead into a brand-new booking. Reuses
   // whatsappBookingEnabled (not a new flag -- see WhatsAppReactivationHandler's class doc
   // comment for why) -- undefined keeps handleInboundWhatsAppText's new CANCELLED routing branch
@@ -430,7 +496,14 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
     : undefined;
 
   // Sanitized: all flags are plain booleans, never secrets/tokens/message bodies.
-  app.log.info({ qualificationEngineEnabled, whatsappBookingEnabled, whatsappCancellationEnabled, whatsappRescheduleEnabled }, "Phase 3B/3C/4B/4C WhatsApp feature flags");
+  app.log.info(
+    {
+      qualificationEngineEnabled, whatsappBookingEnabled, whatsappCancellationEnabled, whatsappRescheduleEnabled,
+      appointmentRemindersEnabled, postMeetingFollowupEnabled, appointmentConfirmationEnabled,
+      noShowDetectionEnabled: config.NO_SHOW_DETECTION_ENABLED,
+    },
+    "Phase 3B/3C/4B/4C/7A WhatsApp feature flags",
+  );
 
   // Sanitized boot-time fingerprint of the loaded WhatsApp config -- only the last 4 characters
   // of the Phone Number ID, never the token/secret. Node only reads .env once at process start,
@@ -753,12 +826,74 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
         "whatsapp webhook parsed inbound message",
       );
       await handleInboundWhatsAppText(
-        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler, reactivationHandler, pastBookedRecoveryHandler, appointments: appointmentsRepo, fiscalLeadScores: fiscalLeadScoresRepo },
+        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler, confirmationHandler, reactivationHandler, pastBookedRecoveryHandler, appointments: appointmentsRepo, fiscalLeadScores: fiscalLeadScoresRepo },
         message,
       );
     }
 
     return reply.code(200).send({ received: true });
+  });
+
+  // -- Fase 7A: internal scheduler + admin endpoints -----------------------------------------
+
+  // Called every ~15 minutes by an external scheduler (Fase 7A spec item 11: Render Cron Job /
+  // cron-job.org / GitHub Actions -- deliberately NOT coupled to any one of them here, see the
+  // Fase 7A report). Stateless and idempotent: every call is a fresh DB sweep (see
+  // AppointmentReminderService's class doc comment), so a missed, delayed, or duplicated call
+  // from the scheduler is always safe.
+  app.post("/internal/reminders/run", async (req, reply) => {
+    // Fail closed: without a configured secret, no caller can be trusted -- same posture as the
+    // WhatsApp webhook's own metaAppSecret check above.
+    if (!reminderRunnerSecret) return reply.code(401).send({ error: "NOT_CONFIGURED" });
+    const authHeader = req.headers.authorization ?? "";
+    const provided = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : "";
+    if (!timingSafeEqualStrings(provided, reminderRunnerSecret)) return reply.code(401).send({ error: "UNAUTHORIZED" });
+
+    const summary = await appointmentReminderService.run(new Date(), {
+      enableReminders: appointmentRemindersEnabled,
+      enablePostMeetingFollowup: postMeetingFollowupEnabled,
+    });
+    // Sanitized: counts only -- never a leadId/appointmentId/phone/message body (Fase 7A spec item 17).
+    app.log.info({ summary }, "Fase 7A: reminder sweep run complete");
+    return reply.code(200).send({ ok: true, ...summary });
+  });
+
+  const appointmentIdParam = z.object({ id: z.string().uuid() });
+  /** Shared `x-admin-token` check for the two admin endpoints below -- same fail-closed-when-unset
+   * and timingSafeEqualStrings posture as the reminders-runner secret / WHATSAPP_VERIFY_TOKEN. */
+  function requireAdminToken(req: FastifyRequest, reply: FastifyReply): boolean {
+    if (!adminApiToken) {
+      reply.code(401).send({ error: "NOT_CONFIGURED" });
+      return false;
+    }
+    const headerValue = req.headers["x-admin-token"];
+    const provided = Array.isArray(headerValue) ? (headerValue[0] ?? "") : (headerValue ?? "");
+    if (!timingSafeEqualStrings(provided, adminApiToken)) {
+      reply.code(401).send({ error: "UNAUTHORIZED" });
+      return false;
+    }
+    return true;
+  }
+
+  // Fase 7A spec item 9 / docs/PHASE4-DESIGN.md §9: no-show/completed is NEVER inferred
+  // automatically -- these two endpoints are the ONLY way an appointment ever reaches COMPLETED or
+  // NO_SHOW, both driven exclusively by Héctor's own explicit action.
+  app.post("/api/appointments/:id/mark-completed", async (req, reply) => {
+    if (!requireAdminToken(req, reply)) return;
+    const { id } = appointmentIdParam.parse(req.params);
+    const outcome = await appointmentCompletionService.markCompleted(id);
+    if (outcome.type === "NOT_FOUND") return reply.code(404).send({ error: "APPOINTMENT_NOT_FOUND" });
+    if (outcome.type === "INCONSISTENT") return reply.code(409).send({ error: "APPOINTMENT_STATUS_INCONSISTENT" });
+    return reply.code(200).send(outcome.appointment);
+  });
+
+  app.post("/api/appointments/:id/mark-no-show", async (req, reply) => {
+    if (!requireAdminToken(req, reply)) return;
+    const { id } = appointmentIdParam.parse(req.params);
+    const outcome = await appointmentCompletionService.markNoShow(id);
+    if (outcome.type === "NOT_FOUND") return reply.code(404).send({ error: "APPOINTMENT_NOT_FOUND" });
+    if (outcome.type === "INCONSISTENT") return reply.code(409).send({ error: "APPOINTMENT_STATUS_INCONSISTENT" });
+    return reply.code(200).send(outcome.appointment);
   });
 
   app.setErrorHandler((error, _req, reply) => {

@@ -13,6 +13,7 @@ import { isFirstWhatsAppInboundForConversation } from "../domain/whatsapp-first-
 import { detectQualifiedLeadIntent } from "../domain/qualified-lead-intent-detection.js";
 import { resolvePendingQualifiedMenu, qualifiedMainMenuMetadata, qualifiedOptionsMenuMetadata } from "../domain/qualified-lead-menu-state.js";
 import { fiscalWelcomeMenuMetadata, resolvePendingFiscalWelcomeMenu, detectFiscalWelcomeDigit } from "../domain/fiscal-welcome-menu-state.js";
+import { resolvePendingAppointmentConfirmation, isAppointmentConfirmationReply } from "../domain/appointment-confirmation-state.js";
 import { topicFollowupMetadata } from "../domain/qualified-lead-topic-followup.js";
 import { conversationalFirstName } from "../domain/conversation-name.js";
 import {
@@ -79,6 +80,17 @@ export interface RescheduleTurnHandler {
 }
 
 /**
+ * Fase 7A confirmation orchestrator, injected only when config.APPOINTMENT_CONFIRMATION_ENABLED
+ * is true (see app.ts). Same decoupling reason as CancellationTurnHandler/RescheduleTurnHandler
+ * above -- WhatsAppAppointmentConfirmationHandler implements this. Unlike those two, this handler
+ * is dispatched ONLY when the pending-confirmation check inline below already matched -- see that
+ * check's own doc comment for why the gating lives there, not inside this handler.
+ */
+export interface ConfirmationTurnHandler {
+  handleTurn(params: { lead: Lead; conversationId: string; whatsappUserId: string; inboundText: string; now: Date }): Promise<void>;
+}
+
+/**
  * Pre-launch hardening: reactivates a CANCELLED lead into a brand-new booking. Injected only when
  * config.WHATSAPP_BOOKING_ENABLED is true (see app.ts) -- the reactivation flow is fundamentally
  * dependent on the booking flow being fully operational, so it reuses that flag rather than
@@ -135,6 +147,11 @@ export interface WhatsAppInboundDeps {
    * RESCHEDULE_REQUESTED lead can only be reached via that flag anyway, exactly Phase 4B behavior,
    * unchanged. */
   rescheduleHandler?: RescheduleTurnHandler;
+  /** Present only when the Fase 7A feature flag (APPOINTMENT_CONFIRMATION_ENABLED) is on. Absent
+   * (the default), the pending-appointment-confirmation check below is skipped entirely (no extra
+   * message-history read), and a BOOKED lead's text is routed exactly as it was before Fase 7A --
+   * byte-for-byte unchanged. */
+  confirmationHandler?: ConfirmationTurnHandler;
   /** Present only when the pre-launch reactivation feature is on (reuses WHATSAPP_BOOKING_ENABLED
    * -- see app.ts). Absent (the default), the CANCELLED routing branch below is never taken and a
    * CANCELLED lead falls through to the same "no automated reply" fallback as before, unchanged. */
@@ -633,6 +650,28 @@ export async function handleInboundWhatsAppText(
             lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date(),
             hasFiscalContext: !!fiscalContext,
           });
+          return;
+        }
+      }
+      // Fase 7A: a BOOKED lead whose most recent outbound message was the 24h reminder's
+      // confirmation request (resolvePendingAppointmentConfirmation, same "read only the last
+      // outbound message's metadata" convention as resolvePendingFiscalWelcomeMenu above) gets ONE
+      // extra check, BEFORE reschedule-intent/cancellation-intent: does this exact reply match the
+      // closed affirmative list (isAppointmentConfirmationReply)? If BOTH are true, this is the
+      // ONLY turn confirmationHandler ever claims -- checked inline here (not delegated blindly
+      // into the handler) specifically so every other case falls through completely unchanged:
+      // no pending confirmation, or a pending one that got "reagendar"/"cancelar"/anything else
+      // instead of an affirmative, all reach the exact same reschedule-intent /
+      // cancellation-intent / generic-fallback chain below as if this feature didn't exist (Fase
+      // 7A spec item 6: reuse those existing flows verbatim, never re-implement their detection
+      // here). confirmationHandler is present only when APPOINTMENT_CONFIRMATION_ENABLED is true
+      // (see app.ts) -- absent, this extra read/check is skipped entirely.
+      if (deps.confirmationHandler && lead.status === "BOOKED") {
+        const priorMessagesForConfirmation = await deps.messages.listByConversationId(conversationId);
+        const confirmationPending = resolvePendingAppointmentConfirmation(priorMessagesForConfirmation);
+        if (confirmationPending && isAppointmentConfirmationReply(input.text)) {
+          logBranch("appointment-confirmation", true);
+          await deps.confirmationHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
           return;
         }
       }

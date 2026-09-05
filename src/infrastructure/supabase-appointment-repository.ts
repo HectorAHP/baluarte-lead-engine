@@ -143,4 +143,26 @@ export class SupabaseAppointmentRepository implements AppointmentRepository {
     if (error) throw new Error(`SUPABASE_APPOINTMENT_LIST_ALL_FAILED: ${error.message}`);
     return (data as AppointmentRow[]).map(mapRowToAppointment);
   }
+
+  async listActiveStartingBetween(from: Date, to: Date): Promise<Appointment[]> {
+    const { data, error } = await this.client
+      .from("appointments")
+      .select()
+      .in("status", ["BOOKED", "CONFIRMED"])
+      .gte("starts_at", from.toISOString())
+      .lt("starts_at", to.toISOString());
+    if (error) throw new Error(`SUPABASE_APPOINTMENT_LIST_ACTIVE_STARTING_BETWEEN_FAILED: ${error.message}`);
+    return (data as AppointmentRow[]).map(mapRowToAppointment);
+  }
+
+  async listCompletedEndingBetween(from: Date, to: Date): Promise<Appointment[]> {
+    const { data, error } = await this.client
+      .from("appointments")
+      .select()
+      .eq("status", "COMPLETED")
+      .gte("ends_at", from.toISOString())
+      .lt("ends_at", to.toISOString());
+    if (error) throw new Error(`SUPABASE_APPOINTMENT_LIST_COMPLETED_ENDING_BETWEEN_FAILED: ${error.message}`);
+    return (data as AppointmentRow[]).map(mapRowToAppointment);
+  }
 }
