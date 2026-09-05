@@ -5,7 +5,7 @@ import {
   InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
   InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository, InMemoryAppointmentMessageDeliveryRepository,
   InMemoryAppointmentCancellationRepository, InMemoryAppointmentRescheduleRepository,
-  InMemoryFiscalLeadScoreRepository,
+  InMemoryFiscalLeadScoreRepository, InMemoryHubSpotSyncOutboxRepository,
 } from "../../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../../src/infrastructure/fake-calendar.js";
 import { FakeMessagingProvider } from "../../src/infrastructure/fake-messaging-provider.js";
@@ -26,6 +26,8 @@ export const TEST_META_APP_SECRET = "test-app-secret";
 // two constants above.
 export const TEST_REMINDER_RUNNER_SECRET = "test-reminder-runner-secret";
 export const TEST_ADMIN_API_TOKEN = "test-admin-api-token";
+// Fase 7C -- same "a fixed test value, never buildApp()'s own config fallback" rationale.
+export const TEST_HUBSPOT_SYNC_RUNNER_SECRET = "test-hubspot-sync-runner-secret";
 
 export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
   return buildApp({
@@ -63,6 +65,8 @@ export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
     appointmentReschedulesRepo: new InMemoryAppointmentRescheduleRepository(),
     // Fase 6A -- same "complete set, never a config-driven default" rationale as every repo above.
     fiscalLeadScoresRepo: new InMemoryFiscalLeadScoreRepository(),
+    // Fase 7C -- same "complete set, never a config-driven default" rationale as every repo above.
+    hubspotSyncOutboxRepo: new InMemoryHubSpotSyncOutboxRepository(),
     calendar: new FakeCalendarProvider(),
     messaging: new FakeMessagingProvider(),
     // Fase 6F -- same "complete set, never a config-driven default" rationale as every provider
@@ -102,6 +106,9 @@ export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
     disposableEmailCheckEnabled: false,
     honeypotEnabled: false,
     emailDomainChecker: new FakeEmailDomainChecker(),
+    // Fase 7C -- same deterministic-false/unset-by-default rationale as every flag/secret above.
+    hubspotOutboxEnabled: false,
+    hubspotSyncRunnerSecret: undefined,
     ...overrides,
   });
 }

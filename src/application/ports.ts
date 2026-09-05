@@ -1,6 +1,7 @@
 import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment, AppointmentStatus } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js"; import type { LeadStatusHistoryEntry } from "../domain/lead-status-history.js"; import type { AppointmentStatusHistoryEntry } from "../domain/appointment-status-history.js"; import type { AppointmentMessageDelivery } from "../domain/appointment-message-delivery.js"; import type { AppointmentCancellation } from "../domain/appointment-cancellation.js"; import type { AppointmentReschedule } from "../domain/appointment-reschedule.js";
 import type { ProcessedEvent } from "../domain/processed-event.js";
 import type { FiscalLeadScore } from "../domain/fiscal-lead-score.js";
+import type { HubSpotSyncOutboxEntry, HubSpotSyncOutboxStatus } from "../domain/hubspot-sync-outbox.js";
 export interface LeadRepository {
   create(input:Omit<Lead,"id"|"createdAt"|"updatedAt">):Promise<Lead>;
   findById(id:string):Promise<Lead|null>;
@@ -142,6 +143,15 @@ export interface FiscalLeadScoreRepository {
   /** Every fiscal_lead_scores row for this lead, newest first -- used by the WhatsApp context
    * bridge (fiscal-lead-context.ts) to read the most recent score/bands for a lead. */
   listByLeadId(leadId: string): Promise<FiscalLeadScore[]>;
+  /**
+   * Fase 7C -- read-only administrative tooling ONLY (see
+   * application/hubspot-outbox-reconciliation.ts / scripts/reconcile-hubspot-outbox.ts) -- never
+   * used by any scoring/capture business logic, which is exclusively keyed by
+   * (leadId, submissionId) via tryCreate/listByLeadId above. `since` bounds the scan (reconciling
+   * "everything ever" is never the right default for a live table); `limit` bounds a single page.
+   * Same "administrative, not business-logic" precedent as AppointmentRepository.listAllByLeadId.
+   */
+  listAll(since: Date, limit: number): Promise<FiscalLeadScore[]>;
 }
 export interface OfferedSlotRepository {
   create(input:Omit<OfferedSlot,"id"|"createdAt">):Promise<OfferedSlot>;
@@ -347,6 +357,31 @@ export interface HubSpotContactUpsertResult {
 }
 export interface HubSpotCRMProvider {
   upsertContact(input: HubSpotContactUpsertInput): Promise<HubSpotContactUpsertResult>;
+}
+
+/**
+ * Fase 7C -- transactional outbox for HubSpot delivery. See domain/hubspot-sync-outbox.ts's class
+ * doc comment for the full design. `tryCreate` wins outright (INSERT succeeds) or returns null on
+ * a (leadId, submissionId) unique-conflict -- never throws for the "already scheduled" case, same
+ * convention as every other tryCreate in this project (ProcessedEventRepository,
+ * SlotOfferClaimRepository, AppointmentMessageDeliveryRepository, ...).
+ */
+export interface HubSpotSyncOutboxRepository {
+  tryCreate(input: Omit<HubSpotSyncOutboxEntry, "id" | "createdAt" | "updatedAt" | "attemptCount" | "status" | "nextAttemptAt"> & { status?: HubSpotSyncOutboxStatus; nextAttemptAt?: Date }): Promise<HubSpotSyncOutboxEntry | null>;
+  findById(id: string): Promise<HubSpotSyncOutboxEntry | null>;
+  findByLeadAndSubmission(leadId: string, submissionId: string): Promise<HubSpotSyncOutboxEntry | null>;
+  /**
+   * Atomically claims up to `limit` rows in PENDING/FAILED_RETRYABLE whose nextAttemptAt has
+   * elapsed, transitioning each to PROCESSING in the same operation -- see the real
+   * implementation's SQL (migration 020, claim_hubspot_sync_outbox_batch) for exactly how this
+   * stays safe when two workers call it at the same moment (Fase 7C spec §12). Returns the
+   * claimed rows (already PROCESSING) in the order they'll be worked.
+   */
+  claimBatch(now: Date, limit: number): Promise<HubSpotSyncOutboxEntry[]>;
+  update(id: string, patch: Partial<HubSpotSyncOutboxEntry>): Promise<HubSpotSyncOutboxEntry>;
+  /** Read-only, for reconciliation/observability tooling -- never used by the processor's own
+   * claim/retry logic, which is exclusively driven by claimBatch. */
+  listByStatus(status: HubSpotSyncOutboxStatus): Promise<HubSpotSyncOutboxEntry[]>;
 }
 export interface AIProvider{generateStructured<T>(systemPrompt:string,messages:Array<{role:"user"|"assistant";content:string}>,schemaName:string):Promise<T>;}
 /**

@@ -1,4 +1,4 @@
-import type { HubSpotCRMProvider, Logger } from "./ports.js";
+import type { HubSpotCRMProvider, HubSpotContactUpsertInput, Logger } from "./ports.js";
 import type { Lead } from "../domain/lead.js";
 import { HubSpotProviderError } from "../domain/errors.js";
 import {
@@ -25,6 +25,42 @@ export interface SyncFiscalCalculatorLeadInput {
    * later-or-equal instant than this one.
    */
   calculatedAt: Date;
+}
+
+/**
+ * Fase 7C -- pure payload construction, extracted out of syncFiscalCalculatorLead below so
+ * WebLeadCaptureService's new outbox path (HUBSPOT_OUTBOX_ENABLED, see that class) can build the
+ * EXACT same HubSpotContactUpsertInput -- computed once, synchronously, at capture time -- without
+ * needing a HubSpotFiscalSyncService instance (which exists to own the HTTP call + logging, neither
+ * of which the outbox path wants: it only wants the payload to freeze into the outbox row). No I/O,
+ * never throws. `syncedAt` is passed in (not generated here) so the outbox path can pass the SAME
+ * moment it's about to persist -- syncFiscalCalculatorLead below still generates its own fresh
+ * `new Date()` for its inline, synchronous-path use, unchanged from before this refactor.
+ */
+export function buildFiscalHubSpotContactUpsertInput(input: SyncFiscalCalculatorLeadInput, syncedAt: Date): HubSpotContactUpsertInput {
+  const { lead } = input;
+  const properties = buildHubSpotFiscalProperties({
+    fiscalCalculator: input.fiscalCalculator,
+    submissionId: input.submissionId,
+    calculatedAt: input.calculatedAt,
+    syncedAt,
+    calculationVersion: input.calculationVersion ?? CALCULATION_VERSION_UNKNOWN,
+    fiscalScore: input.fiscalScore,
+    attribution: input.attribution,
+    source: lead.source,
+    privacyAccepted: true, // POST /api/leads schema-enforces privacyAccepted === true to reach this point
+    privacyAcceptedAt: input.privacyAcceptedAt,
+    consentContact: input.consentContact,
+  });
+  return {
+    email: lead.email,
+    phone: lead.phoneE164,
+    firstName: lead.firstName,
+    lastName: lead.lastName,
+    city: lead.city,
+    state: lead.state,
+    properties,
+  };
 }
 
 /**
@@ -94,31 +130,10 @@ export class HubSpotFiscalSyncService {
     }
 
     try {
-      const properties = buildHubSpotFiscalProperties({
-        fiscalCalculator: input.fiscalCalculator,
-        submissionId: input.submissionId,
-        calculatedAt: input.calculatedAt,
-        // Fase 6F.1: generated fresh, right now, right before the actual HubSpot call -- never
-        // reused from a prior attempt, never confused with calculatedAt above.
-        syncedAt: new Date(),
-        calculationVersion: input.calculationVersion ?? CALCULATION_VERSION_UNKNOWN,
-        fiscalScore: input.fiscalScore,
-        attribution: input.attribution,
-        source: lead.source,
-        privacyAccepted: true, // POST /api/leads schema-enforces privacyAccepted === true to reach this point
-        privacyAcceptedAt: input.privacyAcceptedAt,
-        consentContact: input.consentContact,
-      });
-
-      const result = await this.hubspot.upsertContact({
-        email: lead.email,
-        phone: lead.phoneE164,
-        firstName: lead.firstName,
-        lastName: lead.lastName,
-        city: lead.city,
-        state: lead.state,
-        properties,
-      });
+      // Fase 6F.1: generated fresh, right now, right before the actual HubSpot call -- never
+      // reused from a prior attempt, never confused with calculatedAt above.
+      const contactUpsertInput = buildFiscalHubSpotContactUpsertInput(input, new Date());
+      const result = await this.hubspot.upsertContact(contactUpsertInput);
 
       this.logger.warn(
         {

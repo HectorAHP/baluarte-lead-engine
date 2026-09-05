@@ -147,6 +147,7 @@ describe("Fase 6B -- WhatsApp inbound fiscal context bridge", () => {
     const throwingFiscalScores = {
       tryCreate: async () => { throw new Error("unused"); },
       listByLeadId: async (): Promise<FiscalLeadScore[]> => { throw new Error("SUPABASE_FISCAL_LEAD_SCORE_LIST_FAILED: connection refused to db.internal:5432"); },
+      listAll: async (): Promise<FiscalLeadScore[]> => { throw new Error("unused"); },
     };
     const failingDeps = { ...deps, fiscalLeadScores: throwingFiscalScores };
 

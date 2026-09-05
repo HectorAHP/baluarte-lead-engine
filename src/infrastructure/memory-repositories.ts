@@ -17,6 +17,8 @@ import type {AppointmentReschedule} from "../domain/appointment-reschedule.js";
 import type {ProcessedEvent} from "../domain/processed-event.js";
 import type {FiscalLeadScoreRepository} from "../application/ports.js";
 import type {FiscalLeadScore} from "../domain/fiscal-lead-score.js";
+import type {HubSpotSyncOutboxRepository} from "../application/ports.js";
+import type {HubSpotSyncOutboxEntry,HubSpotSyncOutboxStatus} from "../domain/hubspot-sync-outbox.js";
 import {SlotUnavailableError,DuplicateMessageError,BookingAttemptKeyConflictError} from "../domain/errors.js";
 import {messageDedupKey} from "../domain/message-dedup-key.js";
 
@@ -500,5 +502,71 @@ export class InMemoryFiscalLeadScoreRepository implements FiscalLeadScoreReposit
   async listByLeadId(leadId:string):Promise<FiscalLeadScore[]>{
     const rows=this.byLeadId.get(leadId)??[];
     return [...rows].sort((a,b)=>b.createdAt.getTime()-a.createdAt.getTime());
+  }
+  async listAll(since:Date,limit:number):Promise<FiscalLeadScore[]>{
+    return [...this.byKey.values()]
+      .filter(r=>r.createdAt.getTime()>=since.getTime())
+      .sort((a,b)=>a.createdAt.getTime()-b.createdAt.getTime())
+      .slice(0,limit);
+  }
+}
+
+// -------------------------------------------------------------------------------------------
+// Fase 7C -- transactional outbox for HubSpot delivery. See domain/hubspot-sync-outbox.ts and
+// ports.ts's HubSpotSyncOutboxRepository doc comment.
+// -------------------------------------------------------------------------------------------
+
+export class InMemoryHubSpotSyncOutboxRepository implements HubSpotSyncOutboxRepository{
+  private data=new Map<string,HubSpotSyncOutboxEntry>();
+  private byLeadAndSubmission=new Map<string,string>();
+
+  async tryCreate(input:Omit<HubSpotSyncOutboxEntry,"id"|"createdAt"|"updatedAt"|"attemptCount"|"status"|"nextAttemptAt">&{status?:HubSpotSyncOutboxStatus;nextAttemptAt?:Date}):Promise<HubSpotSyncOutboxEntry|null>{
+    const key=`${input.leadId}:${input.submissionId}`;
+    if(this.byLeadAndSubmission.has(key)) return null; // already scheduled -- same tryCreate convention as every other outbox-style repo in this project
+    const now=new Date();
+    const row:HubSpotSyncOutboxEntry={...input,status:input.status??"PENDING",attemptCount:0,nextAttemptAt:input.nextAttemptAt??now,id:randomUUID(),createdAt:now,updatedAt:now};
+    this.data.set(row.id,row);
+    this.byLeadAndSubmission.set(key,row.id);
+    return row;
+  }
+
+  async findById(id:string):Promise<HubSpotSyncOutboxEntry|null>{
+    return this.data.get(id)??null;
+  }
+
+  async findByLeadAndSubmission(leadId:string,submissionId:string):Promise<HubSpotSyncOutboxEntry|null>{
+    const id=this.byLeadAndSubmission.get(`${leadId}:${submissionId}`);
+    return id?this.data.get(id)??null:null;
+  }
+
+  /** No `await` between the filter and the mutation below -- this is what keeps a batch claim
+   * atomic under JS's single-threaded event loop even when two `claimBatch` calls race via
+   * `Promise.all` in a test: whichever call's synchronous filter+mutate block runs first claims
+   * the rows outright, and the second call's own filter (which reads AFTER the first call's
+   * synchronous mutation already landed) never sees them as PENDING/FAILED_RETRYABLE anymore. */
+  async claimBatch(now:Date,limit:number):Promise<HubSpotSyncOutboxEntry[]>{
+    const eligible=[...this.data.values()]
+      .filter(r=>(r.status==="PENDING"||r.status==="FAILED_RETRYABLE")&&r.nextAttemptAt.getTime()<=now.getTime())
+      .sort((a,b)=>a.nextAttemptAt.getTime()-b.nextAttemptAt.getTime())
+      .slice(0,limit);
+    const claimed:HubSpotSyncOutboxEntry[]=[];
+    for(const row of eligible){
+      const updated:HubSpotSyncOutboxEntry={...row,status:"PROCESSING",updatedAt:now};
+      this.data.set(row.id,updated);
+      claimed.push(updated);
+    }
+    return claimed;
+  }
+
+  async update(id:string,patch:Partial<HubSpotSyncOutboxEntry>):Promise<HubSpotSyncOutboxEntry>{
+    const c=this.data.get(id);
+    if(!c) throw new Error("HUBSPOT_SYNC_OUTBOX_ENTRY_NOT_FOUND");
+    const n={...c,...patch,id,updatedAt:new Date()};
+    this.data.set(id,n);
+    return n;
+  }
+
+  async listByStatus(status:HubSpotSyncOutboxStatus):Promise<HubSpotSyncOutboxEntry[]>{
+    return [...this.data.values()].filter(r=>r.status===status);
   }
 }

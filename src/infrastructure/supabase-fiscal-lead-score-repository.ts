@@ -83,4 +83,17 @@ export class SupabaseFiscalLeadScoreRepository implements FiscalLeadScoreReposit
     if (error) throw new Error(`SUPABASE_FISCAL_LEAD_SCORE_LIST_FAILED: ${error.message}`);
     return (data as FiscalLeadScoreRow[]).map(mapRowToFiscalLeadScore);
   }
+
+  /** Fase 7C -- see FiscalLeadScoreRepository.listAll's doc comment in ports.ts. Administrative
+   * tooling only. */
+  async listAll(since: Date, limit: number): Promise<FiscalLeadScore[]> {
+    const { data, error } = await this.client
+      .from("fiscal_lead_scores")
+      .select()
+      .gte("created_at", since.toISOString())
+      .order("created_at", { ascending: true })
+      .limit(limit);
+    if (error) throw new Error(`SUPABASE_FISCAL_LEAD_SCORE_LIST_ALL_FAILED: ${error.message}`);
+    return (data as FiscalLeadScoreRow[]).map(mapRowToFiscalLeadScore);
+  }
 }

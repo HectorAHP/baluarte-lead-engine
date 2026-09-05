@@ -115,6 +115,28 @@ const schema=z.object({
   // well-tested, already-working booking flow, which this task's "NO romper ningún flujo
   // funcional existente" rule takes priority over.
   STRICT_BOOKING_INTEGRITY_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+
+  // Fase 7C -- transactional-outbox HubSpot delivery. Default false: POST /api/leads keeps
+  // calling HubSpotFiscalSyncService inline and awaiting it, byte-for-byte today's pre-Fase-7C
+  // behavior. true: a new fiscal_v1 submission writes a hubspot_sync_outbox row instead (a cheap
+  // Supabase insert, never awaiting HubSpot itself) -- delivery then happens exclusively via
+  // POST /internal/hubspot-sync/run (see app.ts). Deliberately ONE flag, not two ("evitar flags
+  // redundantes" -- Fase 7C spec §31): there is no meaningful intermediate state between "sync
+  // inline" and "sync via outbox" worth exposing as a separate toggle.
+  HUBSPOT_OUTBOX_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // Bearer secret for POST /internal/hubspot-sync/run -- deliberately its OWN secret, never
+  // REMINDER_RUNNER_SECRET (Fase 7A) or ADMIN_API_TOKEN, same "never share a threshold/secret
+  // across unrelated concerns" principle already applied throughout this project. Optional/unset
+  // fails the route closed (401), same posture as every other internal-endpoint secret here.
+  HUBSPOT_SYNC_RUNNER_SECRET:z.string().optional(),
+  // How many outbox rows one worker run claims at most -- never caller-supplied (Fase 7C spec
+  // §29: "batch size controlado por config, no input libre").
+  HUBSPOT_OUTBOX_BATCH_SIZE:z.coerce.number().int().positive().default(20),
+  // See domain/hubspot-sync-retry.ts's DEFAULT_MAX_ATTEMPTS -- configurable so a future rollout
+  // can tune it without a code change, but the backoff SCHEDULE itself (§9) stays code-defined,
+  // never env-configurable (a wrong env value there could silently create a retry storm or an
+  // effectively-infinite retry).
+  HUBSPOT_OUTBOX_MAX_ATTEMPTS:z.coerce.number().int().positive().default(6),
   // Production hardening (web lead capture / POST /api/leads). Comma-separated origin allowlist
   // for @fastify/cors -- optional because a sensible NODE_ENV-based default (see
   // corsAllowedOrigins below) covers the common case without requiring an env var in every

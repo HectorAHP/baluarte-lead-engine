@@ -13,11 +13,12 @@ import {
   InMemoryQualificationAnswerRepository, InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
   InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository, InMemoryAppointmentMessageDeliveryRepository,
   InMemoryAppointmentCancellationRepository, InMemoryAppointmentRescheduleRepository, InMemoryProcessedEventRepository,
-  InMemoryFiscalLeadScoreRepository,
+  InMemoryFiscalLeadScoreRepository, InMemoryHubSpotSyncOutboxRepository,
 } from "./infrastructure/memory-repositories.js";
 import { SupabaseLeadRepository } from "./infrastructure/supabase-lead-repository.js";
 import { SupabaseProcessedEventRepository } from "./infrastructure/supabase-processed-event-repository.js";
 import { SupabaseFiscalLeadScoreRepository } from "./infrastructure/supabase-fiscal-lead-score-repository.js";
+import { SupabaseHubSpotSyncOutboxRepository } from "./infrastructure/supabase-hubspot-sync-outbox-repository.js";
 import { SupabaseAppointmentRepository } from "./infrastructure/supabase-appointment-repository.js";
 import { SupabaseBookingAttemptRepository } from "./infrastructure/supabase-booking-attempt-repository.js";
 import { SupabaseLeadScoreRepository } from "./infrastructure/supabase-lead-score-repository.js";
@@ -40,6 +41,7 @@ import { RealHubSpotCRMProvider } from "./infrastructure/hubspot-crm-provider.js
 import { LeadService, AppointmentService } from "./application/services.js";
 import { WebLeadCaptureService } from "./application/web-lead-capture.js";
 import { HubSpotFiscalSyncService } from "./application/hubspot-fiscal-sync-service.js";
+import { HubSpotOutboxProcessorService } from "./application/hubspot-outbox-processor.js";
 import { formatFiscalCalculatorNote } from "./domain/fiscal-calculator-lead-note.js";
 import { SlotOfferingService } from "./application/slot-offering-service.js";
 import { AppointmentCancellationService } from "./application/appointment-cancellation-service.js";
@@ -59,7 +61,7 @@ import { verifyMetaSignature } from "./domain/meta-signature.js";
 import { timingSafeEqualStrings } from "./domain/timing-safe-compare.js";
 import {
   LeadNotFoundError, InvalidLeadTransitionError, SlotUnavailableError,
-  IdempotencyConflictError, CalendarProviderError,
+  IdempotencyConflictError, CalendarProviderError, HubSpotProviderError,
 } from "./domain/errors.js";
 import type {
   LeadRepository, AppointmentRepository, BookingAttemptRepository, LeadScoreRepository,
@@ -67,7 +69,7 @@ import type {
   SlotOfferClaimRepository, CalendarProvider, MessagingProvider,
   LeadStatusHistoryRepository, AppointmentStatusHistoryRepository, AppointmentMessageDeliveryRepository,
   AppointmentCancellationRepository, AppointmentRescheduleRepository, ProcessedEventRepository,
-  FiscalLeadScoreRepository, HubSpotCRMProvider, EmailDomainChecker,
+  FiscalLeadScoreRepository, HubSpotCRMProvider, EmailDomainChecker, HubSpotSyncOutboxRepository,
 } from "./application/ports.js";
 
 declare module "fastify" {
@@ -100,6 +102,11 @@ export interface AppDependencies {
    * from leadScoresRepo below (owned by the WhatsApp qualification engine). See
    * FiscalLeadScoreRepository's doc comment in ports.ts. */
   fiscalLeadScoresRepo?: FiscalLeadScoreRepository;
+  /** Fase 7C: transactional outbox for HubSpot delivery -- see
+   * HubSpotSyncOutboxRepository's doc comment in ports.ts. Always constructed (cheap, stateless);
+   * only ever WRITTEN to by WebLeadCaptureService when HUBSPOT_OUTBOX_ENABLED is true, and only
+   * ever READ/claimed by HubSpotOutboxProcessorService via POST /internal/hubspot-sync/run. */
+  hubspotSyncOutboxRepo?: HubSpotSyncOutboxRepository;
   appointmentsRepo?: AppointmentRepository;
   bookingAttemptsRepo?: BookingAttemptRepository;
   leadScoresRepo?: LeadScoreRepository;
@@ -188,6 +195,14 @@ export interface AppDependencies {
   /** Override for the real DNS-backed checker -- tests inject a FakeEmailDomainChecker instead of
    * ever performing real DNS I/O, same override rationale as calendar/messaging above. */
   emailDomainChecker?: EmailDomainChecker;
+  /** Fase 7C overrides -- same "explicit override wins, else config, else false/unset" precedence
+   * as every flag/secret above. */
+  hubspotOutboxEnabled?: boolean;
+  /** Override for config.HUBSPOT_SYNC_RUNNER_SECRET -- exists so POST /internal/hubspot-sync/run
+   * is testable without a real secret in the environment. */
+  hubspotSyncRunnerSecret?: string;
+  hubspotOutboxBatchSize?: number;
+  hubspotOutboxMaxAttempts?: number;
   /** Production hardening (POST /api/leads). Override for config's computed corsAllowedOrigins --
    * lets a test assert prod-like allow/reject behavior without actually setting NODE_ENV=production
    * for the whole process. undefined (the only production path) uses config's own computed list. */
@@ -307,6 +322,9 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   const processedEventsRepo = overrides.processedEventsRepo ?? (supabaseClient ? new SupabaseProcessedEventRepository(supabaseClient) : new InMemoryProcessedEventRepository());
   // Fase 6A: fiscal calculator commercial scoring (fiscal_v1) history -- see FiscalLeadScoreRepository's doc comment in ports.ts.
   const fiscalLeadScoresRepo = overrides.fiscalLeadScoresRepo ?? (supabaseClient ? new SupabaseFiscalLeadScoreRepository(supabaseClient) : new InMemoryFiscalLeadScoreRepository());
+  // Fase 7C -- always constructed (cheap, stateless) -- see AppDependencies' own doc comment on
+  // hubspotSyncOutboxRepo for exactly who writes to vs. reads from it.
+  const hubspotSyncOutboxRepo = overrides.hubspotSyncOutboxRepo ?? (supabaseClient ? new SupabaseHubSpotSyncOutboxRepository(supabaseClient) : new InMemoryHubSpotSyncOutboxRepository());
   const appointmentsRepo = overrides.appointmentsRepo ?? (supabaseClient ? new SupabaseAppointmentRepository(supabaseClient) : new InMemoryAppointmentRepository());
   const bookingAttemptsRepo = overrides.bookingAttemptsRepo ?? (supabaseClient ? new SupabaseBookingAttemptRepository(supabaseClient) : new InMemoryBookingAttemptRepository());
   const leadScoresRepo = overrides.leadScoresRepo ?? (supabaseClient ? new SupabaseLeadScoreRepository(supabaseClient) : new InMemoryLeadScoreRepository());
@@ -348,14 +366,31 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // ever actually queried when BOTH leadIntegrityEnabled and emailDnsValidationEnabled are true
   // (see WebLeadCaptureService.computeIntegritySignals).
   const emailDomainChecker = overrides.emailDomainChecker ?? new DnsEmailDomainChecker();
+  // Fase 7C -- resolved here alongside the Fase 7B flags above, same "webLeadCaptureService needs
+  // it immediately" rationale.
+  const hubspotOutboxEnabled = overrides.hubspotOutboxEnabled ?? config.HUBSPOT_OUTBOX_ENABLED;
 
   const leadService = new LeadService(leadsRepo, leadScoresRepo, leadStatusHistoryRepo, app.log);
   // Fase 6F: always constructed (cheap, stateless) -- its own `hubspot` port being undefined is
-  // what actually gates real behavior, not a conditional construction here.
+  // what actually gates real behavior, not a conditional construction here. Fase 7C: still always
+  // constructed and still the ONLY sync path when hubspotOutboxEnabled is false.
   const hubspotFiscalSync = new HubSpotFiscalSyncService(hubspotCrm, app.log);
   const webLeadCaptureService = new WebLeadCaptureService(
     leadsRepo, processedEventsRepo, leadService, app.log, fiscalLeadScoresRepo, hubspotFiscalSync,
-    { leadIntegrityEnabled, emailDomainChecker, emailDnsValidationEnabled, disposableEmailCheckEnabled, extraDisposableDomains: extraDisposableEmailDomains },
+    { leadIntegrityEnabled, emailDomainChecker, emailDnsValidationEnabled, disposableEmailCheckEnabled, extraDisposableDomains: extraDisposableEmailDomains, hubspotOutboxEnabled },
+    hubspotSyncOutboxRepo,
+  );
+  // Fase 7C -- always constructed (cheap, stateless) -- only ever invoked by POST
+  // /internal/hubspot-sync/run, below. `hubspotCrm` being undefined (no HUBSPOT_PRIVATE_APP_TOKEN
+  // configured) means every claimed batch will fail every upsertContact call -- harmless: those
+  // rows simply retry with backoff like any other real failure, same fail-safe posture as every
+  // other optional provider in this file.
+  const notConfiguredHubSpotCrm: HubSpotCRMProvider = {
+    upsertContact: async () => { throw new HubSpotProviderError("HubSpot is not configured (HUBSPOT_PRIVATE_APP_TOKEN unset)"); },
+  };
+  const hubspotOutboxProcessor = new HubSpotOutboxProcessorService(
+    { outbox: hubspotSyncOutboxRepo, hubspotCrm: hubspotCrm ?? notConfiguredHubSpotCrm, logger: app.log },
+    { batchSize: overrides.hubspotOutboxBatchSize ?? config.HUBSPOT_OUTBOX_BATCH_SIZE, maxAttempts: overrides.hubspotOutboxMaxAttempts ?? config.HUBSPOT_OUTBOX_MAX_ATTEMPTS },
   );
   const appointmentService = new AppointmentService(calendar, appointmentsRepo, bookingAttemptsRepo, leadsRepo, app.log);
   // Always constructed -- cheap, stateless, and needed by both qualificationHandler (to offer
@@ -440,6 +475,8 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   const appointmentConfirmationEnabled = overrides.appointmentConfirmationEnabled ?? config.APPOINTMENT_CONFIRMATION_ENABLED;
   const reminderRunnerSecret = overrides.reminderRunnerSecret ?? config.REMINDER_RUNNER_SECRET;
   const adminApiToken = overrides.adminApiToken ?? config.ADMIN_API_TOKEN;
+  // Fase 7C -- deliberately its OWN secret, never reused from either of the two above.
+  const hubspotSyncRunnerSecret = overrides.hubspotSyncRunnerSecret ?? config.HUBSPOT_SYNC_RUNNER_SECRET;
 
   const qualificationHandler = qualificationEngineEnabled
     ? new WhatsAppQualificationHandler({
@@ -580,8 +617,9 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
       noShowDetectionEnabled: config.NO_SHOW_DETECTION_ENABLED,
       leadIntegrityEnabled, emailDnsValidationEnabled, disposableEmailCheckEnabled, honeypotEnabled,
       strictBookingIntegrityEnabled: config.STRICT_BOOKING_INTEGRITY_ENABLED,
+      hubspotOutboxEnabled,
     },
-    "Phase 3B/3C/4B/4C/7A/7B feature flags",
+    "Phase 3B/3C/4B/4C/7A/7B/7C feature flags",
   );
 
   // Sanitized boot-time fingerprint of the loaded WhatsApp config -- only the last 4 characters
@@ -967,6 +1005,24 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
     });
     // Sanitized: counts only -- never a leadId/appointmentId/phone/message body (Fase 7A spec item 17).
     app.log.info({ summary }, "Fase 7A: reminder sweep run complete");
+    return reply.code(200).send({ ok: true, ...summary });
+  });
+
+  // Fase 7C -- delivers the HubSpot outbox (see HubSpotOutboxProcessorService's class doc
+  // comment). Same posture as /internal/reminders/run above: own secret, own rate limit, small
+  // body limit, never reads req.body for anything -- batch size/max attempts come exclusively
+  // from config (HUBSPOT_OUTBOX_BATCH_SIZE/HUBSPOT_OUTBOX_MAX_ATTEMPTS), never the request (Fase
+  // 7C spec §29: "batch size controlado por config, no input libre"). Stateless and idempotent --
+  // safe to call from any scheduler, any cadence, or manually, at any time.
+  app.post("/internal/hubspot-sync/run", { bodyLimit: 2048, config: routeRateLimit(20, 60_000) }, async (req, reply) => {
+    if (!hubspotSyncRunnerSecret) return reply.code(401).send({ error: "NOT_CONFIGURED" });
+    const authHeader = req.headers.authorization ?? "";
+    const provided = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : "";
+    if (!timingSafeEqualStrings(provided, hubspotSyncRunnerSecret)) return reply.code(401).send({ error: "UNAUTHORIZED" });
+
+    const summary = await hubspotOutboxProcessor.run(new Date());
+    // Sanitized: counts only -- never a leadId/submissionId/email/phone/HubSpot response body.
+    app.log.info({ summary }, "Fase 7C: hubspot outbox run complete");
     return reply.code(200).send({ ok: true, ...summary });
   });
 

@@ -1,10 +1,10 @@
-import type { LeadRepository, ProcessedEventRepository, Logger, FiscalLeadScoreRepository, EmailDomainChecker } from "./ports.js";
+import type { LeadRepository, ProcessedEventRepository, Logger, FiscalLeadScoreRepository, EmailDomainChecker, HubSpotSyncOutboxRepository } from "./ports.js";
 import type { Lead, Vertical } from "../domain/lead.js";
 import { normalizePhoneToE164 } from "../domain/phone.js";
 import type { LeadService } from "./services.js";
 import { scoreFiscalCalculatorLead } from "../domain/fiscal-lead-scoring.js";
 import type { FiscalScoreInput } from "../domain/fiscal-lead-score.js";
-import type { HubSpotFiscalSyncService } from "./hubspot-fiscal-sync-service.js";
+import { buildFiscalHubSpotContactUpsertInput, type HubSpotFiscalSyncService, type SyncFiscalCalculatorLeadInput } from "./hubspot-fiscal-sync-service.js";
 import type { HubSpotFiscalAttributionInput, HubSpotFiscalPropertiesInput } from "../domain/hubspot-fiscal-properties.js";
 import { classifyEmailQuality, normalizeEmail, DEFAULT_DISPOSABLE_EMAIL_DOMAINS } from "../domain/email-quality.js";
 import { classifyPhoneQuality } from "../domain/phone-quality.js";
@@ -122,6 +122,16 @@ export interface WebLeadCaptureServiceOptions {
   /** Merged with DEFAULT_DISPOSABLE_EMAIL_DOMAINS -- see config.ts's
    * EMAIL_DISPOSABLE_DOMAINS_EXTRA. */
   extraDisposableDomains?: ReadonlySet<string>;
+  /**
+   * Fase 7C -- when true AND a hubspotOutbox repository is supplied, a NEW fiscal_v1 score
+   * schedules HubSpot delivery via the outbox (a synchronous, cheap Supabase insert -- see
+   * WebLeadCaptureService.scheduleHubSpotOutboxDelivery) INSTEAD OF calling
+   * HubSpotFiscalSyncService.syncFiscalCalculatorLead inline and awaiting HubSpot's own HTTP
+   * round-trip before this request can respond. False (the default): byte-for-byte today's
+   * pre-Fase-7C behavior -- the inline synchronous call, unchanged. See the Fase 7C report's
+   * "critical path" section for why this exists at all.
+   */
+  hubspotOutboxEnabled?: boolean;
 }
 
 export interface WebLeadCaptureResult {
@@ -175,6 +185,10 @@ export class WebLeadCaptureService {
     // Fase 7B -- see WebLeadCaptureServiceOptions' own doc comment. Defaults to {} (every flag
     // undefined/falsy), which is byte-for-byte today's pre-Fase-7B behavior.
     private readonly integrityOptions: WebLeadCaptureServiceOptions = {},
+    // Fase 7C -- optional so every existing wiring that predates the outbox keeps compiling.
+    // Consulted ONLY when integrityOptions.hubspotOutboxEnabled is true -- see that flag's own
+    // doc comment.
+    private readonly hubspotOutbox?: HubSpotSyncOutboxRepository,
   ) {}
 
   /**
@@ -290,13 +304,13 @@ export class WebLeadCaptureService {
           "lead fiscal score calculated",
         );
 
-        // Fase 6F: sync to HubSpot only on a genuine NEW fiscal_v1 row (never on an idempotent
+        // Fase 6F/7C: sync to HubSpot only on a genuine NEW fiscal_v1 row (never on an idempotent
         // replay of an already-scored submissionId -- `persisted` is exactly that signal). Runs
         // strictly AFTER the lead and its fiscal_v1 score are already durably persisted above --
         // see HubSpotFiscalSyncService's class doc comment for the full "persist lead -> persist
-        // score -> sync HubSpot" ordering rationale. Never throws (fail-open by construction).
-        if (this.hubspotSync && input.fiscalCalculatorSnapshot) {
-          await this.hubspotSync.syncFiscalCalculatorLead({
+        // score -> sync HubSpot" ordering rationale.
+        if (input.fiscalCalculatorSnapshot) {
+          const syncInput: SyncFiscalCalculatorLeadInput = {
             lead,
             submissionId: input.submissionId,
             fiscalCalculator: input.fiscalCalculatorSnapshot,
@@ -308,13 +322,65 @@ export class WebLeadCaptureService {
             // Fase 6F.1: the authoritative submission-capture timestamp, never the sync moment --
             // see WebLeadCaptureInput.submittedAt's doc comment.
             calculatedAt: input.submittedAt ?? new Date(),
-          });
+          };
+          if (this.integrityOptions.hubspotOutboxEnabled && this.hubspotOutbox) {
+            // Fase 7C CRITICAL PATH BOUNDARY: everything above this line (lead + fiscal_v1 +
+            // this outbox row itself) is what capture() waits for. What happens AFTER this line
+            // -- the actual HubSpot HTTP call -- runs on a completely separate schedule (see
+            // HubSpotOutboxProcessorService), so a slow/down/rate-limited HubSpot can never make
+            // this request slow, and a client that gives up waiting can never erase this row
+            // (it's already durably committed to Supabase before this call even starts).
+            await this.scheduleHubSpotOutboxDelivery(syncInput);
+          } else if (this.hubspotSync) {
+            // Pre-Fase-7C behavior, unchanged: synchronous, inline, awaited by this request.
+            await this.hubspotSync.syncFiscalCalculatorLead(syncInput);
+          }
         }
       }
     } catch (err) {
       this.logger.warn(
         { leadIdLast8: lead.id.slice(-8), errorName: err instanceof Error ? err.name : "unknown" },
         "lead fiscal score calculation failed",
+      );
+    }
+  }
+
+  /**
+   * Fase 7C -- writes ONE outbox row (a cheap Supabase insert, no network call to HubSpot) and
+   * returns. `buildFiscalHubSpotContactUpsertInput` is pure (no I/O) -- computing the payload here
+   * costs nothing beyond CPU, so freezing it into the row is effectively free compared to the
+   * HubSpot round-trip this method deliberately never makes.
+   *
+   * Idempotent via the SAME (leadId, submissionId) pair fiscal_lead_scores itself already keys on
+   * -- tryCreate losing the unique-conflict race here means a delivery is already scheduled (or
+   * done), never an error. Never throws: a failure to WRITE the outbox row is a genuine
+   * persistence problem, but it must never surface as a capture() failure -- exactly the same
+   * fail-open posture the pre-Fase-7C inline HubSpot call already had, just one layer earlier now.
+   */
+  private async scheduleHubSpotOutboxDelivery(input: SyncFiscalCalculatorLeadInput): Promise<void> {
+    if (!this.hubspotOutbox) return;
+    try {
+      const payload = buildFiscalHubSpotContactUpsertInput(input, new Date());
+      const entry = await this.hubspotOutbox.tryCreate({
+        leadId: input.lead.id,
+        submissionId: input.submissionId,
+        contactEmail: payload.email,
+        contactPhone: payload.phone,
+        payload,
+      });
+      this.logger.warn(
+        {
+          leadIdLast8: input.lead.id.slice(-8),
+          submissionIdLast8: input.submissionId.slice(-8),
+          hubspotOutboxIdLast8: entry ? entry.id.slice(-8) : undefined,
+          outcome: entry ? "scheduled" : "already_scheduled",
+        },
+        "hubspot outbox delivery scheduled",
+      );
+    } catch (err) {
+      this.logger.warn(
+        { leadIdLast8: input.lead.id.slice(-8), submissionIdLast8: input.submissionId.slice(-8), errorName: err instanceof Error ? err.name : "unknown" },
+        "failed to schedule hubspot outbox delivery -- the lead and its fiscal_v1 score remain correctly persisted",
       );
     }
   }
