@@ -14,6 +14,7 @@ class ThrowingDeleteEventCalendar implements CalendarProvider {
   constructor(private readonly inner: CalendarProvider) {}
   getAvailableSlots(...args: Parameters<CalendarProvider["getAvailableSlots"]>) { return this.inner.getAvailableSlots(...args); }
   isSlotAvailable(...args: Parameters<CalendarProvider["isSlotAvailable"]>) { return this.inner.isSlotAvailable(...args); }
+  isWithinBusinessHours(...args: Parameters<CalendarProvider["isWithinBusinessHours"]>) { return this.inner.isWithinBusinessHours(...args); }
   createEvent(...args: Parameters<CalendarProvider["createEvent"]>) { return this.inner.createEvent(...args); }
   async deleteEvent(): Promise<void> {
     throw new CalendarProviderError("Google Calendar is down");
@@ -24,6 +25,7 @@ class ThrowingCreateEventCalendar implements CalendarProvider {
   constructor(private readonly inner: CalendarProvider) {}
   getAvailableSlots(...args: Parameters<CalendarProvider["getAvailableSlots"]>) { return this.inner.getAvailableSlots(...args); }
   isSlotAvailable(...args: Parameters<CalendarProvider["isSlotAvailable"]>) { return this.inner.isSlotAvailable(...args); }
+  isWithinBusinessHours(...args: Parameters<CalendarProvider["isWithinBusinessHours"]>) { return this.inner.isWithinBusinessHours(...args); }
   async createEvent(_input: CalendarEventInput): Promise<never> {
     throw new CalendarProviderError("Google Calendar is down");
   }
@@ -41,6 +43,7 @@ class FlakyOnceCreateEventCalendar implements CalendarProvider {
   }
   getAvailableSlots(...args: Parameters<CalendarProvider["getAvailableSlots"]>) { return this.inner.getAvailableSlots(...args); }
   isSlotAvailable(...args: Parameters<CalendarProvider["isSlotAvailable"]>) { return this.inner.isSlotAvailable(...args); }
+  isWithinBusinessHours(...args: Parameters<CalendarProvider["isWithinBusinessHours"]>) { return this.inner.isWithinBusinessHours(...args); }
   async createEvent(input: CalendarEventInput) {
     if (this.failuresLeft > 0) {
       this.failuresLeft--;

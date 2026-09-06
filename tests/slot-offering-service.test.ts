@@ -28,6 +28,9 @@ class CountingCalendarProvider implements CalendarProvider {
   async isSlotAvailable(start: Date, end: Date) {
     return this.inner.isSlotAvailable(start, end);
   }
+  isWithinBusinessHours(start: Date, end: Date) {
+    return this.inner.isWithinBusinessHours(start, end);
+  }
   async createEvent(input: CalendarEventInput) {
     return this.inner.createEvent(input);
   }
@@ -41,6 +44,9 @@ const emptyCalendar: CalendarProvider = {
     return [];
   },
   async isSlotAvailable() {
+    return true;
+  },
+  isWithinBusinessHours() {
     return true;
   },
   async createEvent(): Promise<never> {
@@ -59,6 +65,9 @@ const fiveSlotCalendar: CalendarProvider = {
     }));
   },
   async isSlotAvailable() {
+    return true;
+  },
+  isWithinBusinessHours() {
     return true;
   },
   async createEvent(): Promise<never> {

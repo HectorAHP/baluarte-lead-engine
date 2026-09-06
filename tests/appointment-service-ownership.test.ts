@@ -25,6 +25,9 @@ class CountingCalendarProvider implements CalendarProvider {
   isSlotAvailable(...args: Parameters<CalendarProvider["isSlotAvailable"]>) {
     return this.inner.isSlotAvailable(...args);
   }
+  isWithinBusinessHours(...args: Parameters<CalendarProvider["isWithinBusinessHours"]>) {
+    return this.inner.isWithinBusinessHours(...args);
+  }
   async createEvent(input: CalendarEventInput): Promise<CalendarEventResult> {
     this.createEventCalls++;
     return this.inner.createEvent(input);
@@ -305,6 +308,9 @@ describe("AppointmentService.book -- ownership foundation", () => {
         return [];
       },
       async isSlotAvailable() {
+        return true;
+      },
+      isWithinBusinessHours() {
         return true;
       },
       async createEvent(): Promise<CalendarEventResult> {

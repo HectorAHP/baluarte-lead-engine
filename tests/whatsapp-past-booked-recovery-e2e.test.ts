@@ -49,6 +49,9 @@ class CountingCalendarProvider implements CalendarProvider {
   async isSlotAvailable(start: Date, end: Date) {
     return this.inner.isSlotAvailable(start, end);
   }
+  isWithinBusinessHours(start: Date, end: Date) {
+    return this.inner.isWithinBusinessHours(start, end);
+  }
   async createEvent(input: CalendarEventInput) {
     this.createEventCalls++;
     return this.inner.createEvent(input);

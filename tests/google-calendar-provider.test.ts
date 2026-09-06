@@ -101,6 +101,43 @@ describe("GoogleCalendarProvider.isSlotAvailable / getAvailableSlots", () => {
   });
 });
 
+// Fase 7F -- confirms the REAL provider actually wires config.SATURDAY_WORKDAY_END /
+// config.SUNDAY_BOOKING_ENABLED into its business-hours check, not just the domain function in
+// isolation (already exhaustively covered by tests/availability.test.ts). isWithinBusinessHours
+// is pure/synchronous -- no Google mock or "now" clamping concerns, so fixed calendar dates are
+// safe here (2026-03-07 is a real, confirmed Saturday; 2026-03-08 a Sunday -- see
+// tests/availability.test.ts's own reference-date comment for the same week).
+describe("GoogleCalendarProvider.isWithinBusinessHours -- Fase 7F", () => {
+  it("a Sunday instant is rejected -- config.SUNDAY_BOOKING_ENABLED defaults false", () => {
+    const provider = new GoogleCalendarProvider(makeMockApi());
+    const start = new Date("2026-03-08T18:00:00.000Z"); // ~noon Mexico City (UTC-6)
+    const end = new Date("2026-03-08T18:30:00.000Z");
+    expect(provider.isWithinBusinessHours(start, end)).toBe(false);
+  });
+
+  it("a Saturday slot ending exactly at config.SATURDAY_WORKDAY_END (14:00) is accepted", () => {
+    const provider = new GoogleCalendarProvider(makeMockApi());
+    // 2026-03-07 13:30-14:00 America/Mexico_City == 19:30-20:00 UTC (UTC-6, no DST in Mexico since 2022).
+    const start = new Date("2026-03-07T19:30:00.000Z");
+    const end = new Date("2026-03-07T20:00:00.000Z");
+    expect(provider.isWithinBusinessHours(start, end)).toBe(true);
+  });
+
+  it("a Saturday slot ending after config.SATURDAY_WORKDAY_END (14:00) is rejected", () => {
+    const provider = new GoogleCalendarProvider(makeMockApi());
+    const start = new Date("2026-03-07T20:00:00.000Z"); // 14:00 local
+    const end = new Date("2026-03-07T20:30:00.000Z"); // 14:30 local
+    expect(provider.isWithinBusinessHours(start, end)).toBe(false);
+  });
+
+  it("a normal weekday slot within WORKDAY_START/WORKDAY_END is unaffected by any of this", () => {
+    const provider = new GoogleCalendarProvider(makeMockApi());
+    const start = new Date("2026-03-02T15:00:00.000Z"); // Monday 09:00 local
+    const end = new Date("2026-03-02T15:30:00.000Z");
+    expect(provider.isWithinBusinessHours(start, end)).toBe(true);
+  });
+});
+
 describe("GoogleCalendarProvider.deleteEvent", () => {
   it("deletes the event by id (best-effort compensation path)", async () => {
     const eventsDelete = vi.fn().mockResolvedValue({});

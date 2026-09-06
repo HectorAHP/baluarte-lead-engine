@@ -247,6 +247,16 @@ export class AppointmentService{
     let meetingUrl=attempt.meetingUrl;
 
     if(!providerEventId){
+      // Fase 7F -- a "direct" booking (an exact start/end, never routed through
+      // getAvailableSlots' own output -- e.g. a raw POST /api/appointments call) must be
+      // rejected the same way an out-of-hours slot would already be absent from that output.
+      // Checked BEFORE the free/busy call (cheap, synchronous, no reason to spend a Google API
+      // round-trip on an obviously-invalid time) -- same SlotUnavailableError as a genuinely busy
+      // slot, since from the caller's perspective both mean "you cannot book this exact instant".
+      if(!this.calendar.isWithinBusinessHours(input.start,input.end)){
+        await this.bookingAttempts.update(attempt.id,{status:"FAILED"}).catch(()=>{});
+        throw new SlotUnavailableError();
+      }
       if(!await this.calendar.isSlotAvailable(input.start,input.end)){
         await this.bookingAttempts.update(attempt.id,{status:"FAILED"}).catch(()=>{});
         throw new SlotUnavailableError();

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { google, type calendar_v3 } from "googleapis";
 import type { CalendarProvider, CalendarSlot, CalendarEventInput, CalendarEventResult } from "../application/ports.js";
 import { CalendarProviderError, SlotUnavailableError } from "../domain/errors.js";
-import { computeAvailableSlots, clampAvailabilityWindow, type AvailabilityRules, type BusyPeriod } from "../domain/availability.js";
+import { computeAvailableSlots, clampAvailabilityWindow, isWithinBusinessHours, type AvailabilityRules, type BusyPeriod } from "../domain/availability.js";
 import { config } from "../config.js";
 
 export class GoogleCalendarProvider implements CalendarProvider {
@@ -39,6 +39,17 @@ export class GoogleCalendarProvider implements CalendarProvider {
   async isSlotAvailable(start: Date, end: Date): Promise<boolean> {
     const busy = await this.fetchBusyPeriods(start, end);
     return !busy.some((b) => start < b.end && end > b.start);
+  }
+
+  /**
+   * Fase 7F -- protects a "direct" booking (one that names an exact start/end rather than
+   * picking from an offered slot -- see AppointmentService.completeBooking) from ever landing
+   * outside business hours or on a closed day, using the SAME rules() this class already uses
+   * for slot generation. Pure and synchronous -- never queries Google Calendar itself (that
+   * remains isSlotAvailable's job, checked separately).
+   */
+  isWithinBusinessHours(start: Date, end: Date): boolean {
+    return isWithinBusinessHours(start, end, this.rules());
   }
 
   async createEvent(input: CalendarEventInput): Promise<CalendarEventResult> {
@@ -102,6 +113,8 @@ export class GoogleCalendarProvider implements CalendarProvider {
       timezone: config.ADVISOR_TIMEZONE,
       workdayStart: config.WORKDAY_START,
       workdayEnd: config.WORKDAY_END,
+      saturdayWorkdayEnd: config.SATURDAY_WORKDAY_END,
+      sundayBookingEnabled: config.SUNDAY_BOOKING_ENABLED,
       minNoticeHours: config.BOOKING_MIN_NOTICE_HOURS,
       maxDaysAhead: config.BOOKING_MAX_DAYS_AHEAD,
       maxSlots: 3,

@@ -20,6 +20,20 @@ export class FakeCalendarProvider implements CalendarProvider {
     return !this.busy.some((b) => start < b.end && end > b.start);
   }
 
+  /**
+   * Fase 7F -- deliberately ALWAYS true. This fake has no real business-hours concept (the
+   * hundreds of existing tests using it pick arbitrary dates/times with no regard for day-of-week
+   * or Baluarte's real commercial hours, by design -- see GoogleCalendarProvider for the real
+   * enforcement). Never add real business-hours logic here -- a test that specifically needs to
+   * verify business-hours enforcement should exercise domain/availability.ts's own
+   * isWithinBusinessHours directly, or construct a real GoogleCalendarProvider-shaped check --
+   * never by making this shared fake stricter, which would silently break every other test that
+   * uses it.
+   */
+  isWithinBusinessHours(_start: Date, _end: Date): boolean {
+    return true;
+  }
+
   async createEvent(input: CalendarEventInput): Promise<CalendarEventResult> {
     if (!(await this.isSlotAvailable(input.start, input.end))) throw new SlotUnavailableError();
     const id = randomUUID();

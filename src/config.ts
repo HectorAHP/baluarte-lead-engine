@@ -9,6 +9,15 @@ const schema=z.object({
   BOOKING_MAX_DAYS_AHEAD:z.coerce.number().default(14),
   WORKDAY_START:workdayTime.default("09:00"),
   WORKDAY_END:workdayTime.default("19:00"),
+  // Fase 7F -- Baluarte Capital's real commercial hours: Saturday keeps WORKDAY_START as its own
+  // start (deliberately NOT a separate "Saturday start" var -- there was never a business reason
+  // for one) but closes earlier. Sunday is closed entirely by default -- SUNDAY_BOOKING_ENABLED
+  // exists only as an explicit off-switch, never the seed of a separate Sunday schedule (if ever
+  // set true, Sunday simply falls back to the same Monday-Friday hours -- see
+  // domain/availability.ts's workdayBoundsForLocalDate). See domain/availability.ts for the exact
+  // per-day rule this feeds.
+  SATURDAY_WORKDAY_END:workdayTime.default("14:00"),
+  SUNDAY_BOOKING_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
   SUPABASE_URL:z.preprocess((v)=>v===""?undefined:v,z.string().url().optional()),
   SUPABASE_SECRET_KEY:z.string().optional(),
   GOOGLE_CLIENT_ID:z.string().optional(),

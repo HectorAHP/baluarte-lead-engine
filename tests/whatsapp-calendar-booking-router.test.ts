@@ -105,6 +105,7 @@ async function outboundMessages(repos: ReturnType<typeof buildRepos>, conversati
 class FailingCalendar implements CalendarProvider {
   async getAvailableSlots(): Promise<CalendarSlot[]> { throw new CalendarProviderError("simulated outage"); }
   async isSlotAvailable(): Promise<boolean> { throw new CalendarProviderError("simulated outage"); }
+  isWithinBusinessHours(): boolean { return true; }
   async createEvent(): Promise<CalendarEventResult> { throw new CalendarProviderError("simulated outage"); }
   async deleteEvent(): Promise<void> { throw new CalendarProviderError("simulated outage"); }
 }
@@ -113,6 +114,7 @@ class FailingCalendar implements CalendarProvider {
 class EmptyCalendar implements CalendarProvider {
   async getAvailableSlots(): Promise<CalendarSlot[]> { return []; }
   async isSlotAvailable(): Promise<boolean> { return true; }
+  isWithinBusinessHours(): boolean { return true; }
   async createEvent(input: CalendarEventInput): Promise<CalendarEventResult> { return { eventId: randomUUID() }; }
   async deleteEvent(): Promise<void> {}
 }

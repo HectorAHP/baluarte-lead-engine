@@ -6,6 +6,35 @@ import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
 import { SlotUnavailableError, IdempotencyConflictError, CalendarProviderError } from "../src/domain/errors.js";
 import type { CalendarProvider, CalendarEventResult } from "../src/application/ports.js";
+import { isWithinBusinessHours, type AvailabilityRules } from "../src/domain/availability.js";
+
+/**
+ * Fase 7F -- wraps FakeCalendarProvider for free/busy (never a real business-hours concept, see
+ * that class's own doc comment) but implements isWithinBusinessHours using the REAL domain
+ * function with real weekly rules -- proves AppointmentService.completeBooking actually calls and
+ * respects this check for a "direct" booking (an exact start/end, never routed through
+ * getAvailableSlots' own output), not just that the port method exists.
+ */
+function makeRulesEnforcingCalendar(rules: AvailabilityRules): CalendarProvider {
+  const inner = new FakeCalendarProvider();
+  return {
+    getAvailableSlots: (...args) => inner.getAvailableSlots(...args),
+    isSlotAvailable: (...args) => inner.isSlotAvailable(...args),
+    isWithinBusinessHours: (start, end) => isWithinBusinessHours(start, end, rules),
+    createEvent: (...args) => inner.createEvent(...args),
+    deleteEvent: (...args) => inner.deleteEvent(...args),
+  };
+}
+const REAL_WEEKLY_RULES: AvailabilityRules = {
+  timezone: "America/Mexico_City",
+  workdayStart: "09:00",
+  workdayEnd: "19:00",
+  saturdayWorkdayEnd: "14:00",
+  sundayBookingEnabled: false,
+  minNoticeHours: 2,
+  maxDaysAhead: 14,
+  maxSlots: 3,
+};
 
 function makeService() {
   const calendar = new FakeCalendarProvider();
@@ -99,6 +128,9 @@ describe("AppointmentService.book slot protection", () => {
         return [];
       },
       async isSlotAvailable() {
+        return true;
+      },
+      isWithinBusinessHours() {
         return true;
       },
       async createEvent(): Promise<CalendarEventResult> {
@@ -250,5 +282,78 @@ describe("AppointmentService.book -- meeting_at sync", () => {
     expect(second.id).toBe(first.id); // same appointment, not a duplicate
     const afterRetry = await leads.findById(lead.id);
     expect(afterRetry?.meetingAt).toEqual(sentinel); // untouched -- claimExistingAttempt never re-enters completeBooking
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fase 7F items 17/18 -- "booking directo" (an exact start/end passed straight to
+// AppointmentService.book, never picked from getAvailableSlots' own output -- e.g. a raw
+// POST /api/appointments call) must be rejected the same way an out-of-hours slot is already
+// absent from getAvailableSlots. Uses makeRulesEnforcingCalendar (real domain rules), never
+// FakeCalendarProvider alone -- that fake is deliberately permissive (see its own doc comment) and
+// would never catch a regression here.
+// ---------------------------------------------------------------------------------------------
+describe("AppointmentService.book -- Fase 7F direct-booking business-hours protection", () => {
+  it("item 17: a direct booking on Sunday is rejected, even though the calendar itself is free", async () => {
+    const calendar = makeRulesEnforcingCalendar(REAL_WEEKLY_RULES);
+    const appointments = new InMemoryAppointmentRepository();
+    const bookingAttempts = new InMemoryBookingAttemptRepository();
+    const leads = new InMemoryLeadRepository();
+    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger());
+    // 2026-03-08 is a Sunday (see tests/availability.test.ts's own reference week).
+    const input = bookingInput({ start: new Date("2026-03-08T18:00:00.000Z"), end: new Date("2026-03-08T18:30:00.000Z") });
+
+    await expect(service.book(input, randomUUID())).rejects.toThrow(SlotUnavailableError);
+  });
+
+  it("item 18: a direct booking on Saturday ending after 14:00 is rejected", async () => {
+    const calendar = makeRulesEnforcingCalendar(REAL_WEEKLY_RULES);
+    const appointments = new InMemoryAppointmentRepository();
+    const bookingAttempts = new InMemoryBookingAttemptRepository();
+    const leads = new InMemoryLeadRepository();
+    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger());
+    // 2026-03-07 is a Saturday; 20:00-20:30 UTC == 14:00-14:30 America/Mexico_City.
+    const input = bookingInput({ start: new Date("2026-03-07T20:00:00.000Z"), end: new Date("2026-03-07T20:30:00.000Z") });
+
+    await expect(service.book(input, randomUUID())).rejects.toThrow(SlotUnavailableError);
+  });
+
+  it("a direct booking on Saturday ending exactly at 14:00 is accepted (the boundary itself is never over-restricted)", async () => {
+    const calendar = makeRulesEnforcingCalendar(REAL_WEEKLY_RULES);
+    const appointments = new InMemoryAppointmentRepository();
+    const bookingAttempts = new InMemoryBookingAttemptRepository();
+    const leads = new InMemoryLeadRepository();
+    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger());
+    // 19:30-20:00 UTC == 13:30-14:00 America/Mexico_City.
+    const input = bookingInput({ start: new Date("2026-03-07T19:30:00.000Z"), end: new Date("2026-03-07T20:00:00.000Z") });
+
+    const appt = await service.book(input, randomUUID());
+    expect(appt.status).toBe("BOOKED");
+  });
+
+  it("the booking_attempts row is marked FAILED, never left PENDING, when rejected for being outside business hours", async () => {
+    const calendar = makeRulesEnforcingCalendar(REAL_WEEKLY_RULES);
+    const appointments = new InMemoryAppointmentRepository();
+    const bookingAttempts = new InMemoryBookingAttemptRepository();
+    const leads = new InMemoryLeadRepository();
+    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger());
+    const input = bookingInput({ start: new Date("2026-03-08T18:00:00.000Z"), end: new Date("2026-03-08T18:30:00.000Z") });
+    const key = randomUUID();
+
+    await expect(service.book(input, key)).rejects.toThrow(SlotUnavailableError);
+
+    const attempt = await bookingAttempts.findByKey(key);
+    expect(attempt?.status).toBe("FAILED");
+  });
+
+  it("a direct booking within normal weekday hours is completely unaffected by the new check", async () => {
+    const calendar = makeRulesEnforcingCalendar(REAL_WEEKLY_RULES);
+    const appointments = new InMemoryAppointmentRepository();
+    const bookingAttempts = new InMemoryBookingAttemptRepository();
+    const leads = new InMemoryLeadRepository();
+    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger());
+    const appt = await service.book(bookingInput(), randomUUID()); // Monday 09:00, the file's own default
+
+    expect(appt.status).toBe("BOOKED");
   });
 });

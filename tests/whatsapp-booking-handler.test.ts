@@ -25,6 +25,9 @@ class ThrowingCreateEventCalendar implements CalendarProvider {
   async isSlotAvailable(start: Date, end: Date) {
     return this.inner.isSlotAvailable(start, end);
   }
+  isWithinBusinessHours(start: Date, end: Date) {
+    return this.inner.isWithinBusinessHours(start, end);
+  }
   async createEvent(): Promise<never> {
     throw new CalendarProviderError("Google Calendar is down");
   }
@@ -42,6 +45,9 @@ class NoMeetingUrlCalendar implements CalendarProvider {
   }
   async isSlotAvailable(start: Date, end: Date) {
     return this.inner.isSlotAvailable(start, end);
+  }
+  isWithinBusinessHours(start: Date, end: Date) {
+    return this.inner.isWithinBusinessHours(start, end);
   }
   async createEvent(input: CalendarEventInput): Promise<CalendarEventResult> {
     const result = await this.inner.createEvent(input);
@@ -61,6 +67,9 @@ class CountingCalendarProvider implements CalendarProvider {
   }
   async isSlotAvailable(start: Date, end: Date) {
     return this.inner.isSlotAvailable(start, end);
+  }
+  isWithinBusinessHours(start: Date, end: Date) {
+    return this.inner.isWithinBusinessHours(start, end);
   }
   async createEvent(input: CalendarEventInput) {
     return this.inner.createEvent(input);
@@ -378,6 +387,7 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
     const emptyCalendar: CalendarProvider = {
       async getAvailableSlots() { return []; },
       async isSlotAvailable() { return true; },
+      isWithinBusinessHours() { return true; },
       async createEvent(): Promise<never> { throw new Error("not used"); },
       async deleteEvent() {},
     };

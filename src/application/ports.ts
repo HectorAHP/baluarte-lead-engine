@@ -303,7 +303,21 @@ export interface AppointmentRescheduleRepository {
 }
 
 export interface CalendarSlot{start:Date;end:Date;} export interface CalendarEventInput{title:string;description:string;start:Date;end:Date;attendeeEmail?:string;} export interface CalendarEventResult{eventId:string;meetingUrl?:string;}
-export interface CalendarProvider{getAvailableSlots(from:Date,to:Date,durationMinutes:number):Promise<CalendarSlot[]>;isSlotAvailable(start:Date,end:Date):Promise<boolean>;createEvent(input:CalendarEventInput):Promise<CalendarEventResult>;deleteEvent(eventId:string):Promise<void>;}
+export interface CalendarProvider{
+  getAvailableSlots(from:Date,to:Date,durationMinutes:number):Promise<CalendarSlot[]>;
+  isSlotAvailable(start:Date,end:Date):Promise<boolean>;
+  /**
+   * Fase 7F -- business-hours-only check (never queries the calendar itself -- see
+   * isSlotAvailable for the free/busy check). Pure and synchronous. Protects a "direct" booking
+   * (an exact start/end, not one picked from getAvailableSlots' own output) from ever landing
+   * outside commercial hours or on a closed day -- see AppointmentService.completeBooking, the
+   * only caller. A fake/test double may legitimately always return true (no real business rules
+   * to enforce) -- see FakeCalendarProvider's own doc comment on this method.
+   */
+  isWithinBusinessHours(start:Date,end:Date):boolean;
+  createEvent(input:CalendarEventInput):Promise<CalendarEventResult>;
+  deleteEvent(eventId:string):Promise<void>;
+}
 /**
  * Fase 6F -- HubSpot CRM sync (fiscal calculator -> HubSpot contact). Deliberately minimal: one
  * method, matching CalendarProvider's own single-purpose-port style. `properties` is a flat,
