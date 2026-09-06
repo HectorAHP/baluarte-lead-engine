@@ -49,6 +49,7 @@ import { AppointmentRescheduleService } from "./application/appointment-reschedu
 import { AppointmentReminderService } from "./application/appointment-reminder-service.js";
 import { AppointmentCompletionService } from "./application/appointment-completion-service.js";
 import { handleInboundWhatsAppText } from "./application/whatsapp-inbound-service.js";
+import { HumanHandoffRecoveryService } from "./application/human-handoff-recovery-service.js";
 import { WhatsAppQualificationHandler } from "./application/whatsapp-qualification-handler.js";
 import { WhatsAppBookingHandler } from "./application/whatsapp-booking-handler.js";
 import { WhatsAppCancellationHandler } from "./application/whatsapp-cancellation-handler.js";
@@ -445,6 +446,13 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
     appointmentStatusHistoryRepo, leadStatusHistoryRepo, appointmentMessageDeliveryRepo,
     config.WHATSAPP_TEMPLATE_NO_SHOW, config.WHATSAPP_TEMPLATE_LANGUAGE, app.log,
   );
+  // Fase 7E: always constructed -- the recover-handoff admin endpoint is inert (nothing calls this
+  // service) until Héctor explicitly calls it, exactly like appointmentCompletionService above. No
+  // feature flag gates this -- an administrative, per-lead, human-triggered action is never
+  // something a boolean flag should silently enable/disable.
+  const humanHandoffRecoveryService = new HumanHandoffRecoveryService({
+    leads: leadsRepo, appointments: appointmentsRepo, leadStatusHistory: leadStatusHistoryRepo, logger: app.log,
+  });
 
   // "fake" only when a test/dev caller explicitly passed a FakeMessagingProvider override --
   // NOT whenever the resolved `messaging` instance happens to be one, since the normal
@@ -1084,6 +1092,39 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
     if (outcome.type === "NOT_FOUND") return reply.code(404).send({ error: "APPOINTMENT_NOT_FOUND" });
     if (outcome.type === "INCONSISTENT") return reply.code(409).send({ error: "APPOINTMENT_STATUS_INCONSISTENT" });
     return reply.code(200).send(outcome.appointment);
+  });
+
+  const leadIdParam = z.object({ id: z.string().uuid() });
+  // Fase 7E -- ADMINISTRATIVE, EXPLICIT recovery for a lead stuck in HUMAN_HANDOFF. Same
+  // fail-closed/timing-safe/own-rate-limit/small-body posture as mark-completed/mark-no-show
+  // above -- see HumanHandoffRecoveryService's own doc comment for the full decision policy.
+  // :id is the ONLY input this route ever reads -- the request body is never parsed, so an admin
+  // (or anyone who obtained the token) can never choose the destination status, the event type, or
+  // which appointment to act on. The backend alone computes the safe destination from the lead's
+  // own real, already-persisted data.
+  app.post("/api/leads/:id/recover-handoff", { bodyLimit: 2048, config: routeRateLimit(20, 60_000) }, async (req, reply) => {
+    if (!requireAdminToken(req, reply)) return;
+    const { id } = leadIdParam.parse(req.params);
+    const result = await humanHandoffRecoveryService.recover(id, new Date());
+    switch (result.outcome) {
+      case "NOT_FOUND":
+        return reply.code(404).send({ error: "LEAD_NOT_FOUND" });
+      case "NOT_ELIGIBLE":
+        // DO_NOT_CONTACT is never given a bypass elsewhere -- it simply can never be
+        // HUMAN_HANDOFF-eligible, so it always lands here. Distinguished with its own 403
+        // (never recoverable, by absolute rule) from every other NOT_ELIGIBLE currentStatus,
+        // which gets a plain 409 (the lead already isn't in HUMAN_HANDOFF, for some other reason).
+        if (result.currentStatus === "DO_NOT_CONTACT") {
+          return reply.code(403).send({ error: "DO_NOT_CONTACT_PROTECTED" });
+        }
+        return reply.code(409).send({ error: "NOT_ELIGIBLE", currentStatus: result.currentStatus });
+      case "AMBIGUOUS":
+        return reply.code(409).send({ error: "RECOVERY_AMBIGUOUS_APPOINTMENT_STATE" });
+      case "ALREADY_RECOVERED":
+        return reply.code(200).send({ ok: true, outcome: "ALREADY_RECOVERED", status: result.lead.status });
+      case "RECOVERED":
+        return reply.code(200).send({ ok: true, outcome: "RECOVERED", previousStatus: result.previousStatus, status: result.toStatus });
+    }
   });
 
   app.setErrorHandler((error, _req, reply) => {

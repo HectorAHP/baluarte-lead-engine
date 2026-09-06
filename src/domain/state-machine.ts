@@ -52,7 +52,14 @@ const transitions: Record<LeadStatus, readonly LeadStatus[]> = {
   QUOTE_PENDING:["QUOTE_SENT","CLOSED_WON","CLOSED_LOST"],
   QUOTE_SENT:["CLOSED_WON","CLOSED_LOST"],
   CLOSED_WON:[], CLOSED_LOST:[], DO_NOT_CONTACT:[],
-  HUMAN_HANDOFF:["CONTACTED","QUALIFYING","BOOKING_PENDING","DO_NOT_CONTACT"]
+  // Fase 7E additions: HUMAN_HANDOFF -> BOOKED/QUALIFIED_A/QUALIFIED_B/NURTURE_C, needed by
+  // HumanHandoffRecoveryService (application/human-handoff-recovery-service.ts) so an ADMIN,
+  // having verified the original escalation reason no longer applies, can recover a lead to
+  // exactly the state its real, persisted data supports -- never CONFIRMED (that would fabricate
+  // a confirmation the lead never gave) and never QUALIFYING (that would discard a real score
+  // already on file). CONTACTED/QUALIFYING/BOOKING_PENDING/DO_NOT_CONTACT already existed; nothing
+  // here removes or narrows any of those.
+  HUMAN_HANDOFF:["CONTACTED","QUALIFYING","BOOKING_PENDING","BOOKED","QUALIFIED_A","QUALIFIED_B","NURTURE_C","DO_NOT_CONTACT"]
 };
 export const canTransition=(from:LeadStatus,to:LeadStatus)=>transitions[from].includes(to);
 export function assertTransition(from:LeadStatus,to:LeadStatus){if(!canTransition(from,to)) throw new InvalidLeadTransitionError(from,to);}
