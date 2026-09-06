@@ -20,6 +20,7 @@ import { config } from "../src/config.js";
 import { createSupabaseClient } from "../src/infrastructure/supabase-client.js";
 import { SupabaseFiscalLeadScoreRepository } from "../src/infrastructure/supabase-fiscal-lead-score-repository.js";
 import { SupabaseHubSpotSyncOutboxRepository } from "../src/infrastructure/supabase-hubspot-sync-outbox-repository.js";
+import { SupabaseLeadRepository } from "../src/infrastructure/supabase-lead-repository.js";
 import { HubSpotOutboxReconciliationService, formatCandidateForDisplay } from "../src/application/hubspot-outbox-reconciliation.js";
 
 export class ReconcileHubSpotOutboxUsageError extends Error {
@@ -73,8 +74,9 @@ export async function main(): Promise<void> {
   const client = createSupabaseClient();
   const fiscalLeadScores = new SupabaseFiscalLeadScoreRepository(client);
   const outbox = new SupabaseHubSpotSyncOutboxRepository(client);
+  const leads = new SupabaseLeadRepository(client);
   const logger = { warn: (details: Record<string, unknown>, message: string) => console.error(JSON.stringify({ level: "warn", message, ...details })) };
-  const service = new HubSpotOutboxReconciliationService(fiscalLeadScores, outbox, logger);
+  const service = new HubSpotOutboxReconciliationService(fiscalLeadScores, outbox, logger, leads);
 
   const report = await service.dryRun(args.since, args.limit);
   console.log(JSON.stringify({

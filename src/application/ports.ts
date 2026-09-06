@@ -1,7 +1,7 @@
 import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment, AppointmentStatus } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js"; import type { LeadStatusHistoryEntry } from "../domain/lead-status-history.js"; import type { AppointmentStatusHistoryEntry } from "../domain/appointment-status-history.js"; import type { AppointmentMessageDelivery } from "../domain/appointment-message-delivery.js"; import type { AppointmentCancellation } from "../domain/appointment-cancellation.js"; import type { AppointmentReschedule } from "../domain/appointment-reschedule.js";
 import type { ProcessedEvent } from "../domain/processed-event.js";
-import type { FiscalLeadScore } from "../domain/fiscal-lead-score.js";
-import type { HubSpotSyncOutboxEntry, HubSpotSyncOutboxStatus } from "../domain/hubspot-sync-outbox.js";
+import type { FiscalLeadScore, FiscalScoreClass, FiscalScoreReason, MonthlyIncomeBand, AnnualContributionBand } from "../domain/fiscal-lead-score.js";
+import type { HubSpotSyncOutboxEntry, HubSpotSyncOutboxStatus, HubSpotSyncOutboxPayload } from "../domain/hubspot-sync-outbox.js";
 export interface LeadRepository {
   create(input:Omit<Lead,"id"|"createdAt"|"updatedAt">):Promise<Lead>;
   findById(id:string):Promise<Lead|null>;
@@ -376,12 +376,65 @@ export interface HubSpotSyncOutboxRepository {
    * implementation's SQL (migration 020, claim_hubspot_sync_outbox_batch) for exactly how this
    * stays safe when two workers call it at the same moment (Fase 7C spec §12). Returns the
    * claimed rows (already PROCESSING) in the order they'll be worked.
+   *
+   * Fase 7C.1 §6 -- ALSO reclaims a PROCESSING row whose `updatedAt` is older than `staleBefore`
+   * (a crashed/killed worker's claim, otherwise stuck in PROCESSING forever -- see migration 021's
+   * doc comment). `staleBefore` is a moment in the past (e.g. `now - 10min`), never a duration.
    */
-  claimBatch(now: Date, limit: number): Promise<HubSpotSyncOutboxEntry[]>;
+  claimBatch(now: Date, limit: number, staleBefore: Date): Promise<HubSpotSyncOutboxEntry[]>;
   update(id: string, patch: Partial<HubSpotSyncOutboxEntry>): Promise<HubSpotSyncOutboxEntry>;
   /** Read-only, for reconciliation/observability tooling -- never used by the processor's own
    * claim/retry logic, which is exclusively driven by claimBatch. */
   listByStatus(status: HubSpotSyncOutboxStatus): Promise<HubSpotSyncOutboxEntry[]>;
+}
+
+/**
+ * Fase 7C.1 §1/§2 -- makes the (fiscal_lead_scores row) + (hubspot_sync_outbox row) pair a REAL,
+ * single Postgres transaction (see migration 021's create_fiscal_score_with_outbox RPC),
+ * closing the gap in the Fase 7C design where these were two independent Supabase/PostgREST
+ * calls (each its own implicit transaction) -- a crash or network failure between them could
+ * leave a scored lead with no outbox row and no HubSpot delivery ever scheduled, silently.
+ *
+ * Deliberately scoped to ONLY these two tables -- never the lead create/update itself. See the
+ * Fase 7C.1 report for the full boundary rationale: the lead write already has its own robust
+ * idempotency (processed_events + email/phone dedupe) and a clean, retryable failure mode (a
+ * plain request failure the caller can safely retry), unlike the fiscal-score/outbox pair, where
+ * the failure mode was a SILENT, hard-to-detect gap.
+ *
+ * `outbox: undefined` means "this capture never schedules HubSpot delivery" (mirrors
+ * WebLeadCaptureService's own pre-existing `if (input.fiscalCalculatorSnapshot)` gate) -- the
+ * fiscal score row is still created (or idempotently no-ops) in that case, the outbox table is
+ * simply never touched.
+ */
+export interface AtomicFiscalScoreWithOutboxInput {
+  leadId: string;
+  submissionId: string;
+  score: number;
+  scoreClass: FiscalScoreClass;
+  version: string;
+  reasons: FiscalScoreReason[];
+  monthlyIncomeBand: MonthlyIncomeBand;
+  annualContributionBand: AnnualContributionBand;
+  hasPpr?: boolean;
+  filesAnnualReturn?: boolean;
+  outbox?: {
+    contactEmail?: string;
+    contactPhone?: string;
+    payload: HubSpotSyncOutboxPayload;
+  };
+}
+
+export interface AtomicFiscalScoreWithOutboxResult {
+  /** false means this exact (leadId, submissionId) was already scored -- an idempotent replay,
+   * never a duplicate -- same meaning as FiscalLeadScoreRepository.tryCreate returning null. */
+  fiscalScoreCreated: boolean;
+  /** Only ever true when `outbox` was supplied AND fiscalScoreCreated is true (a genuinely new
+   * submission, never an idempotent replay of an already-scored one). */
+  outboxCreated: boolean;
+}
+
+export interface AtomicFiscalCaptureRepository {
+  createFiscalScoreWithOutbox(input: AtomicFiscalScoreWithOutboxInput): Promise<AtomicFiscalScoreWithOutboxResult>;
 }
 export interface AIProvider{generateStructured<T>(systemPrompt:string,messages:Array<{role:"user"|"assistant";content:string}>,schemaName:string):Promise<T>;}
 /**

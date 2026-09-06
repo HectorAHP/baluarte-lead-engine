@@ -40,6 +40,44 @@ describe("Fase 7C spec §20 -- the real, authoritative expected-property set", (
       expect(properties).not.toHaveProperty(name);
     }
   });
+
+  // Fase 7C.1 §10 -- the mirror-image case: EVERY optional source field supplied. This is the test
+  // that actually FAILS if the mapper (buildHubSpotFiscalProperties) and the schema
+  // (REQUIRED_FISCAL_PROPERTIES/OPTIONAL_FISCAL_PROPERTIES/HUBSPOT_FISCAL_PROPERTY_NAMES) ever
+  // drift apart in EITHER direction -- a key set match, not just "every required key is present"
+  // (which the minimal-input test above already covers, but would never catch the mapper silently
+  // gaining or losing an OPTIONAL property).
+  it("with every optional input field populated, the output key set is EXACTLY the full 37 -- no more, no fewer", () => {
+    const properties = buildHubSpotFiscalProperties({
+      fiscalCalculator: {
+        age: 35,
+        city: "León",
+        taxRegime: "sueldos",
+        filesAnnualReturn: true,
+        monthlyIncome: 40000,
+        annualContribution: 20000,
+        deductions: { medicalExpenses: 1000, tuition: 500, mortgageInterest: 0, other: 0 },
+        hasGmm: true,
+        hasPpr: false,
+        calculation: { annualIncome: 480000, pprDeductionLimit: 48000, effectivePprContribution: 20000, otherDeductionsConsidered: 1500, estimatedTaxBenefitMin: 2000, estimatedTaxBenefitMax: 3000 },
+      },
+      submissionId: "sub-full",
+      calculatedAt: new Date(),
+      syncedAt: new Date(),
+      calculationVersion: "ppr_calc_2026_v1",
+      fiscalScore: { score: 90, scoreClass: "HOT", version: "fiscal_v1" },
+      attribution: {
+        utm_source: "google", utm_medium: "cpc", utm_campaign: "ppr", utm_content: "ad1", utm_term: "retiro",
+        fbclid: "fbclid-1", landing_page: "https://baluartecapital.com.mx/impuestos", referrer: "https://google.com",
+      },
+      source: "WEB_FISCAL_CALCULATOR",
+      privacyAccepted: true,
+      privacyAcceptedAt: new Date(),
+      consentContact: true,
+    });
+
+    expect(Object.keys(properties).sort()).toEqual([...HUBSPOT_FISCAL_PROPERTY_NAMES].sort());
+  });
 });
 
 describe("assessFiscalSnapshotCompleteness", () => {

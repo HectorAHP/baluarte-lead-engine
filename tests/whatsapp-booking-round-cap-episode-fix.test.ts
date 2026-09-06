@@ -105,6 +105,17 @@ async function outboundMessages(repos: ReturnType<typeof buildRepos>, conversati
  * that true, mirroring the real-world gap (minutes to days) a genuinely concluded prior episode
  * would always have -- never a workaround, an honest representation of it.
  */
+// Fase 7C.1 §16 -- root-caused a full-parallel-suite flake here (this test file's own
+// seedHistoricalRounds burns a REAL 2200ms wall-clock sleep -- see that function's own doc
+// comment for why it must be real time, not a fake timer). Vitest's 5000ms default per-test
+// timeout leaves only ~2800ms of headroom for app startup + two HTTP round trips on top of that
+// sleep -- comfortable in isolation, but under RESOURCE STARVATION from ~113 other test files'
+// worth of concurrent event-loop/CPU contention in a full run, that headroom is not always
+// enough and the real setTimeout can itself fire late. This is a timing/resource-starvation
+// flake, not a logic bug -- every test below that calls seedHistoricalRounds gets an explicit,
+// generous timeout so it never races the suite's own load.
+const GENEROUS_TIMEOUT_MS = 20_000;
+
 async function seedHistoricalRounds(repos: ReturnType<typeof buildRepos>, conversationId: string, leadId: string, count: number) {
   const past = new Date(Date.now() - 60 * 60 * 1000);
   for (let round = 0; round < count; round++) {
@@ -137,7 +148,7 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound[1]!.body).toContain("Perfecto");
     expect(outbound[1]!.body).not.toContain("orientación adecuada");
-  });
+  }, GENEROUS_TIMEOUT_MS);
 
   it("A. episode start after past appointment: 3 historical rounds do not block round 1 of the new episode", async () => {
     const repos = buildRepos();
@@ -151,7 +162,7 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound[0]!.body).toContain("Tengo estos horarios disponibles");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
-  });
+  }, GENEROUS_TIMEOUT_MS);
 
   it("B. same episode, round 2: 'otros horarios' succeeds", async () => {
     const repos = buildRepos();
@@ -166,7 +177,7 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound[1]!.body).toContain("horarios");
-  });
+  }, GENEROUS_TIMEOUT_MS);
 
   it("C. same episode, round 3: 'ninguno' succeeds", async () => {
     const repos = buildRepos();
@@ -182,7 +193,7 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound[2]!.body).toContain("horarios");
-  });
+  }, GENEROUS_TIMEOUT_MS);
 
   it("D. same episode, round 4: MAX_ROUNDS_REACHED / handoff, correctly scoped to THIS episode's own 3 rounds", async () => {
     const repos = buildRepos();
@@ -200,7 +211,7 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     expect(after?.status).toBe("HUMAN_HANDOFF"); // the cap DOES still protect within-episode
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound[3]!.body).toContain("orientación adecuada");
-  });
+  }, GENEROUS_TIMEOUT_MS);
 
   it("E. 10 historical rounds from previous episodes never affect the new episode's own count", async () => {
     const repos = buildRepos();
@@ -218,7 +229,7 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(3);
     expect(outbound.every((m) => !m.body?.includes("orientación adecuada"))).toBe(true);
-  });
+  }, GENEROUS_TIMEOUT_MS);
 
   it("F. a genuine ActiveOfferInconsistentError still escalates to legitimate HUMAN_HANDOFF, unaffected by episode scoping", async () => {
     const repos = buildRepos();
@@ -251,7 +262,7 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
 
     const roundIds = new Set((await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date())).map((s) => s.roundId));
     expect(roundIds.size).toBe(1); // still exactly one round for the new episode
-  });
+  }, GENEROUS_TIMEOUT_MS);
 
   it("H. slot selection remains visible to WhatsAppBookingHandler -- never repeats the reschedule_context_id mistake", async () => {
     const repos = buildRepos();
@@ -268,7 +279,7 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     expect(newAppt).toBeDefined();
     expect(newAppt?.status).toBe("BOOKED");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKED");
-  });
+  }, GENEROUS_TIMEOUT_MS);
 
   it("item 8: a stale PPR_FOLLOWUP does not indefinitely capture an unrelated later 'sí' after a genuine topic change", async () => {
     const repos = buildRepos();

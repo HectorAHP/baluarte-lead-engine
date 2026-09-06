@@ -4,10 +4,10 @@ import { HubSpotFiscalSyncService } from "../src/application/hubspot-fiscal-sync
 import { LeadService } from "../src/application/services.js";
 import {
   InMemoryLeadRepository, InMemoryProcessedEventRepository, InMemoryLeadStatusHistoryRepository,
-  InMemoryFiscalLeadScoreRepository, InMemoryHubSpotSyncOutboxRepository,
+  InMemoryFiscalLeadScoreRepository, InMemoryHubSpotSyncOutboxRepository, InMemoryAtomicFiscalCaptureRepository,
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
-import type { HubSpotCRMProvider } from "../src/application/ports.js";
+import type { HubSpotCRMProvider, AtomicFiscalCaptureRepository } from "../src/application/ports.js";
 
 const fiscalCalculator = {
   age: 35, city: "León", taxRegime: "sueldos", filesAnnualReturn: true,
@@ -26,7 +26,7 @@ function slowHubSpotCrm(delayMs: number): HubSpotCRMProvider {
   };
 }
 
-function makeService(hubspotCrm: HubSpotCRMProvider, hubspotOutboxEnabled: boolean) {
+function makeService(hubspotCrm: HubSpotCRMProvider, hubspotOutboxEnabled: boolean, atomicFiscalCapture?: AtomicFiscalCaptureRepository) {
   const leads = new InMemoryLeadRepository();
   const processedEvents = new InMemoryProcessedEventRepository();
   const leadStatusHistory = new InMemoryLeadStatusHistoryRepository();
@@ -34,11 +34,12 @@ function makeService(hubspotCrm: HubSpotCRMProvider, hubspotOutboxEnabled: boole
   const fiscalLeadScores = new InMemoryFiscalLeadScoreRepository();
   const hubspotOutbox = new InMemoryHubSpotSyncOutboxRepository();
   const hubspotSync = new HubSpotFiscalSyncService(hubspotCrm, new FakeLogger());
+  const logger = new FakeLogger();
   const service = new WebLeadCaptureService(
-    leads, processedEvents, leadService, new FakeLogger(), fiscalLeadScores, hubspotSync,
-    { hubspotOutboxEnabled }, hubspotOutbox,
+    leads, processedEvents, leadService, logger, fiscalLeadScores, hubspotSync,
+    { hubspotOutboxEnabled }, hubspotOutbox, atomicFiscalCapture,
   );
-  return { leads, fiscalLeadScores, hubspotOutbox, service };
+  return { leads, fiscalLeadScores, hubspotOutbox, service, logger };
 }
 
 function baseInput(overrides: Partial<Parameters<WebLeadCaptureService["capture"]>[0]> = {}) {
@@ -122,5 +123,86 @@ describe("Fase 7C -- WebLeadCaptureService HubSpot outbox integration", () => {
     // must be byte-for-byte identical between the two code paths.
     const strip = (p: Record<string, unknown>) => { const { bc_fiscal_calculated_at, bc_fiscal_synced_at, ...rest } = p; return rest; };
     expect(strip(entry.payload.properties)).toEqual(strip((inlinePayload as { properties: Record<string, unknown> }).properties));
+  });
+});
+
+// Fase 7C.1 §1/§2 -- WebLeadCaptureService wired with a REAL AtomicFiscalCaptureRepository
+// (InMemory stand-in here; migration 021's RPC in production/Supabase).
+describe("Fase 7C.1 -- WebLeadCaptureService atomic fiscal-score + outbox wiring", () => {
+  function makeServiceWithAtomicCapture(hubspotCrm: HubSpotCRMProvider, hubspotOutboxEnabled: boolean) {
+    // IMPORTANT: the atomic-capture repository must wrap the SAME fiscalLeadScores/hubspotOutbox
+    // instances actually wired into the service (the pre-existing 5th/8th constructor args) --
+    // otherwise the OFF-path assertions below would be reading from a disconnected pair of
+    // Maps that the service's own inline/pre-7C.1 path never touches.
+    const leads = new InMemoryLeadRepository();
+    const processedEvents = new InMemoryProcessedEventRepository();
+    const leadStatusHistory = new InMemoryLeadStatusHistoryRepository();
+    const leadService = new LeadService(leads, { create: async () => { throw new Error("unused"); }, listByLeadId: async () => [] }, leadStatusHistory, new FakeLogger());
+    const fiscalLeadScores = new InMemoryFiscalLeadScoreRepository();
+    const hubspotOutbox = new InMemoryHubSpotSyncOutboxRepository();
+    const hubspotSync = new HubSpotFiscalSyncService(hubspotCrm, new FakeLogger());
+    const logger = new FakeLogger();
+    const atomicFiscalCapture = new InMemoryAtomicFiscalCaptureRepository(fiscalLeadScores, hubspotOutbox);
+    const service = new WebLeadCaptureService(
+      leads, processedEvents, leadService, logger, fiscalLeadScores, hubspotSync,
+      { hubspotOutboxEnabled }, hubspotOutbox, atomicFiscalCapture,
+    );
+    return { leads, fiscalLeadScores, hubspotOutbox, service, logger };
+  }
+
+  it("flag ON + atomic repo wired: exactly one outbox row is scheduled through the atomic path, never the old two-call path", async () => {
+    const { service, hubspotOutbox, fiscalLeadScores, logger } = makeServiceWithAtomicCapture(slowHubSpotCrm(0), true);
+    const result = await service.capture(baseInput());
+
+    expect(await fiscalLeadScores.listByLeadId(result.lead.id)).toHaveLength(1);
+    const entries = await hubspotOutbox.listByStatus("PENDING");
+    expect(entries).toHaveLength(1);
+    expect(entries[0].leadId).toBe(result.lead.id);
+    const scheduledLog = logger.warnings.find((w) => w.message === "hubspot outbox delivery scheduled");
+    expect(scheduledLog).toBeDefined();
+    expect((scheduledLog!.details as Record<string, unknown>).outcome).toBe("scheduled");
+  });
+
+  it("flag ON + atomic repo wired: a resubmission of the SAME submissionId never creates a second outbox row (idempotent replay)", async () => {
+    const { service, hubspotOutbox } = makeServiceWithAtomicCapture(slowHubSpotCrm(0), true);
+    const input = baseInput({ submissionId: "fixed-sub-atomic" });
+    await service.capture(input);
+    await service.capture(input);
+    expect(await hubspotOutbox.listByStatus("PENDING")).toHaveLength(1);
+  });
+
+  it("flag ON + atomic repo wired: a failure in the atomic write is swallowed -- capture() still succeeds, the lead is still persisted", async () => {
+    const leads = new InMemoryLeadRepository();
+    const processedEvents = new InMemoryProcessedEventRepository();
+    const leadStatusHistory = new InMemoryLeadStatusHistoryRepository();
+    const leadService = new LeadService(leads, { create: async () => { throw new Error("unused"); }, listByLeadId: async () => [] }, leadStatusHistory, new FakeLogger());
+    const hubspotSync = new HubSpotFiscalSyncService(slowHubSpotCrm(0), new FakeLogger());
+    const logger = new FakeLogger();
+    const failingAtomicCapture: AtomicFiscalCaptureRepository = {
+      createFiscalScoreWithOutbox: async () => { throw new Error("simulated atomic RPC failure"); },
+    };
+    const service = new WebLeadCaptureService(
+      leads, processedEvents, leadService, logger, new InMemoryFiscalLeadScoreRepository(), hubspotSync,
+      { hubspotOutboxEnabled: true }, new InMemoryHubSpotSyncOutboxRepository(), failingAtomicCapture,
+    );
+
+    const result = await service.capture(baseInput()); // must NOT throw -- fiscal scoring failures are always fail-open
+
+    expect(await leads.findById(result.lead.id)).not.toBeNull();
+    const failureLog = logger.warnings.find((w) => w.message === "lead fiscal score calculation failed");
+    expect(failureLog).toBeDefined();
+  });
+
+  it("flag OFF: the atomic repo is wired but NEVER consulted -- falls back to the pre-Fase-7C.1 inline sync path unchanged", async () => {
+    let inlineSyncCalled = false;
+    const capturingCrm: HubSpotCRMProvider = {
+      upsertContact: async () => { inlineSyncCalled = true; return { hubspotContactId: "hs-1", created: true }; },
+    };
+    const { service, hubspotOutbox, fiscalLeadScores } = makeServiceWithAtomicCapture(capturingCrm, false);
+    const result = await service.capture(baseInput());
+
+    expect(inlineSyncCalled).toBe(true); // the OLD inline path ran, not the atomic one
+    expect(await fiscalLeadScores.listByLeadId(result.lead.id)).toHaveLength(1);
+    expect(await hubspotOutbox.listByStatus("PENDING")).toHaveLength(0); // never written -- outbox disabled
   });
 });

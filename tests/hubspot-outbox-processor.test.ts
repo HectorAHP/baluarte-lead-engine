@@ -142,4 +142,91 @@ describe("HubSpotOutboxProcessorService", () => {
     expect(summary.claimed).toBe(2);
     expect(await outbox.listByStatus("PENDING")).toHaveLength(3);
   });
+
+  // Fase 7C.1 §9 -- 401/403 gets a distinct, actionable log outcome, never lumped in with a
+  // generic "invalid lead" permanent failure.
+  it("item 9 (Fase 7C.1): a 401 marks FAILED_PERMANENT AND logs the distinct 'failed_permanent_auth_error' outcome", async () => {
+    const failing: HubSpotCRMProvider = { upsertContact: async () => { throw new HubSpotProviderError("unauthorized", { httpStatus: 401 }); } };
+    const { outbox, logger, processor } = makeProcessor(failing);
+    const entry = await outbox.tryCreate({ leadId: "lead-1", submissionId: "sub-1", payload: samplePayload("a@example.com") });
+
+    const summary = await processor.run(NOW);
+
+    expect(summary.permanentlyFailed).toBe(1);
+    const updated = await outbox.findById(entry!.id);
+    expect(updated?.status).toBe("FAILED_PERMANENT");
+    const authLog = logger.warnings.find((c) => (c.details as Record<string, unknown>)?.outcome === "failed_permanent_auth_error");
+    expect(authLog).toBeDefined();
+  });
+
+  it("item 9 (Fase 7C.1): a 403 gets the same distinct auth-error outcome as 401", async () => {
+    const failing: HubSpotCRMProvider = { upsertContact: async () => { throw new HubSpotProviderError("forbidden", { httpStatus: 403 }); } };
+    const { outbox, logger, processor } = makeProcessor(failing);
+    await outbox.tryCreate({ leadId: "lead-1", submissionId: "sub-1", payload: samplePayload("a@example.com") });
+
+    await processor.run(NOW);
+
+    const authLog = logger.warnings.find((c) => (c.details as Record<string, unknown>)?.outcome === "failed_permanent_auth_error");
+    expect(authLog).toBeDefined();
+  });
+
+  it("a plain 400 (genuinely bad lead data) does NOT get the auth-error outcome", async () => {
+    const failing: HubSpotCRMProvider = { upsertContact: async () => { throw new HubSpotProviderError("bad payload", { httpStatus: 400 }); } };
+    const { outbox, logger, processor } = makeProcessor(failing);
+    await outbox.tryCreate({ leadId: "lead-1", submissionId: "sub-1", payload: samplePayload("a@example.com") });
+
+    await processor.run(NOW);
+
+    const authLog = logger.warnings.find((c) => (c.details as Record<string, unknown>)?.outcome === "failed_permanent_auth_error");
+    expect(authLog).toBeUndefined();
+    const genericLog = logger.warnings.find((c) => (c.details as Record<string, unknown>)?.outcome === "failed_permanent");
+    expect(genericLog).toBeDefined();
+  });
+
+  // Fase 7C.1 §6 -- worker-crash recovery, proven at the processor level (not just the repository
+  // unit test in hubspot-sync-outbox-repository.test.ts): a claimed-but-never-finished row (the
+  // worker died mid-flight, so update() was never called) is reclaimed and successfully processed
+  // by a LATER run, once past the staleness threshold.
+  describe("worker-crash recovery (Fase 7C.1 §6)", () => {
+    it("a row stuck in PROCESSING past the staleness threshold is reclaimed and can succeed on the next run", async () => {
+      const outbox = new InMemoryHubSpotSyncOutboxRepository();
+      const logger = new FakeLogger();
+      const staleProcessingThresholdMs = 10 * 60_000;
+      const crashedCrm: HubSpotCRMProvider = { upsertContact: async () => { throw new Error("simulated process crash -- never resolves, never rejects observably to the outbox row"); } };
+      const entry = await outbox.tryCreate({ leadId: "lead-1", submissionId: "sub-1", payload: samplePayload("a@example.com") });
+
+      // Simulate a worker crashing mid-flight: claim the row directly (bypassing processOne, which
+      // would call update() -- a real crash happens strictly between claim and update).
+      const claimTime = NOW;
+      const claimed = await outbox.claimBatch(claimTime, 20, new Date(0));
+      expect(claimed).toHaveLength(1);
+      expect((await outbox.findById(entry!.id))?.status).toBe("PROCESSING");
+
+      // A healthy worker's run, well past the staleness threshold, must reclaim and process it.
+      const laterProcessor = new HubSpotOutboxProcessorService({ outbox, hubspotCrm: new FakeHubSpotCRMProvider(), logger }, { batchSize: 20, maxAttempts: 6, staleProcessingThresholdMs });
+      const muchLater = new Date(claimTime.getTime() + 20 * 60_000);
+      const summary = await laterProcessor.run(muchLater);
+
+      expect(summary.claimed).toBe(1);
+      expect(summary.succeeded).toBe(1);
+      const finalRow = await outbox.findById(entry!.id);
+      expect(finalRow?.status).toBe("SUCCEEDED");
+      void crashedCrm; // documents the crash scenario; the actual reclaim uses a healthy CRM afterward
+    });
+
+    it("a row still within the staleness window is NEVER reclaimed by a concurrent/second run", async () => {
+      const outbox = new InMemoryHubSpotSyncOutboxRepository();
+      const logger = new FakeLogger();
+      const entry = await outbox.tryCreate({ leadId: "lead-1", submissionId: "sub-1", payload: samplePayload("a@example.com") });
+      const claimTime = NOW;
+      await outbox.claimBatch(claimTime, 20, new Date(0));
+
+      const processor = new HubSpotOutboxProcessorService({ outbox, hubspotCrm: new FakeHubSpotCRMProvider(), logger }, { batchSize: 20, maxAttempts: 6, staleProcessingThresholdMs: 10 * 60_000 });
+      const shortlyAfter = new Date(claimTime.getTime() + 60_000); // 1 min later, threshold is 10 min
+      const summary = await processor.run(shortlyAfter);
+
+      expect(summary.claimed).toBe(0); // must NOT reclaim -- a live worker could still legitimately own this row
+      expect((await outbox.findById(entry!.id))?.status).toBe("PROCESSING");
+    });
+  });
 });

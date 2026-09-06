@@ -19,6 +19,7 @@ import type {FiscalLeadScoreRepository} from "../application/ports.js";
 import type {FiscalLeadScore} from "../domain/fiscal-lead-score.js";
 import type {HubSpotSyncOutboxRepository} from "../application/ports.js";
 import type {HubSpotSyncOutboxEntry,HubSpotSyncOutboxStatus} from "../domain/hubspot-sync-outbox.js";
+import type {AtomicFiscalCaptureRepository,AtomicFiscalScoreWithOutboxInput,AtomicFiscalScoreWithOutboxResult} from "../application/ports.js";
 import {SlotUnavailableError,DuplicateMessageError,BookingAttemptKeyConflictError} from "../domain/errors.js";
 import {messageDedupKey} from "../domain/message-dedup-key.js";
 
@@ -543,10 +544,15 @@ export class InMemoryHubSpotSyncOutboxRepository implements HubSpotSyncOutboxRep
    * atomic under JS's single-threaded event loop even when two `claimBatch` calls race via
    * `Promise.all` in a test: whichever call's synchronous filter+mutate block runs first claims
    * the rows outright, and the second call's own filter (which reads AFTER the first call's
-   * synchronous mutation already landed) never sees them as PENDING/FAILED_RETRYABLE anymore. */
-  async claimBatch(now:Date,limit:number):Promise<HubSpotSyncOutboxEntry[]>{
+   * synchronous mutation already landed) never sees them as PENDING/FAILED_RETRYABLE anymore.
+   * Fase 7C.1 §6 -- also reclaims a PROCESSING row whose updatedAt is at/before `staleBefore`
+   * (a crashed worker's stranded claim), mirroring migration 021's SQL exactly. */
+  async claimBatch(now:Date,limit:number,staleBefore:Date):Promise<HubSpotSyncOutboxEntry[]>{
     const eligible=[...this.data.values()]
-      .filter(r=>(r.status==="PENDING"||r.status==="FAILED_RETRYABLE")&&r.nextAttemptAt.getTime()<=now.getTime())
+      .filter(r=>
+        ((r.status==="PENDING"||r.status==="FAILED_RETRYABLE")&&r.nextAttemptAt.getTime()<=now.getTime())
+        ||(r.status==="PROCESSING"&&r.updatedAt.getTime()<=staleBefore.getTime())
+      )
       .sort((a,b)=>a.nextAttemptAt.getTime()-b.nextAttemptAt.getTime())
       .slice(0,limit);
     const claimed:HubSpotSyncOutboxEntry[]=[];
@@ -568,5 +574,61 @@ export class InMemoryHubSpotSyncOutboxRepository implements HubSpotSyncOutboxRep
 
   async listByStatus(status:HubSpotSyncOutboxStatus):Promise<HubSpotSyncOutboxEntry[]>{
     return [...this.data.values()].filter(r=>r.status===status);
+  }
+}
+
+// -------------------------------------------------------------------------------------------
+// Fase 7C.1 -- local/test counterpart to migration 021's create_fiscal_score_with_outbox RPC. See
+// ports.ts's AtomicFiscalCaptureRepository doc comment for the real guarantee this stands in for.
+//
+// IMPORTANT, HONEST LIMITATION: this class does NOT provide real crash-atomicity -- there is no
+// such thing as "partially committed" for two calls in the same process's volatile memory; if the
+// process dies between the two `tryCreate` calls below, NEITHER write survives anyway (nothing was
+// ever durable), which is a fundamentally different failure mode than Postgres's real WAL-backed
+// transaction. What this class DOES faithfully reproduce -- and the only thing that actually
+// matters for tests exercising WebLeadCaptureService's call ordering -- is the RPC's LOGICAL
+// contract: the outbox row is written if and only if the fiscal-score row was a genuine new
+// insert, with no other test code able to observe an in-between state (no `await` runs between
+// the two calls beyond each one's own I/O-free, Map-backed work -- same single-threaded-event-loop
+// reasoning already relied on for InMemoryHubSpotSyncOutboxRepository.claimBatch).
+//
+// Deliberately wraps the PORT interfaces (FiscalLeadScoreRepository / HubSpotSyncOutboxRepository),
+// never the concrete InMemory classes -- so it works unchanged if a test substitutes its own
+// fake/spy implementing either port.
+// -------------------------------------------------------------------------------------------
+export class InMemoryAtomicFiscalCaptureRepository implements AtomicFiscalCaptureRepository {
+  constructor(
+    private readonly fiscalLeadScores: FiscalLeadScoreRepository,
+    private readonly hubspotOutbox: HubSpotSyncOutboxRepository,
+  ) {}
+
+  async createFiscalScoreWithOutbox(input: AtomicFiscalScoreWithOutboxInput): Promise<AtomicFiscalScoreWithOutboxResult> {
+    const scoreRow = await this.fiscalLeadScores.tryCreate({
+      leadId: input.leadId,
+      submissionId: input.submissionId,
+      score: input.score,
+      scoreClass: input.scoreClass,
+      version: input.version,
+      reasons: input.reasons,
+      monthlyIncomeBand: input.monthlyIncomeBand,
+      annualContributionBand: input.annualContributionBand,
+      hasPpr: input.hasPpr,
+      filesAnnualReturn: input.filesAnnualReturn,
+    });
+    const fiscalScoreCreated = scoreRow !== null;
+    let outboxCreated = false;
+    // Only ever scheduled when THIS call actually won the fiscal-score insert -- mirrors the
+    // RPC's own `if v_fiscal_score_id is not null` guard exactly.
+    if (fiscalScoreCreated && input.outbox) {
+      const outboxRow = await this.hubspotOutbox.tryCreate({
+        leadId: input.leadId,
+        submissionId: input.submissionId,
+        contactEmail: input.outbox.contactEmail,
+        contactPhone: input.outbox.contactPhone,
+        payload: input.outbox.payload,
+      });
+      outboxCreated = outboxRow !== null;
+    }
+    return { fiscalScoreCreated, outboxCreated };
   }
 }

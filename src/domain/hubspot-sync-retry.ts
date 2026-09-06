@@ -45,3 +45,15 @@ export function classifyHubSpotSyncError(httpStatus: number | undefined): HubSpo
   if (httpStatus >= 500) return "RETRYABLE";
   return "PERMANENT"; // 400/401/403/404/422/... -- retrying the exact same payload will not help
 }
+
+/**
+ * Fase 7C.1 §9 -- 401/403 are PERMANENT at the job level (retrying the same row will not help),
+ * but unlike a genuinely bad/invalid lead (400/404/422), a 401/403 almost always means the
+ * HubSpot private-app token/scope is wrong or expired -- a config problem affecting the WHOLE
+ * batch, not one bad row. The processor uses this to emit a distinct, more actionable log outcome
+ * ("failed_permanent_auth_error") instead of the generic "failed_permanent", so this never gets
+ * silently read as "just an invalid lead" during on-call triage.
+ */
+export function isAuthErrorStatus(httpStatus: number | undefined): boolean {
+  return httpStatus === 401 || httpStatus === 403;
+}

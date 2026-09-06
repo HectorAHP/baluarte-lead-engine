@@ -13,12 +13,12 @@ import {
   InMemoryQualificationAnswerRepository, InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
   InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository, InMemoryAppointmentMessageDeliveryRepository,
   InMemoryAppointmentCancellationRepository, InMemoryAppointmentRescheduleRepository, InMemoryProcessedEventRepository,
-  InMemoryFiscalLeadScoreRepository, InMemoryHubSpotSyncOutboxRepository,
+  InMemoryFiscalLeadScoreRepository, InMemoryHubSpotSyncOutboxRepository, InMemoryAtomicFiscalCaptureRepository,
 } from "./infrastructure/memory-repositories.js";
 import { SupabaseLeadRepository } from "./infrastructure/supabase-lead-repository.js";
 import { SupabaseProcessedEventRepository } from "./infrastructure/supabase-processed-event-repository.js";
 import { SupabaseFiscalLeadScoreRepository } from "./infrastructure/supabase-fiscal-lead-score-repository.js";
-import { SupabaseHubSpotSyncOutboxRepository } from "./infrastructure/supabase-hubspot-sync-outbox-repository.js";
+import { SupabaseHubSpotSyncOutboxRepository, SupabaseAtomicFiscalCaptureRepository } from "./infrastructure/supabase-hubspot-sync-outbox-repository.js";
 import { SupabaseAppointmentRepository } from "./infrastructure/supabase-appointment-repository.js";
 import { SupabaseBookingAttemptRepository } from "./infrastructure/supabase-booking-attempt-repository.js";
 import { SupabaseLeadScoreRepository } from "./infrastructure/supabase-lead-score-repository.js";
@@ -70,6 +70,7 @@ import type {
   LeadStatusHistoryRepository, AppointmentStatusHistoryRepository, AppointmentMessageDeliveryRepository,
   AppointmentCancellationRepository, AppointmentRescheduleRepository, ProcessedEventRepository,
   FiscalLeadScoreRepository, HubSpotCRMProvider, EmailDomainChecker, HubSpotSyncOutboxRepository,
+  AtomicFiscalCaptureRepository,
 } from "./application/ports.js";
 
 declare module "fastify" {
@@ -107,6 +108,11 @@ export interface AppDependencies {
    * only ever WRITTEN to by WebLeadCaptureService when HUBSPOT_OUTBOX_ENABLED is true, and only
    * ever READ/claimed by HubSpotOutboxProcessorService via POST /internal/hubspot-sync/run. */
   hubspotSyncOutboxRepo?: HubSpotSyncOutboxRepository;
+  /** Fase 7C.1: real atomicity for the (fiscal_lead_scores row + hubspot_sync_outbox row) pair --
+   * see AtomicFiscalCaptureRepository's doc comment in ports.ts. Always constructed (cheap,
+   * stateless); only ever consulted by WebLeadCaptureService, and only when
+   * HUBSPOT_OUTBOX_ENABLED is true. */
+  atomicFiscalCaptureRepo?: AtomicFiscalCaptureRepository;
   appointmentsRepo?: AppointmentRepository;
   bookingAttemptsRepo?: BookingAttemptRepository;
   leadScoresRepo?: LeadScoreRepository;
@@ -325,6 +331,12 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   // Fase 7C -- always constructed (cheap, stateless) -- see AppDependencies' own doc comment on
   // hubspotSyncOutboxRepo for exactly who writes to vs. reads from it.
   const hubspotSyncOutboxRepo = overrides.hubspotSyncOutboxRepo ?? (supabaseClient ? new SupabaseHubSpotSyncOutboxRepository(supabaseClient) : new InMemoryHubSpotSyncOutboxRepository());
+  // Fase 7C.1 -- real atomicity for fiscal_lead_scores + hubspot_sync_outbox (see
+  // AtomicFiscalCaptureRepository's doc comment in ports.ts). The InMemory case wraps the SAME
+  // fiscalLeadScoresRepo/hubspotSyncOutboxRepo instances resolved just above (never a separate,
+  // isolated store) so every other reader (WhatsApp context bridge, HubSpotOutboxProcessorService,
+  // reconciliation) sees rows created through this path too.
+  const atomicFiscalCaptureRepo = overrides.atomicFiscalCaptureRepo ?? (supabaseClient ? new SupabaseAtomicFiscalCaptureRepository(supabaseClient) : new InMemoryAtomicFiscalCaptureRepository(fiscalLeadScoresRepo, hubspotSyncOutboxRepo));
   const appointmentsRepo = overrides.appointmentsRepo ?? (supabaseClient ? new SupabaseAppointmentRepository(supabaseClient) : new InMemoryAppointmentRepository());
   const bookingAttemptsRepo = overrides.bookingAttemptsRepo ?? (supabaseClient ? new SupabaseBookingAttemptRepository(supabaseClient) : new InMemoryBookingAttemptRepository());
   const leadScoresRepo = overrides.leadScoresRepo ?? (supabaseClient ? new SupabaseLeadScoreRepository(supabaseClient) : new InMemoryLeadScoreRepository());
@@ -379,6 +391,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
     leadsRepo, processedEventsRepo, leadService, app.log, fiscalLeadScoresRepo, hubspotFiscalSync,
     { leadIntegrityEnabled, emailDomainChecker, emailDnsValidationEnabled, disposableEmailCheckEnabled, extraDisposableDomains: extraDisposableEmailDomains, hubspotOutboxEnabled },
     hubspotSyncOutboxRepo,
+    atomicFiscalCaptureRepo,
   );
   // Fase 7C -- always constructed (cheap, stateless) -- only ever invoked by POST
   // /internal/hubspot-sync/run, below. `hubspotCrm` being undefined (no HUBSPOT_PRIVATE_APP_TOKEN
@@ -390,7 +403,11 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   };
   const hubspotOutboxProcessor = new HubSpotOutboxProcessorService(
     { outbox: hubspotSyncOutboxRepo, hubspotCrm: hubspotCrm ?? notConfiguredHubSpotCrm, logger: app.log },
-    { batchSize: overrides.hubspotOutboxBatchSize ?? config.HUBSPOT_OUTBOX_BATCH_SIZE, maxAttempts: overrides.hubspotOutboxMaxAttempts ?? config.HUBSPOT_OUTBOX_MAX_ATTEMPTS },
+    {
+      batchSize: overrides.hubspotOutboxBatchSize ?? config.HUBSPOT_OUTBOX_BATCH_SIZE,
+      maxAttempts: overrides.hubspotOutboxMaxAttempts ?? config.HUBSPOT_OUTBOX_MAX_ATTEMPTS,
+      staleProcessingThresholdMs: config.HUBSPOT_OUTBOX_STALE_PROCESSING_THRESHOLD_MS,
+    },
   );
   const appointmentService = new AppointmentService(calendar, appointmentsRepo, bookingAttemptsRepo, leadsRepo, app.log);
   // Always constructed -- cheap, stateless, and needed by both qualificationHandler (to offer

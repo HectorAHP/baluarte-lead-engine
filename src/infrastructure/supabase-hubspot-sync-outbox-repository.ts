@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import type { HubSpotSyncOutboxRepository } from "../application/ports.js";
+import type { HubSpotSyncOutboxRepository, AtomicFiscalCaptureRepository, AtomicFiscalScoreWithOutboxInput, AtomicFiscalScoreWithOutboxResult } from "../application/ports.js";
 import type { HubSpotSyncOutboxEntry, HubSpotSyncOutboxPayload, HubSpotSyncOutboxStatus } from "../domain/hubspot-sync-outbox.js";
 
 const POSTGRES_UNIQUE_VIOLATION = "23505";
@@ -92,8 +92,12 @@ export class SupabaseHubSpotSyncOutboxRepository implements HubSpotSyncOutboxRep
     return data ? mapRowToHubSpotSyncOutboxEntry(data as HubSpotSyncOutboxRow) : null;
   }
 
-  async claimBatch(now: Date, limit: number): Promise<HubSpotSyncOutboxEntry[]> {
-    const { data, error } = await this.client.rpc("claim_hubspot_sync_outbox_batch", { p_limit: limit, p_now: now.toISOString() });
+  async claimBatch(now: Date, limit: number, staleBefore: Date): Promise<HubSpotSyncOutboxEntry[]> {
+    const { data, error } = await this.client.rpc("claim_hubspot_sync_outbox_batch", {
+      p_limit: limit,
+      p_now: now.toISOString(),
+      p_stale_before: staleBefore.toISOString(),
+    });
     if (error) throw new Error(`SUPABASE_HUBSPOT_SYNC_OUTBOX_CLAIM_FAILED: ${error.message}`);
     return ((data ?? []) as HubSpotSyncOutboxRow[]).map(mapRowToHubSpotSyncOutboxEntry);
   }
@@ -116,5 +120,36 @@ export class SupabaseHubSpotSyncOutboxRepository implements HubSpotSyncOutboxRep
     const { data, error } = await this.client.from("hubspot_sync_outbox").select().eq("status", status);
     if (error) throw new Error(`SUPABASE_HUBSPOT_SYNC_OUTBOX_LIST_FAILED: ${error.message}`);
     return (data as HubSpotSyncOutboxRow[]).map(mapRowToHubSpotSyncOutboxEntry);
+  }
+}
+
+/**
+ * Fase 7C.1 §1/§2 -- the REAL atomic implementation of AtomicFiscalCaptureRepository, backed by
+ * migration 021's create_fiscal_score_with_outbox RPC (a single PL/pgSQL function -- BEGIN/COMMIT
+ * implicit, one Postgres transaction covering both inserts). This is what actually closes the gap
+ * the Fase 7C "transactional outbox" naming got ahead of -- see that migration's own doc comment.
+ */
+export class SupabaseAtomicFiscalCaptureRepository implements AtomicFiscalCaptureRepository {
+  constructor(private readonly client: SupabaseClient) {}
+
+  async createFiscalScoreWithOutbox(input: AtomicFiscalScoreWithOutboxInput): Promise<AtomicFiscalScoreWithOutboxResult> {
+    const { data, error } = await this.client.rpc("create_fiscal_score_with_outbox", {
+      p_lead_id: input.leadId,
+      p_submission_id: input.submissionId,
+      p_score: input.score,
+      p_score_class: input.scoreClass,
+      p_version: input.version,
+      p_reasons: input.reasons,
+      p_monthly_income_band: input.monthlyIncomeBand,
+      p_annual_contribution_band: input.annualContributionBand,
+      p_has_ppr: input.hasPpr ?? null,
+      p_files_annual_return: input.filesAnnualReturn ?? null,
+      p_outbox_payload: input.outbox?.payload ?? null,
+      p_contact_email: input.outbox?.contactEmail ?? null,
+      p_contact_phone: input.outbox?.contactPhone ?? null,
+    });
+    if (error) throw new Error(`SUPABASE_CREATE_FISCAL_SCORE_WITH_OUTBOX_FAILED: ${error.message}`);
+    const result = data as { fiscalScoreCreated: boolean; fiscalScoreId: string | null; outboxCreated: boolean; outboxId: string | null };
+    return { fiscalScoreCreated: result.fiscalScoreCreated, outboxCreated: result.outboxCreated };
   }
 }

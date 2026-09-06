@@ -1,4 +1,4 @@
-import type { LeadRepository, ProcessedEventRepository, Logger, FiscalLeadScoreRepository, EmailDomainChecker, HubSpotSyncOutboxRepository } from "./ports.js";
+import type { LeadRepository, ProcessedEventRepository, Logger, FiscalLeadScoreRepository, EmailDomainChecker, HubSpotSyncOutboxRepository, AtomicFiscalCaptureRepository, AtomicFiscalScoreWithOutboxInput } from "./ports.js";
 import type { Lead, Vertical } from "../domain/lead.js";
 import { normalizePhoneToE164 } from "../domain/phone.js";
 import type { LeadService } from "./services.js";
@@ -189,6 +189,14 @@ export class WebLeadCaptureService {
     // Consulted ONLY when integrityOptions.hubspotOutboxEnabled is true -- see that flag's own
     // doc comment.
     private readonly hubspotOutbox?: HubSpotSyncOutboxRepository,
+    // Fase 7C.1 -- optional so every existing wiring/test that predates real atomicity keeps
+    // compiling and behaving byte-for-byte as before. When present AND hubspotOutboxEnabled is
+    // true, the fiscal-score write (and, when applicable, the outbox write) go through ONE
+    // Postgres transaction instead of two independent Supabase calls -- see
+    // AtomicFiscalCaptureRepository's doc comment in ports.ts. Absent: falls back to the
+    // pre-Fase-7C.1 two-call sequence (fiscalLeadScores.tryCreate then, separately,
+    // scheduleHubSpotOutboxDelivery) -- exactly today's behavior.
+    private readonly atomicFiscalCapture?: AtomicFiscalCaptureRepository,
   ) {}
 
   /**
@@ -277,12 +285,77 @@ export class WebLeadCaptureService {
    * conversations / appointments / lifecycle timestamps -- see migration
    * 018_fiscal_lead_scores.sql's header comment for why those stay untouched.
    */
+  private buildFiscalSyncInput(lead: Lead, input: WebLeadCaptureInput, result: ReturnType<typeof scoreFiscalCalculatorLead>): SyncFiscalCalculatorLeadInput {
+    return {
+      lead,
+      submissionId: input.submissionId,
+      fiscalCalculator: input.fiscalCalculatorSnapshot!,
+      calculationVersion: input.calculationVersion,
+      fiscalScore: { score: result.score, scoreClass: result.scoreClass, version: result.version },
+      attribution: input.attribution,
+      consentContact: input.consentContact,
+      privacyAcceptedAt: input.privacyAcceptedAt,
+      // Fase 6F.1: the authoritative submission-capture timestamp, never the sync moment -- see
+      // WebLeadCaptureInput.submittedAt's doc comment.
+      calculatedAt: input.submittedAt ?? new Date(),
+    };
+  }
+
   private async scoreFiscalCalculatorSubmission(lead: Lead, input: WebLeadCaptureInput): Promise<void> {
     if (input.source !== FISCAL_CALCULATOR_SOURCE) return;
     if (!input.fiscalCalculator) return;
     if (!this.fiscalLeadScores) return;
     try {
       const result = scoreFiscalCalculatorLead(input.fiscalCalculator);
+
+      // Fase 7C.1 §1/§2: when the outbox is enabled AND a real atomic-capture repository is
+      // wired, the fiscal-score write (and, when applicable, the outbox write) go through ONE
+      // Postgres transaction (see AtomicFiscalCaptureRepository's doc comment) instead of two
+      // independent Supabase calls -- this is what actually closes the gap the Fase 7C
+      // "transactional outbox" naming got ahead of. Every existing wiring/test that predates this
+      // (atomicFiscalCapture undefined) falls through to the unchanged two-call sequence below.
+      if (this.integrityOptions.hubspotOutboxEnabled && this.atomicFiscalCapture) {
+        let outboxArg: AtomicFiscalScoreWithOutboxInput["outbox"];
+        if (input.fiscalCalculatorSnapshot) {
+          const syncInput = this.buildFiscalSyncInput(lead, input, result);
+          const payload = buildFiscalHubSpotContactUpsertInput(syncInput, new Date());
+          outboxArg = { contactEmail: payload.email, contactPhone: payload.phone, payload };
+        }
+        const atomicResult = await this.atomicFiscalCapture.createFiscalScoreWithOutbox({
+          leadId: lead.id,
+          submissionId: input.submissionId,
+          score: result.score,
+          scoreClass: result.scoreClass,
+          version: result.version,
+          reasons: result.reasons,
+          monthlyIncomeBand: result.monthlyIncomeBand,
+          annualContributionBand: result.annualContributionBand,
+          hasPpr: input.fiscalCalculator.hasPpr,
+          filesAnnualReturn: input.fiscalCalculator.filesAnnualReturn,
+          outbox: outboxArg,
+        });
+        if (atomicResult.fiscalScoreCreated) {
+          // ALLOWED to log: opaque leadId fragment, scoreClass, score, version. FORBIDDEN: name,
+          // phone, email, exact income/contribution, deductions, fiscal result -- none of those
+          // are referenced here.
+          this.logger.warn(
+            { leadIdLast8: lead.id.slice(-8), score: result.score, scoreClass: result.scoreClass, version: result.version },
+            "lead fiscal score calculated",
+          );
+          if (outboxArg) {
+            this.logger.warn(
+              {
+                leadIdLast8: lead.id.slice(-8),
+                submissionIdLast8: input.submissionId.slice(-8),
+                outcome: atomicResult.outboxCreated ? "scheduled" : "already_scheduled",
+              },
+              "hubspot outbox delivery scheduled",
+            );
+          }
+        }
+        return;
+      }
+
       const persisted = await this.fiscalLeadScores.tryCreate({
         leadId: lead.id,
         submissionId: input.submissionId,
@@ -310,26 +383,16 @@ export class WebLeadCaptureService {
         // see HubSpotFiscalSyncService's class doc comment for the full "persist lead -> persist
         // score -> sync HubSpot" ordering rationale.
         if (input.fiscalCalculatorSnapshot) {
-          const syncInput: SyncFiscalCalculatorLeadInput = {
-            lead,
-            submissionId: input.submissionId,
-            fiscalCalculator: input.fiscalCalculatorSnapshot,
-            calculationVersion: input.calculationVersion,
-            fiscalScore: { score: result.score, scoreClass: result.scoreClass, version: result.version },
-            attribution: input.attribution,
-            consentContact: input.consentContact,
-            privacyAcceptedAt: input.privacyAcceptedAt,
-            // Fase 6F.1: the authoritative submission-capture timestamp, never the sync moment --
-            // see WebLeadCaptureInput.submittedAt's doc comment.
-            calculatedAt: input.submittedAt ?? new Date(),
-          };
+          const syncInput = this.buildFiscalSyncInput(lead, input, result);
           if (this.integrityOptions.hubspotOutboxEnabled && this.hubspotOutbox) {
-            // Fase 7C CRITICAL PATH BOUNDARY: everything above this line (lead + fiscal_v1 +
-            // this outbox row itself) is what capture() waits for. What happens AFTER this line
-            // -- the actual HubSpot HTTP call -- runs on a completely separate schedule (see
-            // HubSpotOutboxProcessorService), so a slow/down/rate-limited HubSpot can never make
-            // this request slow, and a client that gives up waiting can never erase this row
-            // (it's already durably committed to Supabase before this call even starts).
+            // Fase 7C CRITICAL PATH BOUNDARY (no atomicFiscalCapture wired -- see above): the
+            // fiscal-score row and this outbox row are still two independent Supabase calls here,
+            // but everything up to and including this line is still what capture() waits for.
+            // What happens AFTER this line -- the actual HubSpot HTTP call -- runs on a
+            // completely separate schedule (see HubSpotOutboxProcessorService), so a slow/down/
+            // rate-limited HubSpot can never make this request slow, and a client that gives up
+            // waiting can never erase this row (it's already durably committed to Supabase
+            // before this call even starts).
             await this.scheduleHubSpotOutboxDelivery(syncInput);
           } else if (this.hubspotSync) {
             // Pre-Fase-7C behavior, unchanged: synchronous, inline, awaited by this request.

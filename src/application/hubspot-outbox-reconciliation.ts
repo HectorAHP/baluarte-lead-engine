@@ -1,4 +1,5 @@
-import type { FiscalLeadScoreRepository, HubSpotSyncOutboxRepository, Logger } from "./ports.js";
+import type { FiscalLeadScoreRepository, HubSpotSyncOutboxRepository, Logger, LeadRepository } from "./ports.js";
+import { findFiscalCalculatorNoteBlockForSubmission } from "../domain/fiscal-calculator-note-parser.js";
 
 /**
  * Fase 7C spec §18/§23 -- "confirmar que Supabase contiene suficiente información para
@@ -35,10 +36,39 @@ import type { FiscalLeadScoreRepository, HubSpotSyncOutboxRepository, Logger } f
  */
 export type ReconciliationReason = "FAILED_PERMANENT_RETRIABLE" | "MISSING_OUTBOX_PARTIAL_DATA_ONLY";
 
+/**
+ * Fase 7C.1 §14 -- "buscar en TODAS las tablas relevantes... antes de concluir" and classify into
+ * this 4-way taxonomy, informed by a full re-audit that found `leads.notes` (via
+ * fiscal-calculator-note-parser.ts, the inverse of formatFiscalCalculatorNote) actually carries
+ * most of a calculator submission's raw inputs -- richer than the Fase 7C report credited it for,
+ * though never a lossless source (see that parser's own doc comment for the two permanent limits:
+ * money rounded to whole pesos, and the 4 individual deduction inputs are NEVER individually
+ * recoverable, only their sum).
+ *
+ * - FULLY_RECONSTRUCTABLE: an hubspot_sync_outbox row already exists with its FULL, original,
+ *   frozen `payload` intact (the FAILED_PERMANENT_RETRIABLE case) -- exact data, not an
+ *   approximation. Safe to retry as-is.
+ * - PARTIALLY_RECONSTRUCTABLE: no outbox row exists, but `leads.notes` contains a parseable
+ *   calculator block for this exact submissionId -- most figures recoverable, rounded, and the 4
+ *   individual deductions are gone forever (only their sum survives). NEVER auto-executed.
+ * - NOT_RECONSTRUCTABLE: no outbox row AND no parseable notes block (never submitted with a
+ *   snapshot, or truncated away by MAX_NOTES_LENGTH) -- only the scoring-level fields
+ *   (fiscal_lead_scores) survive. Nothing else in this schema holds the raw inputs.
+ * - IDENTITY_CONFLICT: the lead itself is tagged `identityConflict` (Fase 7B) -- its own identity
+ *   is ambiguous (a phone matched a different email's lead). Reconstructing ANY data for this
+ *   lead is deferred until a human resolves the identity question first -- checked BEFORE notes
+ *   parsing, so an identity-conflicted lead is never silently reconstructed from notes either.
+ *
+ * Never uses HubSpot itself as a source of truth to reconstruct anything -- only Supabase tables
+ * this project already owns (fiscal_lead_scores, leads.notes, leads.identityConflict).
+ */
+export type ReconciliationDataQuality = "FULLY_RECONSTRUCTABLE" | "PARTIALLY_RECONSTRUCTABLE" | "NOT_RECONSTRUCTABLE" | "IDENTITY_CONFLICT";
+
 export interface ReconciliationCandidate {
   leadId: string;
   submissionId: string;
   reason: ReconciliationReason;
+  dataQuality: ReconciliationDataQuality;
   /** What --execute would do for this candidate -- see the class doc comment. */
   actionPlanned: string;
 }
@@ -47,6 +77,7 @@ export interface ReconciliationCandidateDisplay {
   leadIdLast8: string;
   submissionIdLast8: string;
   reason: ReconciliationReason;
+  dataQuality: ReconciliationDataQuality;
   actionPlanned: string;
 }
 
@@ -57,6 +88,7 @@ export function formatCandidateForDisplay(candidate: ReconciliationCandidate): R
     leadIdLast8: candidate.leadId.slice(-8),
     submissionIdLast8: candidate.submissionId.slice(-8),
     reason: candidate.reason,
+    dataQuality: candidate.dataQuality,
     actionPlanned: candidate.actionPlanned,
   };
 }
@@ -77,12 +109,46 @@ export class HubSpotOutboxReconciliationService {
     private readonly fiscalLeadScores: FiscalLeadScoreRepository,
     private readonly outbox: HubSpotSyncOutboxRepository,
     private readonly logger: Logger,
+    // Fase 7C.1 §14 -- needed to read leads.notes and leads.identityConflict for the
+    // dataQuality classification above. Required (not optional): a reconciliation report that
+    // silently skipped this check would be exactly the kind of unverified claim this phase exists
+    // to correct.
+    private readonly leads: LeadRepository,
   ) {}
+
+  /**
+   * Fase 7C.1 §14 -- for a MISSING_OUTBOX_PARTIAL_DATA_ONLY candidate, determines exactly how much
+   * (if anything) could ever be reconstructed -- see ReconciliationDataQuality's own doc comment
+   * for the full taxonomy and ordering rationale (identity conflict is checked BEFORE notes
+   * parsing, deliberately).
+   */
+  private async classifyDataQuality(leadId: string, submissionId: string): Promise<ReconciliationDataQuality> {
+    const lead = await this.leads.findById(leadId);
+    if (!lead) return "NOT_RECONSTRUCTABLE"; // defensive -- should not happen (a fiscal score always references a real lead)
+    if (lead.identityConflict) return "IDENTITY_CONFLICT";
+    const parsed = findFiscalCalculatorNoteBlockForSubmission(lead.notes, submissionId);
+    return parsed ? "PARTIALLY_RECONSTRUCTABLE" : "NOT_RECONSTRUCTABLE";
+  }
+
+  private actionPlannedFor(dataQuality: ReconciliationDataQuality): string {
+    switch (dataQuality) {
+      case "IDENTITY_CONFLICT":
+        return "flag_for_manual_review -- this lead's own identity is ambiguous (Fase 7B identityConflict); resolve that FIRST, never reconstruct data for it in the meantime";
+      case "PARTIALLY_RECONSTRUCTABLE":
+        return "flag_for_manual_review -- leads.notes contains a parseable calculator block for this submission; figures are approximate (rounded, individual deductions unrecoverable, only their sum), never auto-executed";
+      case "NOT_RECONSTRUCTABLE":
+        return "flag_for_manual_review -- only scoring-level fields (fiscal_lead_scores) survive; no raw calculator inputs recoverable from any table";
+      case "FULLY_RECONSTRUCTABLE":
+        return "reset_to_pending -- full original payload preserved, safe to retry";
+    }
+  }
 
   /**
    * Fase 7C spec §19 -- ALWAYS dry-run: never mutates anything. Scans every fiscal_lead_scores row
    * since `since` (bounded -- see FiscalLeadScoreRepository.listAll's own doc comment) and cross-
-   * references hubspot_sync_outbox for each (leadId, submissionId) pair.
+   * references hubspot_sync_outbox for each (leadId, submissionId) pair. Fase 7C.1 §14: for every
+   * MISSING_OUTBOX candidate, ALSO reads the lead's notes/identityConflict to classify dataQuality
+   * -- never concludes "nothing recoverable" without having actually looked.
    */
   async dryRun(since: Date, limit: number): Promise<ReconciliationReport> {
     const scores = await this.fiscalLeadScores.listAll(since, limit);
@@ -91,18 +157,21 @@ export class HubSpotOutboxReconciliationService {
     for (const score of scores) {
       const entry = await this.outbox.findByLeadAndSubmission(score.leadId, score.submissionId);
       if (!entry) {
+        const dataQuality = await this.classifyDataQuality(score.leadId, score.submissionId);
         candidates.push({
           leadId: score.leadId,
           submissionId: score.submissionId,
           reason: "MISSING_OUTBOX_PARTIAL_DATA_ONLY",
-          actionPlanned: "flag_for_manual_review -- only scoring-level fields could ever be reconstructed, never auto-executed",
+          dataQuality,
+          actionPlanned: this.actionPlannedFor(dataQuality),
         });
       } else if (entry.status === "FAILED_PERMANENT") {
         candidates.push({
           leadId: score.leadId,
           submissionId: score.submissionId,
           reason: "FAILED_PERMANENT_RETRIABLE",
-          actionPlanned: "reset_to_pending -- full original payload preserved, safe to retry",
+          dataQuality: "FULLY_RECONSTRUCTABLE",
+          actionPlanned: this.actionPlannedFor("FULLY_RECONSTRUCTABLE"),
         });
       }
       // SUCCEEDED / PENDING / PROCESSING / FAILED_RETRYABLE -- not a candidate. A row already

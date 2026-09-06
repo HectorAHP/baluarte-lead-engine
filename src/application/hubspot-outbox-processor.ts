@@ -1,6 +1,6 @@
 import type { HubSpotSyncOutboxRepository, HubSpotCRMProvider, Logger } from "./ports.js";
 import type { HubSpotSyncOutboxEntry } from "../domain/hubspot-sync-outbox.js";
-import { classifyHubSpotSyncError, computeNextAttemptAt, DEFAULT_MAX_ATTEMPTS } from "../domain/hubspot-sync-retry.js";
+import { classifyHubSpotSyncError, computeNextAttemptAt, isAuthErrorStatus, DEFAULT_MAX_ATTEMPTS } from "../domain/hubspot-sync-retry.js";
 import { HubSpotProviderError } from "../domain/errors.js";
 
 export interface HubSpotOutboxProcessorDeps {
@@ -12,7 +12,16 @@ export interface HubSpotOutboxProcessorDeps {
 export interface HubSpotOutboxProcessorOptions {
   batchSize: number;
   maxAttempts: number;
+  /** Fase 7C.1 §6 -- how long a row may sit in PROCESSING before a later claimBatch call treats it
+   * as a crashed worker's stranded claim and reclaims it. Generous headroom above the real
+   * HubSpot call's own request timeout (infrastructure/hubspot-crm-provider.ts) so a row still
+   * genuinely being worked by a live process is never falsely reclaimed. Optional -- defaults to
+   * DEFAULT_STALE_PROCESSING_THRESHOLD_MS (10 minutes) so existing call sites that only care about
+   * batchSize/maxAttempts need no change. */
+  staleProcessingThresholdMs?: number;
 }
+
+export const DEFAULT_STALE_PROCESSING_THRESHOLD_MS = 10 * 60_000;
 
 export interface HubSpotOutboxRunSummary {
   claimed: number;
@@ -35,11 +44,12 @@ export interface HubSpotOutboxRunSummary {
 export class HubSpotOutboxProcessorService {
   constructor(
     private readonly deps: HubSpotOutboxProcessorDeps,
-    private readonly options: HubSpotOutboxProcessorOptions = { batchSize: 20, maxAttempts: DEFAULT_MAX_ATTEMPTS },
+    private readonly options: HubSpotOutboxProcessorOptions = { batchSize: 20, maxAttempts: DEFAULT_MAX_ATTEMPTS, staleProcessingThresholdMs: DEFAULT_STALE_PROCESSING_THRESHOLD_MS },
   ) {}
 
   async run(now: Date): Promise<HubSpotOutboxRunSummary> {
-    const batch = await this.deps.outbox.claimBatch(now, this.options.batchSize);
+    const staleBefore = new Date(now.getTime() - (this.options.staleProcessingThresholdMs ?? DEFAULT_STALE_PROCESSING_THRESHOLD_MS));
+    const batch = await this.deps.outbox.claimBatch(now, this.options.batchSize, staleBefore);
     let succeeded = 0, retryScheduled = 0, permanentlyFailed = 0;
     for (const entry of batch) {
       const outcome = await this.processOne(entry, now);
@@ -89,6 +99,16 @@ export class HubSpotOutboxProcessorService {
           lastAttemptAt: now,
           lastErrorCode: errorCode,
         });
+        // Fase 7C.1 §9 -- 401/403 gets its own distinct, more actionable outcome label: it almost
+        // always signals a bad/expired HubSpot token or scope (a config problem affecting the
+        // WHOLE batch), never "just an invalid lead" -- must never be lost inside the generic
+        // "failed_permanent" bucket during on-call triage. Checked before the exhausted-retries
+        // case since an auth failure is never actually retried (PERMANENT on first sight).
+        const outcome = isAuthErrorStatus(httpStatus)
+          ? "failed_permanent_auth_error"
+          : exhausted && classification === "RETRYABLE"
+            ? "failed_permanent_attempts_exhausted"
+            : "failed_permanent";
         this.deps.logger.warn(
           {
             hubspotOutboxIdLast8: entry.id.slice(-8),
@@ -96,9 +116,11 @@ export class HubSpotOutboxProcessorService {
             submissionIdLast8: entry.submissionId.slice(-8),
             attempt: nextAttemptCount,
             statusCode: httpStatus,
-            outcome: exhausted && classification === "RETRYABLE" ? "failed_permanent_attempts_exhausted" : "failed_permanent",
+            outcome,
           },
-          "hubspot outbox delivery permanently failed -- see hubspot_sync_outbox for manual reconciliation",
+          outcome === "failed_permanent_auth_error"
+            ? "hubspot outbox delivery failed with an auth error (401/403) -- check the HubSpot private-app token/scope, this likely affects the whole batch, not just this lead"
+            : "hubspot outbox delivery permanently failed -- see hubspot_sync_outbox for manual reconciliation",
         );
         return "FAILED_PERMANENT";
       }

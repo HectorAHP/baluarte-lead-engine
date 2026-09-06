@@ -19,9 +19,28 @@ describe("Fase 7C item 2 -- client abort semantics on a slow Fastify handler", (
     let startedCount = 0;
     let finishedCount = 0;
     let handlerSawAbort = false;
+    // Fase 7C.1 §16 -- root-caused the original flake (`startedCount` expected 1, got 0 under a
+    // full-parallel-suite run) to TIMING/RESOURCE-STARVATION, not a bug in the behavior under
+    // test: the original test scheduled the client abort on a fixed 80ms wall-clock timer,
+    // gambling that `app.listen()` + establishing the TCP connection + the handler actually
+    // starting would ALWAYS finish well inside that budget. Under heavy event-loop contention from
+    // hundreds of other tests running in parallel, that assumption can fail -- the abort fires
+    // before the request even reaches the handler, so `startedCount` never increments, and the
+    // test asserts something the abort itself prevented from ever happening (a false failure, not
+    // a real regression in Fastify/Node's behavior).
+    //
+    // FIX: replace the arbitrary timer with a real synchronization signal. `started` resolves the
+    // instant the handler's very first line runs -- the test now waits for that CONFIRMED, actual
+    // "the request was received" signal before triggering the abort, so `startedCount === 1` is
+    // guaranteed by construction, never a race against an arbitrary duration. The abort still
+    // fires while the handler is genuinely mid-flight (it still has ~350ms of simulated work left
+    // at that point), which is exactly the scenario this test exists to verify.
+    let resolveStarted!: () => void;
+    const started = new Promise<void>((resolve) => { resolveStarted = resolve; });
 
     app.post("/slow", async (req, reply) => {
       startedCount++;
+      resolveStarted();
       // Simulate the exact shape of a real handler: some fast synchronous-ish work (Supabase
       // writes), then a slow downstream call (HubSpot), all inside one await chain -- nothing
       // here ever inspects req.raw for cancellation, exactly like WebLeadCaptureService today.
@@ -37,23 +56,22 @@ describe("Fase 7C item 2 -- client abort semantics on a slow Fastify handler", (
     const port = typeof address === "object" && address ? address.port : 0;
 
     const controller = new AbortController();
-    // Abort well before the handler's own ~350ms total duration -- mirrors impuestos.html's
-    // LEAD_ENGINE_TIMEOUT_MS firing before the backend responds.
-    setTimeout(() => controller.abort(), 80);
-
     let clientError: unknown;
-    try {
-      await fetch(`http://127.0.0.1:${port}/slow`, { method: "POST", signal: controller.signal });
-    } catch (err) {
-      clientError = err;
-    }
-    expect(clientError).toBeDefined(); // the client DOES see this as a failure -- AbortError/fetch failed
+    const fetchPromise = fetch(`http://127.0.0.1:${port}/slow`, { method: "POST", signal: controller.signal }).catch((err) => { clientError = err; });
 
-    // Wait past the handler's own total duration (350ms) plus margin, then check whether it ran
-    // to completion anyway, server-side, despite the client having already given up at 80ms.
+    // Deterministic: only abort once the handler has PROVABLY started -- never a guess about
+    // timing under load.
+    await started;
+    controller.abort();
+    await fetchPromise;
+
+    expect(clientError).toBeDefined(); // the client DOES see this as a failure -- AbortError/fetch failed
+    expect(startedCount).toBe(1); // guaranteed by the `await started` above, not a race any more
+
+    // Wait past the handler's own total duration (350ms) plus generous margin, then check whether
+    // it ran to completion anyway, server-side, despite the client having already given up.
     await new Promise((resolve) => setTimeout(resolve, 500));
 
-    expect(startedCount).toBe(1);
     // THE ANSWER: Fastify/Node does NOT cancel the handler's Promise chain just because the
     // client's socket closed. The handler keeps running to completion in the background -- its
     // own side effects (here, incrementing finishedCount; in production, the Supabase writes and

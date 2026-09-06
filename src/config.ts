@@ -137,6 +137,11 @@ const schema=z.object({
   // never env-configurable (a wrong env value there could silently create a retry storm or an
   // effectively-infinite retry).
   HUBSPOT_OUTBOX_MAX_ATTEMPTS:z.coerce.number().int().positive().default(6),
+  // Fase 7C.1 §6 -- how long a row may sit in PROCESSING before a later worker run treats the
+  // claim as abandoned (a crashed/killed process) and reclaims it. Default 10 minutes, generous
+  // headroom above the HubSpot call's own request timeout (infrastructure/hubspot-crm-provider.ts)
+  // so a row genuinely still being worked by a live process is never falsely reclaimed.
+  HUBSPOT_OUTBOX_STALE_PROCESSING_THRESHOLD_MS:z.coerce.number().int().positive().default(10*60_000),
   // Production hardening (web lead capture / POST /api/leads). Comma-separated origin allowlist
   // for @fastify/cors -- optional because a sensible NODE_ENV-based default (see
   // corsAllowedOrigins below) covers the common case without requiring an env var in every
