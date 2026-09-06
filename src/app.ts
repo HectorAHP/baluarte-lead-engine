@@ -60,6 +60,7 @@ import { WhatsAppPastBookedRecoveryHandler } from "./application/whatsapp-past-b
 import { extractWhatsAppMessages } from "./domain/whatsapp-webhook-payload.js";
 import { verifyMetaSignature } from "./domain/meta-signature.js";
 import { timingSafeEqualStrings } from "./domain/timing-safe-compare.js";
+import { checkAdminToken } from "./domain/admin-auth.js";
 import {
   LeadNotFoundError, InvalidLeadTransitionError, SlotUnavailableError,
   IdempotencyConflictError, CalendarProviderError, HubSpotProviderError,
@@ -1052,20 +1053,24 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
   });
 
   const appointmentIdParam = z.object({ id: z.string().uuid() });
-  /** Shared `x-admin-token` check for the two admin endpoints below -- same fail-closed-when-unset
-   * and timingSafeEqualStrings posture as the reminders-runner secret / WHATSAPP_VERIFY_TOKEN. */
+  /**
+   * Shared `x-admin-token` check for every ADMIN_API_TOKEN-protected endpoint (mark-completed,
+   * mark-no-show, recover-handoff) -- same fail-closed-when-unset posture as the reminders-runner
+   * secret / WHATSAPP_VERIFY_TOKEN. Fase 7E.2: the actual decision now lives in
+   * domain/admin-auth.ts's checkAdminToken (a pure function, directly unit-tested, guaranteed to
+   * never throw) -- this wrapper's only job is translating that decision into the HTTP
+   * response/return-value shape every caller here already expects. Response bodies/codes are
+   * byte-identical to before this refactor (NOT_CONFIGURED -> 401, UNAUTHORIZED -> 401, OK ->
+   * true) -- this is a hardening of the failure boundary, never a behavior change for the
+   * already-correct paths.
+   */
   function requireAdminToken(req: FastifyRequest, reply: FastifyReply): boolean {
-    if (!adminApiToken) {
-      reply.code(401).send({ error: "NOT_CONFIGURED" });
-      return false;
-    }
     const headerValue = req.headers["x-admin-token"];
-    const provided = Array.isArray(headerValue) ? (headerValue[0] ?? "") : (headerValue ?? "");
-    if (!timingSafeEqualStrings(provided, adminApiToken)) {
-      reply.code(401).send({ error: "UNAUTHORIZED" });
-      return false;
-    }
-    return true;
+    const provided = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+    const result = checkAdminToken(provided, adminApiToken);
+    if (result === "OK") return true;
+    reply.code(401).send({ error: result });
+    return false;
   }
 
   // Fase 7A spec item 9 / docs/PHASE4-DESIGN.md §9: no-show/completed is NEVER inferred

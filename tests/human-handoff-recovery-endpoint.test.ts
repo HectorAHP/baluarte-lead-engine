@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { buildTestApp, TEST_ADMIN_API_TOKEN, TEST_META_APP_SECRET } from "./helpers/test-app.js";
 import {
   InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryConversationRepository,
@@ -61,6 +61,45 @@ describe("Fase 7E -- POST /api/leads/:id/recover-handoff", () => {
     const app = await buildTestApp({ adminApiToken: TEST_ADMIN_API_TOKEN });
     const res = await app.inject({ method: "POST", url: `/api/leads/${UNKNOWN_ID}/recover-handoff`, headers: { "x-admin-token": TEST_ADMIN_API_TOKEN } });
     expect(JSON.stringify(res.json())).not.toContain(TEST_ADMIN_API_TOKEN);
+  });
+
+  // Fase 7E.2 §5/§8 items 4/5 -- authentication happens strictly BEFORE any repository access.
+  // Proven with spies, not inferred from reading the code -- a real UUID id is used so the ONLY
+  // reason findById would ever be skipped is the auth check itself returning early.
+  describe("order of operations: auth before any data access (spied, not assumed)", () => {
+    it("item 4: an unauthenticated request (no token) never queries the lead repository", async () => {
+      const leadsRepo = new InMemoryLeadRepository();
+      const findByIdSpy = vi.spyOn(leadsRepo, "findById");
+      const app = await buildTestApp({ adminApiToken: TEST_ADMIN_API_TOKEN, leadsRepo });
+
+      const res = await app.inject({ method: "POST", url: `/api/leads/${UNKNOWN_ID}/recover-handoff` });
+
+      expect(res.statusCode).toBe(401);
+      expect(findByIdSpy).not.toHaveBeenCalled();
+    });
+
+    it("item 5: a wrong-token request never queries the lead repository", async () => {
+      const leadsRepo = new InMemoryLeadRepository();
+      const findByIdSpy = vi.spyOn(leadsRepo, "findById");
+      const app = await buildTestApp({ adminApiToken: TEST_ADMIN_API_TOKEN, leadsRepo });
+
+      const res = await app.inject({ method: "POST", url: `/api/leads/${UNKNOWN_ID}/recover-handoff`, headers: { "x-admin-token": "wrong" } });
+
+      expect(res.statusCode).toBe(401);
+      expect(findByIdSpy).not.toHaveBeenCalled();
+    });
+
+    it("a request with the CORRECT token DOES reach the repository -- confirms the spy itself is wired correctly, not just silent", async () => {
+      const leadsRepo = new InMemoryLeadRepository();
+      const findByIdSpy = vi.spyOn(leadsRepo, "findById");
+      const app = await buildTestApp({ adminApiToken: TEST_ADMIN_API_TOKEN, leadsRepo });
+
+      const res = await app.inject({ method: "POST", url: `/api/leads/${UNKNOWN_ID}/recover-handoff`, headers: { "x-admin-token": TEST_ADMIN_API_TOKEN } });
+
+      expect(res.statusCode).toBe(404); // unknown id -> NOT_FOUND, but only AFTER the repository was actually consulted
+      expect(findByIdSpy).toHaveBeenCalledTimes(1);
+      expect(findByIdSpy).toHaveBeenCalledWith(UNKNOWN_ID);
+    });
   });
 
   // item 13/14 -- no user-controlled destination
