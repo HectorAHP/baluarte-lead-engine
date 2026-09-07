@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { LeadService, AppointmentService } from "../src/application/services.js";
-import { InMemoryLeadRepository, InMemoryLeadScoreRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository, InMemoryLeadStatusHistoryRepository } from "../src/infrastructure/memory-repositories.js";
+import { InMemoryLeadRepository, InMemoryLeadScoreRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository, InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
 
@@ -54,6 +54,7 @@ describe("lifecycle timestamps", () => {
       new InMemoryBookingAttemptRepository(),
       leads,
       new FakeLogger(),
+      new InMemoryAppointmentStatusHistoryRepository(),
     );
 
     const start = new Date("2026-03-02T15:00:00.000Z");

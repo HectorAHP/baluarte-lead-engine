@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { AppointmentService } from "../src/application/services.js";
-import { InMemoryAppointmentRepository, InMemoryBookingAttemptRepository, InMemoryLeadRepository } from "../src/infrastructure/memory-repositories.js";
+import { InMemoryAppointmentRepository, InMemoryBookingAttemptRepository, InMemoryLeadRepository, InMemoryAppointmentStatusHistoryRepository } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
 import { SlotUnavailableError, IdempotencyConflictError, CalendarProviderError } from "../src/domain/errors.js";
@@ -44,7 +44,7 @@ function makeService() {
   // lead.bookedAt-write-fails-but-booking-still-succeeds path on every test in this file.
   const leads = new InMemoryLeadRepository();
   const logger = new FakeLogger();
-  const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, logger);
+  const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, logger, new InMemoryAppointmentStatusHistoryRepository());
   return { service, calendar, appointments, bookingAttempts, leads, logger };
 }
 
@@ -139,7 +139,7 @@ describe("AppointmentService.book slot protection", () => {
       async deleteEvent() {},
     };
     const leads = new InMemoryLeadRepository();
-    const service = new AppointmentService(failingCalendar, appointments, bookingAttempts, leads, new FakeLogger());
+    const service = new AppointmentService(failingCalendar, appointments, bookingAttempts, leads, new FakeLogger(), new InMemoryAppointmentStatusHistoryRepository());
     const key = randomUUID();
     await expect(service.book(bookingInput(), key)).rejects.toThrow(CalendarProviderError);
     const attempt = await bookingAttempts.findByKey(key);
@@ -299,7 +299,7 @@ describe("AppointmentService.book -- Fase 7F direct-booking business-hours prote
     const appointments = new InMemoryAppointmentRepository();
     const bookingAttempts = new InMemoryBookingAttemptRepository();
     const leads = new InMemoryLeadRepository();
-    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger());
+    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger(), new InMemoryAppointmentStatusHistoryRepository());
     // 2026-03-08 is a Sunday (see tests/availability.test.ts's own reference week).
     const input = bookingInput({ start: new Date("2026-03-08T18:00:00.000Z"), end: new Date("2026-03-08T18:30:00.000Z") });
 
@@ -311,7 +311,7 @@ describe("AppointmentService.book -- Fase 7F direct-booking business-hours prote
     const appointments = new InMemoryAppointmentRepository();
     const bookingAttempts = new InMemoryBookingAttemptRepository();
     const leads = new InMemoryLeadRepository();
-    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger());
+    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger(), new InMemoryAppointmentStatusHistoryRepository());
     // 2026-03-07 is a Saturday; 20:00-20:30 UTC == 14:00-14:30 America/Mexico_City.
     const input = bookingInput({ start: new Date("2026-03-07T20:00:00.000Z"), end: new Date("2026-03-07T20:30:00.000Z") });
 
@@ -323,7 +323,7 @@ describe("AppointmentService.book -- Fase 7F direct-booking business-hours prote
     const appointments = new InMemoryAppointmentRepository();
     const bookingAttempts = new InMemoryBookingAttemptRepository();
     const leads = new InMemoryLeadRepository();
-    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger());
+    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger(), new InMemoryAppointmentStatusHistoryRepository());
     // 19:30-20:00 UTC == 13:30-14:00 America/Mexico_City.
     const input = bookingInput({ start: new Date("2026-03-07T19:30:00.000Z"), end: new Date("2026-03-07T20:00:00.000Z") });
 
@@ -336,7 +336,7 @@ describe("AppointmentService.book -- Fase 7F direct-booking business-hours prote
     const appointments = new InMemoryAppointmentRepository();
     const bookingAttempts = new InMemoryBookingAttemptRepository();
     const leads = new InMemoryLeadRepository();
-    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger());
+    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger(), new InMemoryAppointmentStatusHistoryRepository());
     const input = bookingInput({ start: new Date("2026-03-08T18:00:00.000Z"), end: new Date("2026-03-08T18:30:00.000Z") });
     const key = randomUUID();
 
@@ -351,7 +351,7 @@ describe("AppointmentService.book -- Fase 7F direct-booking business-hours prote
     const appointments = new InMemoryAppointmentRepository();
     const bookingAttempts = new InMemoryBookingAttemptRepository();
     const leads = new InMemoryLeadRepository();
-    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger());
+    const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, new FakeLogger(), new InMemoryAppointmentStatusHistoryRepository());
     const appt = await service.book(bookingInput(), randomUUID()); // Monday 09:00, the file's own default
 
     expect(appt.status).toBe("BOOKED");

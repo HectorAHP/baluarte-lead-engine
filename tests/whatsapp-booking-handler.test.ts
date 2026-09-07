@@ -5,7 +5,7 @@ import { SlotOfferingService, OFFERED_SLOT_TTL_MS } from "../src/application/slo
 import {
   InMemoryLeadRepository, InMemoryConversationRepository, InMemoryAppointmentRepository,
   InMemoryOfferedSlotRepository, InMemoryBookingAttemptRepository, InMemoryMessageRepository,
-  InMemorySlotOfferClaimRepository, InMemoryLeadStatusHistoryRepository,
+  InMemorySlotOfferClaimRepository, InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository,
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import { FakeMessagingProvider } from "../src/infrastructure/fake-messaging-provider.js";
@@ -89,7 +89,8 @@ function makeHandler(overrides: { calendar?: CalendarProvider } = {}) {
   const messages = new InMemoryMessageRepository();
   const messaging = new FakeMessagingProvider();
   const logger = new FakeLogger();
-  const appointmentService = new AppointmentService(calendar, appointments, bookingAttempts, leads, logger);
+  const appointmentStatusHistory = new InMemoryAppointmentStatusHistoryRepository();
+  const appointmentService = new AppointmentService(calendar, appointments, bookingAttempts, leads, logger, appointmentStatusHistory);
   const slotOfferClaims = new InMemorySlotOfferClaimRepository();
   const leadStatusHistory = new InMemoryLeadStatusHistoryRepository();
   const slotOffering = new SlotOfferingService(calendar, offeredSlots, appointments, leads, slotOfferClaims, leadStatusHistory, logger);

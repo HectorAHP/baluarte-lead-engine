@@ -411,7 +411,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
       staleProcessingThresholdMs: config.HUBSPOT_OUTBOX_STALE_PROCESSING_THRESHOLD_MS,
     },
   );
-  const appointmentService = new AppointmentService(calendar, appointmentsRepo, bookingAttemptsRepo, leadsRepo, app.log);
+  const appointmentService = new AppointmentService(calendar, appointmentsRepo, bookingAttemptsRepo, leadsRepo, app.log, appointmentStatusHistoryRepo);
   // Always constructed -- cheap, stateless, and needed by both qualificationHandler (to offer
   // slots right after QUALIFIED_A/B) and bookingHandler below, each gated independently by its
   // own flag.

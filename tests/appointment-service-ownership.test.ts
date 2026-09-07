@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppointmentService, PENDING_STALE_THRESHOLD_MS, fingerprintBooking, type BookInput } from "../src/application/services.js";
-import { InMemoryAppointmentRepository, InMemoryBookingAttemptRepository, InMemoryLeadRepository } from "../src/infrastructure/memory-repositories.js";
+import { InMemoryAppointmentRepository, InMemoryBookingAttemptRepository, InMemoryLeadRepository, InMemoryAppointmentStatusHistoryRepository } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
 import {
@@ -43,7 +43,7 @@ function makeService(calendarOverride?: CalendarProvider) {
   const bookingAttempts = new InMemoryBookingAttemptRepository();
   const leads = new InMemoryLeadRepository();
   const logger = new FakeLogger();
-  const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, logger);
+  const service = new AppointmentService(calendar, appointments, bookingAttempts, leads, logger, new InMemoryAppointmentStatusHistoryRepository());
   return { service, calendar: calendar as CountingCalendarProvider, appointments, bookingAttempts, leads, logger };
 }
 
@@ -257,7 +257,7 @@ describe("AppointmentService.book -- ownership foundation", () => {
         return [];
       },
     };
-    const service = new AppointmentService(calendar, failingAppointments, bookingAttempts, leads, logger);
+    const service = new AppointmentService(calendar, failingAppointments, bookingAttempts, leads, logger, new InMemoryAppointmentStatusHistoryRepository());
 
     await expect(service.book(input, key)).rejects.toThrow();
     expect(calendar.createEventCalls).toBe(1);
@@ -319,7 +319,7 @@ describe("AppointmentService.book -- ownership foundation", () => {
       async deleteEvent() {},
     };
     const leads = new InMemoryLeadRepository();
-    const service = new AppointmentService(failingCalendar, appointments, bookingAttempts, leads, new FakeLogger());
+    const service = new AppointmentService(failingCalendar, appointments, bookingAttempts, leads, new FakeLogger(), new InMemoryAppointmentStatusHistoryRepository());
     const key = randomUUID();
     await expect(service.book(bookingInput(), key)).rejects.toThrow(CalendarProviderError);
     const attempt = await bookingAttempts.findByKey(key);

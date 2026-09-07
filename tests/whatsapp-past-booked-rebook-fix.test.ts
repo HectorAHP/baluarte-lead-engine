@@ -226,7 +226,7 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
   });
 
-  it("8. the original past appointment remains historical -- never mutated, never reused as if it were the new one", async () => {
+  it("8. the original past appointment is correctly closed out (EXPIRED) by the rebooking -- never reused as if it were the new one, its timing never altered", async () => {
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214779980008", "BOOKED");
@@ -236,8 +236,14 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     await send(app, "5214779980008", "wamid.8b", "1");
 
+    // Fase 7H: AppointmentService.expirePriorStaleBookedAppointments now closes this exact
+    // orphan-shaped row out as part of the rebooking (BOOKED -> EXPIRED, never COMPLETED/NO_SHOW --
+    // it never infers attendance) -- this is the fix for the real eb95060d incident, where this
+    // stale row was left BOOKED forever and made cancellation/reschedule see ">1 active" and
+    // escalate to HUMAN_HANDOFF. Its identity/timing are still never altered to look like the new
+    // appointment -- only its status legitimately advances.
     const reloadedStale = await repos.appointmentsRepo.findById(staleAppointment.id);
-    expect(reloadedStale?.status).toBe("BOOKED");
+    expect(reloadedStale?.status).toBe("EXPIRED");
     expect(reloadedStale?.startsAt.getTime()).toBe(PAST_STARTS_AT.getTime()); // untouched
     void offered;
   });

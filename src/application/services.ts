@@ -1,5 +1,5 @@
 import {createHash} from "node:crypto";
-import type { LeadRepository,CalendarProvider,AppointmentRepository,BookingAttemptRepository,LeadScoreRepository,LeadStatusHistoryRepository,Logger } from "./ports.js";
+import type { LeadRepository,CalendarProvider,AppointmentRepository,BookingAttemptRepository,LeadScoreRepository,LeadStatusHistoryRepository,AppointmentStatusHistoryRepository,Logger } from "./ports.js";
 import type { Vertical,Lead,LeadStatus } from "../domain/lead.js";
 import type { Appointment } from "../domain/appointment.js";
 import type { BookingAttempt } from "../domain/booking-attempt.js";
@@ -8,7 +8,7 @@ import type {QualificationVertical} from "../domain/qualification-fields.js";
 import {assertTransition} from "../domain/state-machine.js";
 import {normalizePhoneToE164} from "../domain/phone.js";
 import {LeadNotFoundError,SlotUnavailableError,IdempotencyConflictError,BookingAttemptKeyConflictError,BookingInProgressError,BookingAttemptInconsistentError} from "../domain/errors.js";
-import {recordLeadStatusTransition} from "./lead-status-audit.js";
+import {recordLeadStatusTransition,recordAppointmentStatusTransition} from "./lead-status-audit.js";
 
 /** Exported (pre-launch hardening) so WhatsAppBookingHandler.abandonBookingPending reuses the
  * EXACT SAME scoreClass -> LeadStatus mapping this class already uses to land a freshly-scored
@@ -165,7 +165,16 @@ export function fingerprintBooking(input:BookInput):string{
 export const PENDING_STALE_THRESHOLD_MS = 2 * 60 * 1000;
 
 export class AppointmentService{
-  constructor(private readonly calendar:CalendarProvider,private readonly appointments:AppointmentRepository,private readonly bookingAttempts:BookingAttemptRepository,private readonly leads:LeadRepository,private readonly logger:Logger){}
+  constructor(
+    private readonly calendar:CalendarProvider,
+    private readonly appointments:AppointmentRepository,
+    private readonly bookingAttempts:BookingAttemptRepository,
+    private readonly leads:LeadRepository,
+    private readonly logger:Logger,
+    /** Fase 7H -- required so expirePriorStaleBookedAppointments below can write a real
+     * appointment_status_history row instead of silently changing status with no audit trail. */
+    private readonly appointmentStatusHistory:AppointmentStatusHistoryRepository,
+  ){}
 
   getAvailability(from:Date,to:Date,durationMinutes=30){
     return this.calendar.getAvailableSlots(from,to,durationMinutes);
@@ -275,6 +284,15 @@ export class AppointmentService{
 
     let appointment:Appointment;
     try{
+      // Fase 7H -- MUST run before create() below, never after: the real incident this closes
+      // (lead eb95060d) had an old BOOKED appointment from before a HUMAN_HANDOFF recovery sit
+      // forever unresolved while a brand-new BOOKED appointment was created independently,
+      // leaving TWO "active" rows and making WhatsAppCancellationHandler/WhatsAppRescheduleHandler
+      // see ">1 active" and escalate every future cancel/reschedule to HUMAN_HANDOFF. Folded into
+      // this SAME try/catch as appointments.create so a failure here gets the exact same cleanup
+      // (booking attempt FAILED, Calendar event deleted) as an appointment-create failure --
+      // never leaves an orphaned Calendar event behind.
+      await this.expirePriorStaleBookedAppointments(input.leadId);
       appointment=await this.appointments.create({leadId:input.leadId,status:"BOOKED",startsAt:input.start,endsAt:input.end,timezone:input.timezone,calendarEventId:providerEventId,meetingProvider:"GOOGLE_MEET",meetingUrl});
     }catch(err){
       await this.bookingAttempts.update(attempt.id,{status:"FAILED"}).catch(()=>{});
@@ -306,5 +324,35 @@ export class AppointmentService{
       );
     });
     return appointment;
+  }
+
+  /**
+   * Fase 7H -- closes out any of this lead's OTHER "BOOKED" appointments whose endsAt has
+   * already passed, immediately before a brand-new one is created. Never touches a future/current
+   * BOOKED appointment (the `prior.endsAt>=now` guard), never infers attendance (transitions to
+   * EXPIRED, never COMPLETED/NO_SHOW -- see AppointmentStatus's doc comment), and never touches
+   * Calendar (no deleteEvent call here -- the old appointment's real Calendar event, if any, is
+   * left exactly as it is; only this app's own bookkeeping changes).
+   *
+   * Uses listActiveByLeadId (every BOOKED row for this lead, not just the most recent) so it can
+   * genuinely close ALL of them, not just one -- and claimTransition's compare-and-set so a prior
+   * appointment that a concurrent turn already moved out of BOOKED (e.g. a cancellation completing
+   * at the same moment) is silently skipped (claimed===null) rather than double-processed or
+   * overwritten. Safe to call on every booking, including idempotent retries: an appointment
+   * that's already EXPIRED (or anything else) simply never matches listActiveByLeadId's
+   * status==="BOOKED" filter again, so no duplicate appointment_status_history row is ever
+   * written for the same appointment.
+   */
+  private async expirePriorStaleBookedAppointments(leadId:string):Promise<void>{
+    const now=new Date();
+    const activePrior=await this.appointments.listActiveByLeadId(leadId);
+    for(const prior of activePrior){
+      if(prior.endsAt>=now) continue; // still future/current -- never auto-close a live commitment
+      const claimed=await this.appointments.claimTransition(prior.id,"BOOKED","EXPIRED");
+      if(!claimed) continue; // lost the race (already changed by something else) -- nothing to do
+      await recordAppointmentStatusTransition(this.appointmentStatusHistory,this.logger,{
+        appointmentId:prior.id,leadId,fromStatus:"BOOKED",toStatus:"EXPIRED",eventType:"APPOINTMENT_EXPIRED_ON_REBOOK",
+      });
+    }
   }
 }

@@ -34,7 +34,7 @@ describe("Phase 4A: lead_status_history across the real Phase 3C booking lifecyc
 
     const leadService = new LeadService(leads, leadScores, leadStatusHistory, logger);
     const slotOffering = new SlotOfferingService(calendar, offeredSlots, appointments, leads, slotOfferClaims, leadStatusHistory, logger);
-    const appointmentService = new AppointmentService(calendar, appointments, bookingAttempts, leads, logger);
+    const appointmentService = new AppointmentService(calendar, appointments, bookingAttempts, leads, logger, appointmentStatusHistory);
 
     // 1-3: NEW -> CONTACTED -> QUALIFYING (mirrors handleInboundWhatsAppText's real sequence).
     let lead = await leadService.createLead({ firstName: "Ana", productVertical: "GMM" });

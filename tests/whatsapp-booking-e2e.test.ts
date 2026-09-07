@@ -6,7 +6,7 @@ import {
   InMemoryLeadRepository, InMemoryConversationRepository, InMemoryMessageRepository,
   InMemoryQualificationAnswerRepository, InMemoryLeadScoreRepository, InMemoryAppointmentRepository,
   InMemoryBookingAttemptRepository, InMemoryOfferedSlotRepository, InMemorySlotOfferClaimRepository,
-  InMemoryLeadStatusHistoryRepository,
+  InMemoryLeadStatusHistoryRepository, InMemoryAppointmentStatusHistoryRepository,
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import { FakeLogger } from "../src/infrastructure/fake-logger.js";
@@ -59,6 +59,7 @@ function buildRepos() {
     offeredSlotsRepo: new InMemoryOfferedSlotRepository(),
     slotOfferClaimsRepo: new InMemorySlotOfferClaimRepository(),
     leadStatusHistoryRepo: new InMemoryLeadStatusHistoryRepository(),
+    appointmentStatusHistoryRepo: new InMemoryAppointmentStatusHistoryRepository(),
     calendar: new FakeCalendarProvider(),
   };
 }
@@ -131,7 +132,7 @@ function makeBookingHarness(overrides: { calendar?: CalendarProvider } = {}) {
   const repos = buildRepos();
   const bookingAttempts = repos.bookingAttemptsRepo;
   const logger = new FakeLogger();
-  const appointmentService = new AppointmentService(calendar, repos.appointmentsRepo, bookingAttempts, repos.leadsRepo, logger);
+  const appointmentService = new AppointmentService(calendar, repos.appointmentsRepo, bookingAttempts, repos.leadsRepo, logger, repos.appointmentStatusHistoryRepo);
   const slotOffering = new SlotOfferingService(calendar, repos.offeredSlotsRepo, repos.appointmentsRepo, repos.leadsRepo, repos.slotOfferClaimsRepo, repos.leadStatusHistoryRepo, new FakeLogger());
   const messaging = new FakeMessagingProvider();
   const handler = new WhatsAppBookingHandler(
@@ -380,7 +381,7 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     const now = new Date("2026-03-02T12:00:00.000Z");
     const failingMessaging = new AlwaysFailingMessaging();
     const slotOffering = new SlotOfferingService(calendar, repos.offeredSlotsRepo, repos.appointmentsRepo, repos.leadsRepo, repos.slotOfferClaimsRepo, repos.leadStatusHistoryRepo, new FakeLogger());
-    const appointmentService = new AppointmentService(calendar, repos.appointmentsRepo, repos.bookingAttemptsRepo, repos.leadsRepo, new FakeLogger());
+    const appointmentService = new AppointmentService(calendar, repos.appointmentsRepo, repos.bookingAttemptsRepo, repos.leadsRepo, new FakeLogger(), repos.appointmentStatusHistoryRepo);
     const failingHandler = new WhatsAppBookingHandler(
       { leads: repos.leadsRepo, conversations: repos.conversationsRepo, appointments: repos.appointmentsRepo, offeredSlots: repos.offeredSlotsRepo, slotOffering, appointmentService, messaging: failingMessaging, messages: repos.messagesRepo, leadStatusHistory: repos.leadStatusHistoryRepo, logger: new FakeLogger() },
       "America/Mexico_City",
@@ -423,7 +424,7 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     const offer = await slotOffering.getOrCreateOffer({ lead, conversationId: conversation.id, now });
     if (offer.type !== "CREATED") throw new Error("unreachable");
 
-    const appointmentService = new AppointmentService(calendar, repos.appointmentsRepo, repos.bookingAttemptsRepo, repos.leadsRepo, new FakeLogger());
+    const appointmentService = new AppointmentService(calendar, repos.appointmentsRepo, repos.bookingAttemptsRepo, repos.leadsRepo, new FakeLogger(), repos.appointmentStatusHistoryRepo);
     const failingMessaging = new AlwaysFailingMessaging();
     const failingHandler = new WhatsAppBookingHandler(
       { leads: repos.leadsRepo, conversations: repos.conversationsRepo, appointments: repos.appointmentsRepo, offeredSlots: repos.offeredSlotsRepo, slotOffering, appointmentService, messaging: failingMessaging, messages: repos.messagesRepo, leadStatusHistory: repos.leadStatusHistoryRepo, logger: new FakeLogger() },

@@ -269,7 +269,7 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     void lead;
   });
 
-  it("11. the historical (past) appointment remains completely unchanged through the full rebooking flow", async () => {
+  it("11. the historical (past) appointment is correctly closed out (EXPIRED) through the full rebooking flow, its timing never altered", async () => {
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead } = await createLeadAtStatus(repos, "5214779970011", "BOOKED");
@@ -278,8 +278,10 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     await send(app, "5214779970011", "wamid.11a", "Agendar");
     await send(app, "5214779970011", "wamid.11b", "1");
 
+    // Fase 7H: see the identical assertion's doc comment in
+    // whatsapp-past-booked-rebook-fix.test.ts item 8 -- same fix, same reasoning.
     const reloaded = await repos.appointmentsRepo.findById(stale.id);
-    expect(reloaded?.status).toBe("BOOKED");
+    expect(reloaded?.status).toBe("EXPIRED");
     expect(reloaded?.startsAt.getTime()).toBe(PAST_STARTS_AT.getTime());
   });
 
