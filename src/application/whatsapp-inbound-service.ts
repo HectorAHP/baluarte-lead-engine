@@ -7,6 +7,9 @@ import { normalizePhoneToE164 } from "../domain/phone.js";
 import { isOptOutMessage } from "../domain/opt-out-detection.js";
 import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isCancellationRequest } from "../domain/cancellation-intent-detection.js";
+import { isContextualRescheduleRequest } from "../domain/contextual-reschedule-detection.js";
+import { parseDatePreference } from "../domain/date-preference-parser.js";
+import { config } from "../config.js";
 import { isUpcomingBooked } from "../domain/appointment-timing.js";
 import { looksLikeFiscalCalculatorOrigin } from "../domain/fiscal-calculator-origin-detection.js";
 import { isFirstWhatsAppInboundForConversation } from "../domain/whatsapp-first-inbound.js";
@@ -728,6 +731,26 @@ export async function handleInboundWhatsAppText(
         logBranch("booked-reschedule-intent", true);
         await deps.rescheduleHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
+      }
+      // Fase 7I.2 (CAUSE_CONTEXTUAL_RESCHEDULE_NOT_DETECTED fix): a BOOKED lead expressing a
+      // temporal preference DIFFERENT from their current appointment ("Mejor el domingo",
+      // "Prefiero el lunes") never matched isRescheduleRequest's purely lexical patterns above,
+      // so it fell all the way through to the generic BOOKED fallback just below -- the real
+      // incident this closes (lead eb95060d: "Mejor el domingo" got "Ya tienes una cita..."
+      // instead of a reschedule offer). Checked AFTER explicit reschedule-intent (never
+      // overriding it) and BEFORE the generic fallback (never after it -- see that branch's own
+      // updated doc comment). A DatePreference alone is deliberately NEVER sufficient here (see
+      // isContextualRescheduleRequest's own doc comment for why "El sábado"/"El 12 de septiembre"
+      // alone must stay `false`) -- one shared `now` for both the parse and the dispatch below,
+      // never two separate `new Date()` calls that could straddle a boundary differently.
+      if (deps.rescheduleHandler && lead.status === "BOOKED") {
+        const now = new Date();
+        const contextualPreference = parseDatePreference(input.text, now, config.ADVISOR_TIMEZONE);
+        if (isContextualRescheduleRequest(input.text, contextualPreference)) {
+          logBranch("booked-contextual-reschedule", true);
+          await deps.rescheduleHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now });
+          return;
+        }
       }
       // Pre-launch hardening: a BOOKED lead's free text that matched neither reschedule-intent
       // (checked above) nor cancellation-intent must still get a safe, deterministic reply --
