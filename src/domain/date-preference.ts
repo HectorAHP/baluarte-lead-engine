@@ -1,3 +1,5 @@
+import { localDateString } from "./timezone.js";
+
 /**
  * Fase 7I -- a deterministic, user-expressed temporal preference for booking/reschedule slot
  * offering. Produced only by date-preference-parser.ts's parseDatePreference (never hand-built
@@ -58,3 +60,42 @@ export const DAYPART_WINDOWS_MINUTES: Record<Daypart, { startMinute: number; end
   AFTERNOON: { startMinute: 12 * 60, endMinute: 18 * 60 },
   EVENING: { startMinute: 18 * 60, endMinute: 24 * 60 },
 };
+
+/**
+ * Fase 7I.1 -- CAUSE_ROUND_CAP_ESCALATION fix. A `targetDate` that is already in the past, or
+ * beyond the booking horizon, is a deterministic impossibility Calendar was never going to be
+ * able to resolve -- discovering that fact is NOT "a new offer of slots" and must be checked
+ * BEFORE any round-budget (MAX_OFFER_ROUNDS) accounting, so that explaining it can never itself
+ * exhaust the budget or trigger MAX_ROUNDS_REACHED's HUMAN_HANDOFF escalation for a lead who
+ * simply asked for an impossible date. A bare `weekday`/`daypart` preference (no `targetDate`) is
+ * always feasible here -- a recurring weekday always has a next occurrence within any reasonable
+ * horizon, so there is nothing deterministic to reject up front (see
+ * date-preference-parser.ts's own doc comment on why weekday is deliberately never resolved to a
+ * concrete date).
+ */
+export type DatePreferenceInfeasibilityReason = "OUT_OF_HORIZON" | "PAST_DATE";
+
+export interface DatePreferenceFeasibility {
+  feasible: boolean;
+  reason?: DatePreferenceInfeasibilityReason;
+}
+
+/**
+ * Pure, Calendar-free, deterministic. `now`/`maxDaysAhead`/`timezone` are real parameters (never
+ * hardcoded) so this can never silently drift from config.BOOKING_MAX_DAYS_AHEAD/
+ * config.ADVISOR_TIMEZONE. Called from SlotOfferingService.getOrCreateOffer/replaceOffer BEFORE
+ * the round-cap gate -- see that file's own doc comments for the full before/after ordering.
+ */
+export function evaluateDatePreferenceFeasibility(
+  datePreference: DatePreference | undefined,
+  now: Date,
+  maxDaysAhead: number,
+  timezone: string,
+): DatePreferenceFeasibility {
+  if (!datePreference?.targetDate) return { feasible: true };
+  const today = localDateString(now, timezone);
+  if (datePreference.targetDate < today) return { feasible: false, reason: "PAST_DATE" };
+  const horizonEnd = localDateString(new Date(now.getTime() + maxDaysAhead * 86_400_000), timezone);
+  if (datePreference.targetDate > horizonEnd) return { feasible: false, reason: "OUT_OF_HORIZON" };
+  return { feasible: true };
+}

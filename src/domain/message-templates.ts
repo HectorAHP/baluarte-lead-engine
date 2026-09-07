@@ -167,22 +167,40 @@ export const BOOKING_NO_AVAILABILITY_MESSAGE =
   "Por ahora no tengo horarios disponibles para ofrecerte. En cuanto haya opciones te aviso, o si prefieres, un asesor de Baluarte Capital puede contactarte directamente.";
 
 /**
- * Fase 7I -- SlotOfferingService returned REQUESTED_DATE_UNAVAILABLE: the lead asked for a
+ * Fase 7I / 7I.1 -- SlotOfferingService returned REQUESTED_DATE_UNAVAILABLE: the lead asked for a
  * specific day/date/time-of-day that produced zero matching slots (a closed day, e.g. Sunday; a
- * fully booked day; or a date beyond the booking horizon), but real availability DOES exist more
- * generally -- `fallbackSlots` is always offered right alongside the explanation, reusing
- * buildSlotOfferMessage's own list formatting (never a duplicated one). Deliberately never names
- * the specific day/date that was requested (keeps this generic across every possible preference,
- * never Sunday-specific wording) and never mentions any internal detail (horizon day count,
- * "Calendar", provider names) -- exactly the same "no internal details" discipline every other
- * message in this file already follows.
+ * fully booked day; a date already past; or a date beyond the booking horizon), but real
+ * availability DOES exist -- somewhere. Deliberately never names the specific day/date that was
+ * requested (keeps this generic across every possible preference, never Sunday-specific wording)
+ * and never mentions any internal detail (horizon day count, "Calendar", provider names, round
+ * budget) -- exactly the same "no internal details" discipline every other message in this file
+ * already follows.
+ *
+ * `fallbackSource` (Fase 7I.1) decides HOW this is phrased:
+ *  - "ACTIVE_ROUND" / "NEW_ROUND": `fallbackSlots` is real and selectable -- reuses
+ *    buildSlotOfferMessage's own list formatting (never a duplicated one), with copy that reads
+ *    naturally whether those options are the lead's own still-standing choice (ACTIVE_ROUND) or a
+ *    freshly-found alternative (NEW_ROUND).
+ *  - "NONE": there is nothing to list (round budget exhausted, no active round to fall back to)
+ *    -- explanation-only, inviting a new, in-range attempt. Never silence, never a fabricated list.
  */
-export function buildRequestedDateUnavailableMessage(reason: "OUT_OF_HORIZON" | "NO_SLOTS", fallbackSlots: OfferedSlot[], timezone: string): string {
-  const intro =
-    reason === "OUT_OF_HORIZON"
-      ? "Por ahora solo puedo revisar disponibilidad en los próximos días, así que esa fecha está fuera de ese rango. Aquí tienes las opciones más próximas:"
-      : "Para ese día no tengo horarios disponibles. Aquí tienes las opciones más próximas:";
-  return buildSlotOfferMessage(fallbackSlots, timezone, intro);
+export function buildRequestedDateUnavailableMessage(
+  reason: "OUT_OF_HORIZON" | "PAST_DATE" | "NO_SLOTS",
+  fallbackSlots: OfferedSlot[],
+  fallbackSource: "ACTIVE_ROUND" | "NEW_ROUND" | "NONE",
+  timezone: string,
+): string {
+  if (fallbackSource === "NONE") {
+    return "Por ahora solo puedo revisar disponibilidad en los próximos días. Si quieres, dime un día dentro de ese periodo y con gusto reviso.";
+  }
+  const explanation =
+    reason === "PAST_DATE"
+      ? "Esa fecha ya pasó."
+      : reason === "OUT_OF_HORIZON"
+        ? "Por ahora solo puedo revisar disponibilidad en los próximos días, así que esa fecha está fuera de ese rango."
+        : "Para ese día no tengo horarios disponibles.";
+  const invite = fallbackSource === "ACTIVE_ROUND" ? "Estas opciones siguen disponibles:" : "Aquí tienes las opciones más próximas:";
+  return buildSlotOfferMessage(fallbackSlots, timezone, `${explanation} ${invite}`);
 }
 
 /**

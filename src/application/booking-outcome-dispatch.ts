@@ -161,7 +161,7 @@ export async function dispatchSlotOfferOutcome(
     case "REQUESTED_DATE_UNAVAILABLE":
       await sendAndPersistReply(
         deps, lead.id, conversationId, whatsappUserId,
-        buildRequestedDateUnavailableMessage(outcome.reason, outcome.fallbackSlots, advisorTimezone),
+        buildRequestedDateUnavailableMessage(outcome.reason, outcome.fallbackSlots, outcome.fallbackSource, advisorTimezone),
       );
       return;
   }

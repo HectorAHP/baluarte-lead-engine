@@ -9,8 +9,7 @@ import { LeadNotOfferableError, SlotOfferClaimInProgressError } from "../domain/
 import { assertSingleActiveRound } from "../domain/active-offer-consistency.js";
 import { recordLeadStatusTransition } from "./lead-status-audit.js";
 import { config } from "../config.js";
-import type { DatePreference } from "../domain/date-preference.js";
-import { localDateString } from "../domain/timezone.js";
+import { evaluateDatePreferenceFeasibility, type DatePreference, type DatePreferenceInfeasibilityReason } from "../domain/date-preference.js";
 
 /**
  * Lead statuses from which offering booking slots is meaningful. Anything else (HUMAN_HANDOFF,
@@ -104,20 +103,40 @@ export type SlotOfferOutcome =
   | { type: "NO_AVAILABILITY" }
   | { type: "MAX_ROUNDS_REACHED" }
   /**
-   * Fase 7I -- a `datePreference` was given but produced zero matching candidate slots, while
-   * availability DOES exist more broadly (an unfiltered search of the same window returned at
-   * least one slot). `fallbackSlots` is a REAL, freshly-persisted round (same claim/round-cap
-   * machinery as CREATED -- see fetchAndPersistRound) the lead can actually select from; it is
-   * NEVER presented as if it matched the request. `reason` distinguishes an explicit date/weekday
-   * that fell outside BOOKING_MAX_DAYS_AHEAD (OUT_OF_HORIZON, detected before ever calling
-   * Calendar for it) from every other case -- a closed day (e.g. Sunday) or a day that's simply
-   * fully booked (NO_SLOTS) -- deliberately not distinguished further, so no day-specific
-   * (e.g. Sunday-only) message logic is ever needed. When even the unfiltered fallback search
-   * comes back empty, this outcome is never returned -- NO_AVAILABILITY is used instead (§13 of
-   * the Fase 7I spec's A/B distinction: no availability at all, vs. availability but not that
-   * day).
+   * A `datePreference` produced no matching slots to offer as-is, while availability DOES exist
+   * more broadly. `fallbackSlots` is NEVER presented as if it matched the request. `reason`:
+   *  - "OUT_OF_HORIZON" / "PAST_DATE" (Fase 7I.1): a `targetDate` deterministically impossible
+   *    without ever needing Calendar -- see evaluateDatePreferenceFeasibility, called from
+   *    getOrCreateOffer/replaceOffer BEFORE the round-cap gate. This outcome's `fallbackSlots` can
+   *    come from THREE different sources (see `fallbackSource`), never fabricated.
+   *  - "NO_SLOTS" (Fase 7I): the preference was genuinely checked against Calendar (a closed day
+   *    like Sunday, or a day that's simply fully booked) and matched nothing, but an unfiltered
+   *    search of the same window found something. Always `fallbackSource: "NEW_ROUND"` -- see
+   *    fetchAndPersistRound, the only place this specific reason is ever returned.
+   * When even the broadest possible fallback search comes back empty, this outcome is never
+   * returned -- NO_AVAILABILITY is used instead (the Fase 7I spec's A/B distinction: no
+   * availability at all, vs. availability but not on the requested day).
    */
-  | { type: "REQUESTED_DATE_UNAVAILABLE"; requestedPreference: DatePreference; reason: "OUT_OF_HORIZON" | "NO_SLOTS"; fallbackSlots: OfferedSlot[]; lead: Lead };
+  | {
+      type: "REQUESTED_DATE_UNAVAILABLE";
+      requestedPreference: DatePreference;
+      reason: "OUT_OF_HORIZON" | "PAST_DATE" | "NO_SLOTS";
+      fallbackSlots: OfferedSlot[];
+      /**
+       * Fase 7I.1 -- where `fallbackSlots` actually came from, so the reply can never lie about
+       * having searched Calendar when it didn't, and so callers know whether a round was really
+       * consumed:
+       *  - "ACTIVE_ROUND": the lead's own already-active, already-persisted round, reused
+       *    verbatim -- never invalidated, never re-persisted, never counted as a new round.
+       *  - "NEW_ROUND": a genuinely fresh round was queried from Calendar and persisted --
+       *    consumes real round budget, same as CREATED.
+       *  - "NONE": no slots to offer at all (round budget exhausted AND no active round exists)
+       *    -- `fallbackSlots` is `[]`; the reply is explanation-only, never silence, never a
+       *    fabricated list.
+       */
+      fallbackSource: "ACTIVE_ROUND" | "NEW_ROUND" | "NONE";
+      lead: Lead;
+    };
 
 export interface SlotOfferParams {
   lead: Lead;
@@ -291,6 +310,17 @@ export class SlotOfferingService {
     // caller's decision (replaceOffer), never this method's.
     if (activeSlots.length > 0) return this.resolveReused(lead, now, conversationId, activeSlots, mode);
 
+    // Fase 7I.1 (CAUSE_ROUND_CAP_ESCALATION fix): a deterministically-infeasible preference
+    // (out-of-horizon or a past date) is resolved BEFORE the round-cap gate below -- see
+    // resolveInfeasiblePreference's own doc comment for why explaining it must never itself
+    // consume round budget or trigger MAX_ROUNDS_REACHED's HUMAN_HANDOFF escalation. A bare
+    // weekday/daypart preference (no targetDate) is always feasible and falls straight through,
+    // byte-identical to before this fix.
+    const feasibility = evaluateDatePreferenceFeasibility(datePreference, now, config.BOOKING_MAX_DAYS_AHEAD, config.ADVISOR_TIMEZONE);
+    if (datePreference && !feasibility.feasible) {
+      return this.resolveInfeasiblePreference(lead, conversationId, now, mode, datePreference, feasibility.reason!, activeSlots);
+    }
+
     if (!skipRoundCap) {
       const since = await this.episodeScopedSince(lead.id, mode);
       const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode), since);
@@ -335,6 +365,18 @@ export class SlotOfferingService {
 
     const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now, rescheduleContextIdOf(mode));
     assertSingleActiveRound(conversationId, activeSlots); // refuse to replace an already-inconsistent offer
+
+    // Fase 7I.1 (CAUSE_ROUND_CAP_ESCALATION fix -- the real incident this closes: lead eb95060d
+    // had an active Saturday round, 3 rounds already spent in the episode, and "15 de diciembre"
+    // (out of horizon) hit the round-cap check below BEFORE ever being recognized as
+    // deterministically impossible, escalating to HUMAN_HANDOFF). Checked BEFORE the round-cap
+    // gate AND before ever invalidating/replacing `activeSlots` -- an out-of-horizon/past-date
+    // preference is never treated as "a new offer", so it can never cost a round, and the
+    // lead's genuinely active round (if any) is returned completely untouched.
+    const feasibility = evaluateDatePreferenceFeasibility(datePreference, now, config.BOOKING_MAX_DAYS_AHEAD, config.ADVISOR_TIMEZONE);
+    if (datePreference && !feasibility.feasible) {
+      return this.resolveInfeasiblePreference(lead, conversationId, now, mode, datePreference, feasibility.reason!, activeSlots);
+    }
 
     const since = await this.episodeScopedSince(lead.id, mode);
     const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode), since);
@@ -578,31 +620,25 @@ export class SlotOfferingService {
    * method persists always matches its claim's intended_round_id exactly.
    */
   /**
-   * Fase 7I -- with `datePreference` present, this now has THREE possible outcomes instead of
-   * two:
-   *  1. An explicit `targetDate` beyond BOOKING_MAX_DAYS_AHEAD -- OUT_OF_HORIZON, detected BEFORE
-   *     ever calling Calendar for the (structurally unreachable) preferred window. Never silently
-   *     substitutes a different date and pretends it's the one requested (Fase 7I spec item 5).
-   *  2. The preference-filtered search finds real slots -- CREATED, exactly as before, just with
-   *     `datePreference` threaded into the Calendar call so filtering happens BEFORE the
-   *     `slice(0, MAX_OFFERED_SLOTS)` truncation (the actual fix for the real "sábado" incident --
-   *     see domain/availability.ts's computeAvailableSlots).
-   *  3. The preference-filtered search finds nothing, but an UNFILTERED search of the same window
-   *     does -- REQUESTED_DATE_UNAVAILABLE, with that unfiltered result persisted as a real
-   *     fallback round (never a lie -- the caller's message-building must always attribute these
-   *     slots to "here's what IS available", never to the requested day).
+   * Fase 7I.1: a deterministically-infeasible `targetDate` (out-of-horizon or already past) NEVER
+   * reaches this method anymore -- getOrCreateOffer/replaceOffer both intercept it via
+   * evaluateDatePreferenceFeasibility + resolveInfeasiblePreference BEFORE ever calling
+   * claimAndCreateRound. So `datePreference`, if present here, is always feasibility-checked
+   * already, and this has exactly two remaining possible outcomes:
+   *  1. The preference-filtered search finds real slots -- CREATED, with `datePreference` threaded
+   *     into the Calendar call so filtering happens BEFORE the `slice(0, MAX_OFFERED_SLOTS)`
+   *     truncation (the Fase 7I fix for the real "sábado" incident -- see
+   *     domain/availability.ts's computeAvailableSlots).
+   *  2. The preference-filtered search finds nothing (a closed day like Sunday, or simply fully
+   *     booked), but an UNFILTERED search of the same window does -- REQUESTED_DATE_UNAVAILABLE
+   *     (reason "NO_SLOTS", fallbackSource "NEW_ROUND"), with that unfiltered result persisted as
+   *     a real fallback round (never a lie -- the caller's message-building must always attribute
+   *     these slots to "here's what IS available", never to the requested day).
    * With `datePreference` omitted (undefined), this is byte-identical to before Fase 7I: exactly
    * one Calendar call, exactly two possible outcomes (CREATED / NO_AVAILABILITY).
    */
   private async fetchAndPersistRound(lead: Lead, conversationId: string, now: Date, roundId: string, mode?: SlotOfferParams["mode"], datePreference?: DatePreference): Promise<SlotOfferOutcome> {
     const to = new Date(now.getTime() + config.BOOKING_MAX_DAYS_AHEAD * 86_400_000);
-
-    if (datePreference?.targetDate !== undefined && datePreference.targetDate > localDateString(to, config.ADVISOR_TIMEZONE)) {
-      const fallback = await this.calendar.getAvailableSlots(now, to, config.MEETING_DURATION_MINUTES);
-      if (fallback.length === 0) return { type: "NO_AVAILABILITY" };
-      const { persisted, updatedLead } = await this.persistChosenSlots(lead, conversationId, roundId, now, mode, fallback);
-      return { type: "REQUESTED_DATE_UNAVAILABLE", reason: "OUT_OF_HORIZON", requestedPreference: datePreference, fallbackSlots: persisted, lead: updatedLead };
-    }
 
     const available = datePreference
       ? await this.calendar.getAvailableSlots(now, to, config.MEETING_DURATION_MINUTES, datePreference)
@@ -620,7 +656,54 @@ export class SlotOfferingService {
     const fallback = await this.calendar.getAvailableSlots(now, to, config.MEETING_DURATION_MINUTES);
     if (fallback.length === 0) return { type: "NO_AVAILABILITY" };
     const { persisted, updatedLead } = await this.persistChosenSlots(lead, conversationId, roundId, now, mode, fallback);
-    return { type: "REQUESTED_DATE_UNAVAILABLE", reason: "NO_SLOTS", requestedPreference: datePreference, fallbackSlots: persisted, lead: updatedLead };
+    return { type: "REQUESTED_DATE_UNAVAILABLE", reason: "NO_SLOTS", requestedPreference: datePreference, fallbackSlots: persisted, fallbackSource: "NEW_ROUND", lead: updatedLead };
+  }
+
+  /**
+   * Fase 7I.1 -- CAUSE_ROUND_CAP_ESCALATION fix. Resolves a deterministically-infeasible
+   * `datePreference` (out-of-horizon or already past) WITHOUT EVER touching round budget or
+   * MAX_ROUNDS_REACHED, and without ever invalidating an existing active round just because the
+   * NEW preference turned out to be impossible:
+   *  - An active round exists (`activeSlots.length > 0`, only ever true when called from
+   *    replaceOffer): reused verbatim as the fallback -- NOT invalidated, NOT re-persisted, NOT
+   *    counted as a new round. `fallbackSource: "ACTIVE_ROUND"`.
+   *  - No active round, but the episode still has round budget left: a genuine, UNFILTERED
+   *    fallback round is queried and persisted (this DOES consume one real round -- it is a
+   *    genuinely new Calendar search and a genuinely new persisted round, same cost as CREATED).
+   *    `fallbackSource: "NEW_ROUND"`.
+   *  - No active round AND the budget is already exhausted: explanation only, `fallbackSlots: []`,
+   *    `fallbackSource: "NONE"` -- NEVER a hidden 4th round via skipRoundCap, and NEVER
+   *    MAX_ROUNDS_REACHED (which would escalate to HUMAN_HANDOFF for a lead who simply asked for
+   *    an impossible date, not a genuine booking inconsistency).
+   */
+  private async resolveInfeasiblePreference(
+    lead: Lead,
+    conversationId: string,
+    now: Date,
+    mode: SlotOfferParams["mode"] | undefined,
+    datePreference: DatePreference,
+    reason: DatePreferenceInfeasibilityReason,
+    activeSlots: OfferedSlot[],
+  ): Promise<SlotOfferOutcome> {
+    if (activeSlots.length > 0) {
+      const updatedLead = await this.ensureOfferableLeadStatus(lead, now, mode);
+      return { type: "REQUESTED_DATE_UNAVAILABLE", reason, requestedPreference: datePreference, fallbackSlots: activeSlots, fallbackSource: "ACTIVE_ROUND", lead: updatedLead };
+    }
+
+    const since = await this.episodeScopedSince(lead.id, mode);
+    const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode), since);
+    if (roundIds.length < MAX_OFFER_ROUNDS) {
+      // Budget available -- a genuine, unfiltered fallback round (never the impossible date
+      // itself: `datePreference` is deliberately omitted here).
+      const outcome = await this.claimAndCreateRound(lead, conversationId, now, mode, undefined);
+      if (outcome.type !== "CREATED") return outcome; // NO_AVAILABILITY -- nothing to fall back to at all
+      return { type: "REQUESTED_DATE_UNAVAILABLE", reason, requestedPreference: datePreference, fallbackSlots: outcome.slots, fallbackSource: "NEW_ROUND", lead: outcome.lead };
+    }
+
+    // Budget exhausted AND no active round to fall back to -- explain, stay booking-capable,
+    // never escalate, never fabricate a round.
+    const updatedLead = await this.ensureOfferableLeadStatus(lead, now, mode);
+    return { type: "REQUESTED_DATE_UNAVAILABLE", reason, requestedPreference: datePreference, fallbackSlots: [], fallbackSource: "NONE", lead: updatedLead };
   }
 
   /** Shared persistence step for every fetchAndPersistRound exit that actually has slots to

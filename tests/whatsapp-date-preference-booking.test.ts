@@ -267,3 +267,64 @@ describe("Fase 7I -- WhatsApp reschedule: item 7 (old appointment untouched unti
     expect(rereadAgain?.status).toBe("BOOKED");
   });
 });
+
+describe("Fase 7I.1 -- CAUSE_ROUND_CAP_ESCALATION fix: exact real-incident reproduction (lead eb95060d)", () => {
+  it("item 14: 3 rounds consumed by real preference changes + active Saturday round + out-of-horizon date -> stays BOOKING_PENDING, 0 new rounds, Saturday fallback, never HUMAN_HANDOFF", async () => {
+    const h = makeBookingHandler();
+    const { lead, conversation } = await makeBookingPendingLead(h);
+
+    // The exact real conversation, in order (Fase 7I.1-DIAG item 26/7):
+    await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Quiero agendar en sábado", now: NOW }); // round 1
+    let currentLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Mejor domingo", now: new Date(NOW.getTime() + 31_000) }); // round 2 (fallback)
+    currentLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Sábado por la mañana", now: new Date(NOW.getTime() + 50_000) }); // round 3 -- ACTIVE, never expires in this test
+    currentLead = (await h.leads.findById(lead.id))!;
+
+    expect(await h.offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(3);
+    const activeBefore = await h.offeredSlots.listActiveByConversationId(conversation.id, new Date(NOW.getTime() + 70_000));
+    expect(activeBefore.length).toBeGreaterThan(0);
+    for (const s of activeBefore) expect(localDow(s.slotStart)).toBe(6); // Saturday
+
+    // The real trigger.
+    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Quiero agendar el 15 de diciembre", now: new Date(NOW.getTime() + 70_000) });
+
+    const finalLead = await h.leads.findById(lead.id);
+    expect(finalLead?.status).toBe("BOOKING_PENDING"); // NEVER HUMAN_HANDOFF
+    expect(await h.offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(3); // still 3 -- no round 4
+
+    const activeAfter = await h.offeredSlots.listActiveByConversationId(conversation.id, new Date(NOW.getTime() + 70_000));
+    expect(activeAfter.map((s) => s.id).sort()).toEqual(activeBefore.map((s) => s.id).sort()); // the exact same Saturday round, untouched
+    for (const s of activeAfter) expect(localDow(s.slotStart)).toBe(6);
+
+    const lastMessage = h.messaging.sentTexts[h.messaging.sentTexts.length - 1].body;
+    expect(lastMessage).toContain("fuera de ese rango"); // horizon explanation
+    expect(lastMessage).toContain("Sábado"); // the Saturday fallback options, shown alongside the explanation
+    expect(lastMessage).not.toContain("orientación adecuada"); // never the HUMAN_HANDOFF copy
+
+    const history = await h.leadStatusHistory.listByLeadId(lead.id);
+    expect(history.some((e) => e.toStatus === "HUMAN_HANDOFF")).toBe(false);
+  });
+
+  it("item 2/12: after the out-of-horizon message, the lead can still select option \"1\" from the untouched active Saturday round", async () => {
+    const h = makeBookingHandler();
+    const { lead, conversation } = await makeBookingPendingLead(h);
+
+    await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Quiero agendar en sábado", now: NOW });
+    let currentLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Mejor domingo", now: new Date(NOW.getTime() + 31_000) });
+    currentLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Sábado por la mañana", now: new Date(NOW.getTime() + 50_000) });
+    currentLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Quiero agendar el 15 de diciembre", now: new Date(NOW.getTime() + 70_000) });
+    currentLead = (await h.leads.findById(lead.id))!;
+    expect(currentLead.status).toBe("BOOKING_PENDING");
+
+    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now: new Date(NOW.getTime() + 90_000) });
+
+    const booked = await h.leads.findById(lead.id);
+    expect(booked?.status).toBe("BOOKED");
+    const appointment = (await h.appointments.listAllByLeadId(lead.id))[0];
+    expect(localDow(appointment.startsAt)).toBe(6); // booked the Saturday slot, exactly as offered
+  });
+});
