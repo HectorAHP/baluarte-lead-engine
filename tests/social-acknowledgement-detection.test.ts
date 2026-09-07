@@ -1,11 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { isSocialAcknowledgement, isBareGreeting, isBookingIndecisionReply } from "../src/domain/social-acknowledgement-detection.js";
+import { isSocialAcknowledgement, isBareGreeting, isBookingIndecisionReply, isVagueInformationRequest } from "../src/domain/social-acknowledgement-detection.js";
 
 describe("Fase 7J -- isSocialAcknowledgement: positives", () => {
   const positives = [
     "gracias", "Gracias", "GRACIAS", "  gracias  ", "gracias!", "gracias.",
     "muchas gracias", "ok", "Ok", "okay", "va", "perfecto", "listo",
-    "entendido", "excelente", "de acuerdo", "sale", "👍",
+    "entendido", "excelente", "de acuerdo", "sale", "👍", "nos vemos", "Nos vemos",
   ];
   it.each(positives)("%s -> true", (text) => {
     expect(isSocialAcknowledgement(text)).toBe(true);
@@ -69,5 +69,45 @@ describe("Fase 7J -- isBookingIndecisionReply: negatives (never a substring/fuzz
   ];
   it.each(negatives)("%s -> false", (text) => {
     expect(isBookingIndecisionReply(text)).toBe(false);
+  });
+});
+
+describe("Fase 7J.1 -- isVagueInformationRequest: positives", () => {
+  const positives = [
+    "Hola, quiero información",
+    "Hola quiero información",
+    "hola quiero informacion",
+    "Hola tengo una duda",
+    "hola tengo una duda",
+    "quiero información",
+    "quiero informacion",
+    "tengo una duda",
+    "una duda",
+    "tengo una pregunta",
+    "una pregunta",
+    "quiero preguntar algo",
+    "quiero preguntar",
+    "Hola",
+    "hola.",
+  ];
+  it.each(positives)("%s -> true", (text) => {
+    expect(isVagueInformationRequest(text)).toBe(true);
+  });
+});
+
+describe("Fase 7J.1 -- isVagueInformationRequest: negatives (a real, specific question must still be free to escalate)", () => {
+  const negatives = [
+    "Hola, tengo una duda sobre una póliza anterior",
+    "tengo una duda sobre una poliza anterior",
+    "¿también me pueden ayudar con el seguro de mi empresa?",
+    "¿qué pasa si tengo dos patrones?",
+    "quiero revisar también gastos médicos",
+    "asdkjfh qweoiu",
+    "¿Mi cita es el sábado?",
+    "cancelar",
+    "1",
+  ];
+  it.each(negatives)("%s -> false", (text) => {
+    expect(isVagueInformationRequest(text)).toBe(false);
   });
 });

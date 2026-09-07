@@ -9,6 +9,8 @@ import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isCancellationRequest } from "../domain/cancellation-intent-detection.js";
 import { isContextualRescheduleRequest } from "../domain/contextual-reschedule-detection.js";
 import { parseDatePreference } from "../domain/date-preference-parser.js";
+import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
+import { isSocialAcknowledgement, isBareGreeting, isVagueInformationRequest } from "../domain/social-acknowledgement-detection.js";
 import { config } from "../config.js";
 import { isUpcomingBooked } from "../domain/appointment-timing.js";
 import { looksLikeFiscalCalculatorOrigin } from "../domain/fiscal-calculator-origin-detection.js";
@@ -23,7 +25,7 @@ import {
   buildWelcomeMessage, buildFiscalContextWelcomeMessage, HEALTH_HANDOFF_MESSAGE, OPT_OUT_CONFIRMATION_MESSAGE,
   BOOKED_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, buildQualifiedLeadAskQuestionMessage,
   buildQualifiedLeadTopicAnswer, buildQualifiedLeadOptionsMessage, QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE,
-  QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE, FISCAL_WELCOME_OTHER_TOPIC_MESSAGE,
+  QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE, FISCAL_WELCOME_OTHER_TOPIC_MESSAGE, UNKNOWN_INTENT_HANDOFF_MESSAGE,
 } from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
 import { getFiscalLeadContextForLead, type FiscalLeadContext } from "./fiscal-lead-context.js";
@@ -211,6 +213,27 @@ async function applyPassiveWhatsAppPhoneVerification(
     "whatsapp inbound: inbound phone differs from the lead's phoneE164 on file -- flagging identity conflict, never overwriting",
   );
   return deps.leads.update(lead.id, { identityConflict: true });
+}
+
+/**
+ * Fase 7J.1 -- the escalation mechanism for "the lead's message didn't match any supported flow"
+ * within a status that already has an active flow (currently: BOOKED's generic-fallback branch
+ * only -- see docs/security/FASE7J-UNKNOWN-INTENT-HANDOFF.md Sec 3 for why the router's OWN final
+ * fallback deliberately does NOT use this, and stays untouched). Mirrors HEALTH_HANDOFF_MESSAGE's
+ * sensitive-content branch's mechanics (lead -> HUMAN_HANDOFF via LeadService, conversation ->
+ * HUMAN_HANDOFF, one outbound message) -- never a second, parallel handoff system. Callers must
+ * already be inside a branch gated on a status with a valid ->HUMAN_HANDOFF edge (BOOKED does,
+ * unconditionally, per state-machine.ts) so this never throws in practice.
+ */
+async function escalateUnknownIntent(
+  deps: Pick<WhatsAppInboundDeps, "leadService" | "conversations" | "messaging" | "messages" | "logger">,
+  leadId: string,
+  conversationId: string,
+  whatsappUserId: string,
+): Promise<void> {
+  await deps.leadService.requestHumanHandoff(leadId, "UNKNOWN_INTENT_HANDOFF");
+  await deps.conversations.update(conversationId, { status: "HUMAN_HANDOFF" });
+  await sendAndPersistReply(deps, leadId, conversationId, whatsappUserId, UNKNOWN_INTENT_HANDOFF_MESSAGE);
 }
 
 export type WhatsAppInboundOutcome = "DUPLICATE" | "PROCESSED";
@@ -752,22 +775,51 @@ export async function handleInboundWhatsAppText(
           return;
         }
       }
-      // Pre-launch hardening: a BOOKED lead's free text that matched neither reschedule-intent
-      // (checked above) nor cancellation-intent must still get a safe, deterministic reply --
-      // never silence -- while NEVER changing status/score/meetingAt/appointment, never calling
-      // Calendar, never creating offered_slots, never recording a qualification answer (this
-      // branch does exactly one thing: send a message). This is the sole owner of "BOOKED +
-      // generic inbound" -- previously a genuine gap: WhatsAppCancellationHandler only ever acts
-      // on an explicit cancellation-intent match and silently no-ops otherwise (by design, for
-      // ITS OWN concern), and nothing downstream ever got a chance to reply once its routing
-      // condition matched and unconditionally returned. Gated on BOTH rescheduleHandler AND
-      // cancellationHandler being present -- the copy references both actions ("reagendar" /
-      // "cancelar"), so it is only ever sent when both are genuinely available; with either (or
-      // both) flags off, this branch is never taken and behavior is byte-for-byte the prior
-      // silent fallback, unchanged -- same "flag off -> unchanged behavior" guarantee as every
-      // other flag in this project. Placed BEFORE the cancellationHandler dispatch below so
-      // genuinely non-actionable text never even reaches that handler's internal no-op.
+      // Pre-launch hardening (extended Fase 7J.1): a BOOKED lead's free text that matched neither
+      // reschedule-intent (checked above) nor cancellation-intent must still get a safe,
+      // deterministic reply -- never silence. Gated on BOTH rescheduleHandler AND
+      // cancellationHandler being present -- the generic copy references both actions
+      // ("reagendar"/"cancelar") -- with either (or both) flags off, this branch is never taken
+      // and behavior is byte-for-byte the prior fallback, unchanged.
+      //
+      // Fase 7J.1 (docs/security/FASE7J-UNKNOWN-INTENT-HANDOFF.md Sec 10 covers the sibling
+      // BOOKING_PENDING case this mirrors): before this phase, EVERY such message got the SAME
+      // generic "ya tienes una cita" reply, including genuinely unrelated content ("¿también me
+      // pueden ayudar con el seguro de mi empresa?", "tengo una duda sobre una póliza anterior") --
+      // this branch swallowed real questions Lía cannot answer instead of ever surfacing them to
+      // Héctor. Split, built ONLY from signals with an existing or equally narrow, deterministic,
+      // exact-match/pattern definition (never a new topic/keyword heuristic, never an LLM):
+      //  - a parsed DatePreference (e.g. "El 12 de septiembre", "¿Mi cita es el sábado?" -- a bare
+      //    date mention that Fase 7I.2 deliberately does NOT treat as reschedule intent) --
+      //    unchanged, stays on the generic reply.
+      //  - a number-shaped reply (a stray slot-selection-shaped input) -- unchanged.
+      //  - text isNewBookingRequest already recognizes (e.g. "Quiero agendar", "Agendar") -- a
+      //    BOOKED lead with an upcoming appointment asking to book again is still squarely about
+      //    booking, never a new topic (see whatsapp-past-booked-recovery-e2e.test.ts's "no double
+      //    future booking" test) -- unchanged, reused verbatim from Fase 6E.2.
+      //  - a trivial acknowledgement ("gracias", "nos vemos") or a bare greeting ("hola") --
+      //    unchanged.
+      //  - a vague, contentless request for help ("Hola, quiero información", "Hola tengo una
+      //    duda") -- names no topic to classify, so it is NOT treated as unknown; a real, SPECIFIC
+      //    question is free to escalate (isVagueInformationRequest's own doc comment has the exact
+      //    boundary) -- unchanged from before this phase for this narrow case.
+      //  - anything else (a real, specific question Lía has no flow for, or genuinely unparseable
+      //    content) -- escalates instead of hiding behind the generic reply. Reuses the exact
+      //    HUMAN_HANDOFF mechanism every other escalation in this file already uses, never a
+      //    second, parallel one.
       if (deps.rescheduleHandler && deps.cancellationHandler && lead.status === "BOOKED" && !isCancellationRequest(input.text)) {
+        const staysGeneric =
+          isSocialAcknowledgement(input.text)
+          || isBareGreeting(input.text)
+          || isVagueInformationRequest(input.text)
+          || isNewBookingRequest(input.text)
+          || !!parseDatePreference(input.text, new Date(), config.ADVISOR_TIMEZONE)
+          || /^(?:opcion |la |el )?[1-9]\d*$/i.test(input.text.trim());
+        if (!staysGeneric) {
+          logBranch("booked-unknown-intent-handoff", true);
+          await escalateUnknownIntent(deps, leadId, conversationId, input.whatsappUserId);
+          return;
+        }
         logBranch("booked-generic-fallback", true);
         await sendAndPersistReply(deps, leadId, conversationId, input.whatsappUserId, BOOKED_GENERIC_INBOUND_MESSAGE);
         return;

@@ -25,6 +25,9 @@ const ACKNOWLEDGEMENT_PHRASES: ReadonlySet<string> = new Set([
   "de acuerdo",
   "sale",
   "👍",
+  // Fase 7J.1 -- a closing remark, same "no unresolved content" reasoning as the rest of this
+  // list (a farewell, not a greeting -- kept here rather than in GREETING_PHRASES below).
+  "nos vemos",
 ]);
 
 /** lowercase, trim, collapse internal whitespace, strip accents, strip trailing punctuation --
@@ -89,4 +92,33 @@ const INDECISION_PHRASES: ReadonlySet<string> = new Set([
 
 export function isBookingIndecisionReply(text: string): boolean {
   return INDECISION_PHRASES.has(normalize(text));
+}
+
+/**
+ * A vague, contentless request for help/information -- optionally opened with a bare greeting
+ * ("Hola, quiero información", "Hola tengo una duda") -- names no topic of its own to classify,
+ * so it is grouped with the carve-outs above: never grounds to escalate to a human. Distinct from
+ * a real question that NAMES something specific ("tengo una duda sobre una póliza anterior"
+ * mentions a prior policy -- that is NOT vague here, and must still be free to escalate as
+ * UNKNOWN_INTENT). Exact-match on the text remaining after stripping an optional leading greeting
+ * -- never a substring match, so "Hola, tengo una duda sobre el seguro de mi empresa" is NOT vague
+ * here and is left to escalate.
+ */
+const VAGUE_INFORMATION_PHRASES: ReadonlySet<string> = new Set([
+  "",
+  "quiero informacion",
+  "tengo una duda",
+  "una duda",
+  "tengo una pregunta",
+  "una pregunta",
+  "quiero preguntar algo",
+  "quiero preguntar",
+]);
+
+const GREETING_PREFIX_PATTERN = /^(?:hola|hi|hello|hey|buenas|buenos dias|buenas tardes|buenas noches)[,.]?\s*/;
+
+export function isVagueInformationRequest(text: string): boolean {
+  const normalized = normalize(text);
+  const remainder = normalized.replace(GREETING_PREFIX_PATTERN, "");
+  return VAGUE_INFORMATION_PHRASES.has(remainder);
 }
