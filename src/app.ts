@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { config, hasGoogleCalendarCredentials, hasWhatsAppCredentials, hasHubSpotCredentials, corsAllowedOrigins as defaultCorsAllowedOrigins, extraDisposableEmailDomains } from "./config.js";
 import { isHoneypotTriggered } from "./domain/honeypot.js";
+import { trustedProxyFn } from "./domain/trusted-proxy.js";
 import { DnsEmailDomainChecker } from "./infrastructure/dns-email-domain-checker.js";
 import {
   InMemoryLeadRepository, InMemoryAppointmentRepository, InMemoryBookingAttemptRepository,
@@ -234,6 +235,19 @@ function routeRateLimit(max: number, timeWindowMs: number) {
     rateLimit: {
       max,
       timeWindow: timeWindowMs,
+      // Fase 7G item 15 -- safe observability for a rate-limit hit, deliberately separate from
+      // errorResponseBuilder below (which stays byte-identical to before -- untouched, so the
+      // existing 429 response shape every rate-limit test already relies on is never at risk).
+      // Never the resolved IP itself (that's `key`, deliberately never read here -- see this
+      // function's own "NO persistir IP completa" constraint), never any header/body/token --
+      // only route/method/statusCode, the same operational-metadata-only discipline every other
+      // structured log line in this codebase already follows.
+      onExceeded: (req: FastifyRequest) => {
+        req.log.warn(
+          { event: "rate_limit_hit", route: req.routeOptions?.url ?? req.url, method: req.method, statusCode: 429 },
+          "rate limit exceeded",
+        );
+      },
       errorResponseBuilder: (_req: unknown, context: { statusCode: number }) => {
         const err = new Error("rate_limited") as Error & { statusCode: number };
         err.statusCode = context.statusCode;
@@ -244,7 +258,13 @@ function routeRateLimit(max: number, timeWindowMs: number) {
 }
 
 export async function buildApp(overrides: AppDependencies = {}): Promise<FastifyInstance> {
-  const app = Fastify({ logger: true });
+  // Fase 7G -- trustProxy hardening. See src/domain/trusted-proxy.ts's own doc comment for the
+  // full audit trail (Render's real Cloudflare-then-load-balancer topology, and the confirmed
+  // fact that a numeric trustProxy value is a silent no-op in this exact Fastify version). Every
+  // req.ip consumer in this codebase (only @fastify/rate-limit's keyGenerator below) now resolves
+  // to the genuine client IP Cloudflare observed, never Render's own constant load-balancer
+  // address and never a value a client can freely fabricate.
+  const app = Fastify({ logger: true, trustProxy: trustedProxyFn });
 
   // Production hardening: allowlist-based CORS, replacing the previous origin:true (reflects any
   // origin -- unsafe for a surface that now carries PII/financial data). CORS only governs
