@@ -795,10 +795,17 @@ export async function handleInboundWhatsAppText(
         await deps.reactivationHandler.handleTurn({ lead, conversationId, whatsappUserId: input.whatsappUserId, inboundText: input.text, now: new Date() });
         return;
       }
-      // No qualifier/booking/cancellation/reschedule/reactivation handler configured (flags off),
-      // or an existing lead outside an active round (e.g. already QUALIFIED_A/B/NURTURE_C, or a
-      // CONTACTED lead that still carries a product from a prior round): no automated reply, same
-      // as Phase 2.
+      // Fase 7J audit finding (see docs/security or the phase report): every reachable path to
+      // this point in the CURRENT router is structurally a "handler/flag absent" case, never a
+      // "handler present but declined to classify" case -- every handler dispatch above is
+      // unconditional (calls handleTurn/beginQualification and returns immediately), so a lead
+      // only ever reaches here when the relevant flag is off, or (CONTACTED) when there is
+      // deliberately no active flow yet (e.g. productInterest already set). Numerous existing
+      // "flag off -> byte-for-byte unchanged, silent" tests encode this as a hard contract across
+      // CONTACTED, CANCELLED, BOOKING_PENDING, RESCHEDULE_REQUESTED, BOOKED and CANCEL_PENDING.
+      // Escalating here unconditionally (attempted during this phase) broke all of them. Left
+      // silent, unchanged, pending a product decision on how to reconcile with those contracts --
+      // see the Fase 7J report.
       logBranch("no-match", false);
     },
     deps.logger,

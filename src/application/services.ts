@@ -92,8 +92,13 @@ export class LeadService{
     return lead;
   }
 
-  async requestHumanHandoff(id:string):Promise<Lead>{
-    return this.transitionTo(id,"HUMAN_HANDOFF","HUMAN_HANDOFF_REQUESTED");
+  /** `eventType` defaults to the original, generic reason -- every existing call site (opt-out
+   * flow's own DO_NOT_CONTACT path is separate; this is used by the sensitive-health-content
+   * branch in whatsapp-inbound-service.ts) keeps getting byte-identical behavior. Fase 7J passes
+   * "UNKNOWN_INTENT_HANDOFF" explicitly so that cause is never conflated with this one in
+   * lead_status_history. */
+  async requestHumanHandoff(id:string,eventType:string="HUMAN_HANDOFF_REQUESTED"):Promise<Lead>{
+    return this.transitionTo(id,"HUMAN_HANDOFF",eventType);
   }
 
   async requestDoNotContact(id:string):Promise<Lead>{

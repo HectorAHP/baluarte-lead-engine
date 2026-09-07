@@ -46,6 +46,15 @@ export const OPT_OUT_CONFIRMATION_MESSAGE = "Entendido. No te enviaremos más me
 export const QUALIFIER_HUMAN_HANDOFF_MESSAGE =
   "Quiero asegurarme de que recibas la orientación adecuada. Voy a dejar esto preparado para que un asesor de Baluarte Capital pueda continuar contigo.";
 
+// Fase 7J -- sent when a lead's message doesn't match any supported flow/intent (a real question
+// or content outside the current conversational tree), never for a trivial social
+// acknowledgement (see social-acknowledgement-detection.ts) and never for a message an existing
+// flow already claimed. Deliberately avoids "no te entendí"/"error"/"el bot no sabe"/any
+// technical wording, and never promises a response time -- same tone/constraints as
+// QUALIFIER_HUMAN_HANDOFF_MESSAGE and HEALTH_HANDOFF_MESSAGE above.
+export const UNKNOWN_INTENT_HANDOFF_MESSAGE =
+  "Quiero asegurarme de darte una respuesta correcta. Voy a pasar tu conversación con un asesor de Baluarte Capital para que pueda ayudarte personalmente.";
+
 // Phase 3B -- sent when qualification completes. Deliberately does not offer time slots (that's
 // Phase 3C); A/B and C get different copy since only A/B are headed toward a meeting.
 export const QUALIFICATION_COMPLETE_AB_MESSAGE =

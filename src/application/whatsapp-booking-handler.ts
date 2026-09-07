@@ -185,6 +185,12 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
       // names the abandon escape hatch, instead of only ever repeating the same instruction.
       // Reuses the SAME active offered_slots already loaded above -- never a new round, never a
       // new Calendar call.
+      //
+      // Fase 7J audit note: evaluated escalating genuinely unrelated content (vs. this generic
+      // reminder) here instead -- reverted after the full suite showed it conflicts with this
+      // exact hardening contract (e.g. gibberish input is explicitly expected to land here, not
+      // escalate -- see whatsapp-booking-pending-conversational-trap.test.ts). See the Fase 7J
+      // report for the conflict and the options for reconciling it.
       await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildBookingPendingFallbackMessage(activeSlots, this.advisorTimezone));
       return;
     }
