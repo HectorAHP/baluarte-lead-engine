@@ -4,7 +4,7 @@ import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { config, hasGoogleCalendarCredentials, hasWhatsAppCredentials, hasHubSpotCredentials, corsAllowedOrigins as defaultCorsAllowedOrigins, extraDisposableEmailDomains } from "./config.js";
+import { config, hasGoogleCalendarCredentials, hasWhatsAppCredentials, hasHubSpotCredentials, corsAllowedOrigins as defaultCorsAllowedOrigins, extraDisposableEmailDomains, humanHandoffAdvisorPhoneE164 } from "./config.js";
 import { isHoneypotTriggered } from "./domain/honeypot.js";
 import { trustedProxyFn } from "./domain/trusted-proxy.js";
 import { DnsEmailDomainChecker } from "./infrastructure/dns-email-domain-checker.js";
@@ -51,6 +51,8 @@ import { AppointmentReminderService } from "./application/appointment-reminder-s
 import { AppointmentCompletionService } from "./application/appointment-completion-service.js";
 import { handleInboundWhatsAppText } from "./application/whatsapp-inbound-service.js";
 import { HumanHandoffRecoveryService } from "./application/human-handoff-recovery-service.js";
+import { HumanHandoffAlertService } from "./application/human-handoff-alert-service.js";
+import { normalizePhoneToE164 } from "./domain/phone.js";
 import { WhatsAppQualificationHandler } from "./application/whatsapp-qualification-handler.js";
 import { WhatsAppBookingHandler } from "./application/whatsapp-booking-handler.js";
 import { WhatsAppCancellationHandler } from "./application/whatsapp-cancellation-handler.js";
@@ -221,6 +223,14 @@ export interface AppDependencies {
   leadsRateLimitMax?: number;
   /** Override for config.LEADS_RATE_LIMIT_WINDOW_MS -- same rationale as leadsRateLimitMax. */
   leadsRateLimitWindowMs?: number;
+  /** Fase 7J.2 overrides -- same "explicit override wins, else config, else false/unset"
+   * precedence as every flag above. Lets a test enable the advisor alert and inject a fake
+   * advisor phone/template without a real HUMAN_HANDOFF_ADVISOR_PHONE in the environment (which
+   * config.ts's own superRefine would otherwise require -- see that file). Production always
+   * takes the config.* path (this override object is never populated from a real request). */
+  humanHandoffAlertsEnabled?: boolean;
+  humanHandoffAdvisorPhone?: string;
+  humanHandoffAlertTemplateName?: string;
 }
 
 /**
@@ -475,6 +485,34 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
     leads: leadsRepo, appointments: appointmentsRepo, leadStatusHistory: leadStatusHistoryRepo, logger: app.log,
   });
 
+  // Fase 7J.2 -- the advisor (Héctor) WhatsApp alert on UNKNOWN_INTENT_HANDOFF. Constructed ONLY
+  // when the flag is on AND a valid advisor phone resolves -- absent (undefined) otherwise, so
+  // both call sites (escalateUnknownIntent, escalateToHuman) degrade to a no-op via optional
+  // chaining and every existing HUMAN_HANDOFF behavior (Fase 7J/7J.1) is byte-for-byte unchanged.
+  // The phone is re-validated HERE (not just trusted from config.ts's own superRefine) as
+  // defense-in-depth for a caller that overrides humanHandoffAlertsEnabled without going through
+  // real env vars (a test, or a future programmatic caller) -- never sends to an
+  // invalid/empty/inbound-derived destination (spec item 12).
+  const humanHandoffAlertsEnabled = overrides.humanHandoffAlertsEnabled ?? config.HUMAN_HANDOFF_ALERTS_ENABLED;
+  const humanHandoffAdvisorPhoneOverride = overrides.humanHandoffAdvisorPhone !== undefined
+    ? normalizePhoneToE164(overrides.humanHandoffAdvisorPhone)
+    : humanHandoffAdvisorPhoneE164;
+  const humanHandoffAlertTemplateName = overrides.humanHandoffAlertTemplateName ?? config.HUMAN_HANDOFF_ALERT_TEMPLATE_NAME;
+  let handoffAlertService: HumanHandoffAlertService | undefined;
+  if (humanHandoffAlertsEnabled) {
+    if (humanHandoffAdvisorPhoneOverride) {
+      handoffAlertService = new HumanHandoffAlertService(
+        { messaging, processedEvents: processedEventsRepo, leads: leadsRepo, logger: app.log },
+        { advisorPhoneE164: humanHandoffAdvisorPhoneOverride, templateName: humanHandoffAlertTemplateName, languageCode: config.WHATSAPP_TEMPLATE_LANGUAGE, timezone: config.ADVISOR_TIMEZONE },
+      );
+    } else {
+      app.log.error(
+        { event: "human_handoff_alerts_misconfigured" },
+        "HUMAN_HANDOFF_ALERTS_ENABLED is true but the advisor phone is missing/invalid -- alerts disabled",
+      );
+    }
+  }
+
   // "fake" only when a test/dev caller explicitly passed a FakeMessagingProvider override --
   // NOT whenever the resolved `messaging` instance happens to be one, since the normal
   // production fallback (missing credentials) also constructs a FakeMessagingProvider. That
@@ -557,6 +595,13 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
           messages: messagesRepo,
           leadStatusHistory: leadStatusHistoryRepo,
           logger: app.log,
+          // Fase 7J.2 -- undefined unless HUMAN_HANDOFF_ALERTS_ENABLED (see above). Only this
+          // handler gets it wired this phase (its BOOKING_PENDING UNKNOWN_INTENT_HANDOFF branch,
+          // Fase 7J) -- reschedule/cancellation/reactivation/past-booked-recovery below are
+          // deliberately left untouched (spec item 11): their own escalateToHuman calls use
+          // different eventTypes, which the eventType check inside escalateToHuman already
+          // excludes from alerting regardless.
+          handoffAlertService,
         },
         config.ADVISOR_TIMEZONE,
       )
@@ -1013,7 +1058,7 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
         "whatsapp webhook parsed inbound message",
       );
       await handleInboundWhatsAppText(
-        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler, confirmationHandler, reactivationHandler, pastBookedRecoveryHandler, appointments: appointmentsRepo, fiscalLeadScores: fiscalLeadScoresRepo, leadIntegrityEnabled },
+        { leads: leadsRepo, conversations: conversationsRepo, messages: messagesRepo, leadService, messaging, logger: app.log, qualificationHandler, bookingHandler, cancellationHandler, rescheduleHandler, confirmationHandler, reactivationHandler, pastBookedRecoveryHandler, appointments: appointmentsRepo, fiscalLeadScores: fiscalLeadScoresRepo, leadIntegrityEnabled, handoffAlertService },
         message,
       );
     }

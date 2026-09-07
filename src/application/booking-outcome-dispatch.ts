@@ -2,7 +2,7 @@ import type { LeadRepository, ConversationRepository, MessagingProvider, Message
 import type { Lead, LeadStatus } from "../domain/lead.js";
 import type { Appointment } from "../domain/appointment.js";
 import { assertTransition } from "../domain/state-machine.js";
-import { sendAndPersistReply } from "./whatsapp-inbound-service.js";
+import { sendAndPersistReply, type HandoffAlertTurnService } from "./whatsapp-inbound-service.js";
 import type { SlotOfferOutcome } from "./slot-offering-service.js";
 import { recordLeadStatusTransition } from "./lead-status-audit.js";
 import { conversationalFirstName } from "../domain/conversation-name.js";
@@ -18,6 +18,10 @@ export interface BookingOutcomeDeps {
   messages: MessageRepository;
   leadStatusHistory: LeadStatusHistoryRepository;
   logger: Logger;
+  /** Fase 7J.2 -- present only when config.HUMAN_HANDOFF_ALERTS_ENABLED is true AND a valid
+   * advisor phone is configured (see app.ts). Absent (the default) or an `eventType` other than
+   * "UNKNOWN_INTENT_HANDOFF" (see escalateToHuman below): no alert, byte-for-byte unchanged. */
+  handoffAlertService?: HandoffAlertTurnService;
 }
 
 /**
@@ -102,6 +106,7 @@ export async function escalateToHuman(
   message: string = QUALIFIER_HUMAN_HANDOFF_MESSAGE,
 ): Promise<void> {
   const target: LeadStatus = "HUMAN_HANDOFF";
+  let isGenuineNewEscalation = false;
   if (lead.status !== target) {
     assertTransition(lead.status, target);
     await deps.leads.update(lead.id, { status: target });
@@ -111,9 +116,20 @@ export async function escalateToHuman(
       toStatus: target,
       eventType,
     });
+    isGenuineNewEscalation = true;
   }
   await deps.conversations.update(conversationId, { status: "HUMAN_HANDOFF" });
   await sendAndPersistReply(deps, lead.id, conversationId, whatsappUserId, message);
+  // Fase 7J.2 (item 11 of the spec): alert exclusively for UNKNOWN_INTENT_HANDOFF this phase --
+  // every other eventType this function already serves (BOOKING_INCONSISTENCY_HANDOFF,
+  // RESCHEDULE_APPOINTMENT_INCONSISTENCY, etc.) is deliberately left unchanged, even though this
+  // same helper could alert on any of them once that decision is made. Gated on
+  // isGenuineNewEscalation so a redundant/idempotent call (lead already HUMAN_HANDOFF) never
+  // re-alerts -- the ONE-alert-per-episode guarantee starts here, before
+  // HumanHandoffAlertService's own idempotency record is even consulted.
+  if (isGenuineNewEscalation && eventType === "UNKNOWN_INTENT_HANDOFF") {
+    await deps.handoffAlertService?.alertAdvisorOfHandoff({ leadId: lead.id, conversationId, whatsappUserId, handoffReason: eventType, now: new Date() });
+  }
 }
 
 /**

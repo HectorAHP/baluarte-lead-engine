@@ -109,6 +109,12 @@ export function buildTestApp(overrides: Partial<AppDependencies> = {}) {
     // Fase 7C -- same deterministic-false/unset-by-default rationale as every flag/secret above.
     hubspotOutboxEnabled: false,
     hubspotSyncRunnerSecret: undefined,
+    // Fase 7J.2 -- same deterministic-false/unset-by-default rationale as every flag/secret
+    // above. This repo's real .env carries no HUMAN_HANDOFF_ADVISOR_PHONE today, so a test that
+    // wants the alert must explicitly override both humanHandoffAlertsEnabled and
+    // humanHandoffAdvisorPhone (a fake number) together -- never left to config.ts's own fallback.
+    humanHandoffAlertsEnabled: false,
+    humanHandoffAdvisorPhone: undefined,
     ...overrides,
   });
 }

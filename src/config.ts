@@ -1,4 +1,5 @@
 import "dotenv/config"; import {z} from "zod";
+import {normalizePhoneToE164} from "./domain/phone.js";
 const workdayTime=z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/,"Expected HH:MM");
 const schema=z.object({
   NODE_ENV:z.string().default("development"),
@@ -80,6 +81,27 @@ const schema=z.object({
   // Meta locale code for every template above -- "es_MX" (not "es"/"es-MX") is Meta's own
   // documented format for Mexican Spanish in the Template API.
   WHATSAPP_TEMPLATE_LANGUAGE:z.string().default("es_MX"),
+  // Fase 7J.2 -- WhatsApp alert to the advisor (Héctor) when a conversation is escalated to
+  // HUMAN_HANDOFF via UNKNOWN_INTENT_HANDOFF (see human-handoff-alert-service.ts). Default false:
+  // with it unset/false, HUMAN_HANDOFF happens exactly as in Fase 7J/7J.1 -- no alert is ever
+  // attempted, byte-for-byte unchanged. Deliberately deployable passively (spec item 10): the
+  // service can ship with this false even before Héctor's number is set and before Meta has
+  // approved the template below. Same safe-parsing rationale as every other flag above: never
+  // z.coerce.boolean().
+  HUMAN_HANDOFF_ALERTS_ENABLED:z.preprocess((v)=>v==="true",z.boolean()).default(false),
+  // The advisor's own WhatsApp number. NEVER taken from any inbound message, never
+  // user-selectable -- this is the ONLY destination an alert can ever be sent to (spec item 12).
+  // Optional at the schema level so the service can be deployed with HUMAN_HANDOFF_ALERTS_ENABLED
+  // left false before this is set -- validated (must normalize to a real E.164 number) only when
+  // the flag is true, in the superRefine below. Normalized via the same normalizePhoneToE164
+  // every lead/webhook phone in this codebase already goes through -- never a bespoke regex.
+  HUMAN_HANDOFF_ADVISOR_PHONE:z.string().optional(),
+  // Meta Message Template name for the advisor alert -- same "configurable, never assumed
+  // approved" posture as WHATSAPP_TEMPLATE_NO_SHOW etc. above; reuses WHATSAPP_TEMPLATE_LANGUAGE,
+  // never a second language config. Sending fails loudly (MessagingProviderError, alert logged as
+  // human_handoff_alert_failed) until Meta actually approves whatever name ends up configured
+  // here -- see docs/security/FASE7J2-HUMAN-HANDOFF-ALERT.md for the exact submission steps.
+  HUMAN_HANDOFF_ALERT_TEMPLATE_NAME:z.string().default("handoff_asesor"),
   // Fase 7A -- static bearer secret for POST /internal/reminders/run (Fase 7A spec item 10:
   // "Authorization: Bearer <REMINDER_RUNNER_SECRET>"). Optional/undefined fails the route closed
   // (401, same "no secret configured -> nothing can be trusted" posture as META_APP_SECRET's own
@@ -175,11 +197,26 @@ const schema=z.object({
   if(setCount>0&&setCount<3){
     ctx.addIssue({code:z.ZodIssueCode.custom,message:"GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN must all be set together, or all left empty"});
   }
+  // Fase 7J.2 item 9 -- fail closed AT STARTUP, same posture as the Google credential check above:
+  // HUMAN_HANDOFF_ALERTS_ENABLED=true with a missing/invalid advisor phone is a genuine
+  // misconfiguration (an operator who flipped the flag but forgot the number), never something to
+  // silently treat as "off" once the process is already running. false (the default) needs no
+  // phone at all -- this feature ships passively (item 10 of the spec) with the flag off,
+  // regardless of what HUMAN_HANDOFF_ADVISOR_PHONE holds.
+  if(cfg.HUMAN_HANDOFF_ALERTS_ENABLED&&!normalizePhoneToE164(cfg.HUMAN_HANDOFF_ADVISOR_PHONE)){
+    ctx.addIssue({code:z.ZodIssueCode.custom,message:"HUMAN_HANDOFF_ADVISOR_PHONE must be a valid phone number when HUMAN_HANDOFF_ALERTS_ENABLED is true"});
+  }
 });
 export const config=schema.parse(process.env);
 export const hasGoogleCalendarCredentials=Boolean(config.GOOGLE_CLIENT_ID&&config.GOOGLE_CLIENT_SECRET&&config.GOOGLE_REFRESH_TOKEN);
 export const hasWhatsAppCredentials=Boolean(config.WHATSAPP_ACCESS_TOKEN&&config.WHATSAPP_PHONE_NUMBER_ID&&config.WHATSAPP_VERIFY_TOKEN&&config.META_APP_SECRET);
 export const hasHubSpotCredentials=Boolean(config.HUBSPOT_PRIVATE_APP_TOKEN);
+// Fase 7J.2 -- normalized once here (never re-parsed at each alert send). null whenever
+// HUMAN_HANDOFF_ADVISOR_PHONE is unset/unparseable -- the superRefine above already guarantees
+// this is non-null whenever HUMAN_HANDOFF_ALERTS_ENABLED is true (driven by real env vars);
+// app.ts re-checks it anyway before constructing the alert service, as defense-in-depth for a
+// caller that overrides the flag without going through real env vars (e.g. a test).
+export const humanHandoffAdvisorPhoneE164=normalizePhoneToE164(config.HUMAN_HANDOFF_ADVISOR_PHONE);
 
 // Production hardening: CORS allowlist for the public web surface (POST /api/leads and friends --
 // PII/financial data). CORS is a browser-enforced concept; server-to-server callers (Meta's

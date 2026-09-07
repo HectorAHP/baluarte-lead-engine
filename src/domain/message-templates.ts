@@ -577,6 +577,35 @@ export function buildAppointmentConfirmedReplyMessage(firstName: string | undefi
   return `${greeting} Tu cita queda confirmada. Te esperamos.`;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Fase 7J.2 -- WhatsApp alert to the advisor (Héctor), sent via sendTemplate to
+// HUMAN_HANDOFF_ADVISOR_PHONE, never to the lead's own conversation (see
+// human-handoff-alert-service.ts -- this is never persisted into the lead's `messages`, since it
+// is not part of that conversation). Four variables, in this exact order (spec item 3): lead
+// name, a contact identifier to locate the chat, a fixed reason string, and a local timestamp.
+// Deliberately NEVER includes the lead's original inbound text, nor any health/fiscal/score/
+// income/policy field -- `body` below is the exact proposed copy to submit to Meta for approval
+// (see docs/security/FASE7J2-HUMAN-HANDOFF-ALERT.md), not something this codebase ever sends as
+// free text itself (Meta requires the approved template's own stored body -- only `params` is
+// actually transmitted, positionally, via MessagingProvider.sendTemplate).
+export interface HumanHandoffAlertPayload {
+  body: string;
+  params: string[];
+}
+
+export function buildHumanHandoffAlertMessage(leadName: string, contact: string, reason: string, whenLocal: string): HumanHandoffAlertPayload {
+  return {
+    body: `Atención requerida en Baluarte Capital.\n\nNombre: ${leadName}\nContacto: ${contact}\nMotivo: ${reason}\nHora: ${whenLocal}\n\nEl chat quedó asignado a atención humana.`,
+    params: [leadName, contact, reason, whenLocal],
+  };
+}
+
+/** Fixed reason string for the one handoff cause Fase 7J.2 alerts on -- never the lead's actual
+ * inbound text (spec item 3/4). A closed constant, not a free-text field, so a future second
+ * alerted reason (see HandoffAlertTurnService's own doc comment) gets its own distinct string
+ * here, never a reused/overloaded one. */
+export const HUMAN_HANDOFF_ALERT_REASON_UNKNOWN_INTENT = "Mensaje no reconocido";
+
 /** Recoverable technical/infra failure while processing a confirmation reply -- no state change,
  * the lead can simply reply again. Deliberately distinct copy from CANCELLATION_TECHNICAL_ERROR_MESSAGE
  * (never mentions "cancelación" for a confirmation-flow failure). */

@@ -9,7 +9,7 @@ import {
   BookingInProgressError, SlotUnavailableError, ActiveOfferInconsistentError, BookingAttemptInconsistentError,
   SlotOfferClaimInProgressError,
 } from "../domain/errors.js";
-import { sendAndPersistReply, type BookingTurnHandler } from "./whatsapp-inbound-service.js";
+import { sendAndPersistReply, type BookingTurnHandler, type HandoffAlertTurnService } from "./whatsapp-inbound-service.js";
 import type { SlotOfferingService } from "./slot-offering-service.js";
 import { targetStatusForScore, type AppointmentService } from "./services.js";
 import { parseSlotSelection } from "../domain/slot-selection-parser.js";
@@ -41,6 +41,11 @@ export interface WhatsAppBookingHandlerDeps {
   messages: MessageRepository;
   leadStatusHistory: LeadStatusHistoryRepository;
   logger: Logger;
+  /** Fase 7J.2 -- passed straight through to escalateToHuman (booking-outcome-dispatch.ts) for
+   * the UNKNOWN_INTENT_HANDOFF case below. Present only when config.HUMAN_HANDOFF_ALERTS_ENABLED
+   * is true AND a valid advisor phone is configured (see app.ts); absent (the default), no alert
+   * is ever attempted -- byte-for-byte Fase 7J. */
+  handoffAlertService?: HandoffAlertTurnService;
 }
 
 /**

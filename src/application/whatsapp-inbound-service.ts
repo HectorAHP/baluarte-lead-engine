@@ -120,6 +120,20 @@ export interface PastBookedRecoveryTurnHandler {
   }): Promise<void>;
 }
 
+/**
+ * Fase 7J.2 -- reusable alert hook, injected only when config.HUMAN_HANDOFF_ALERTS_ENABLED is
+ * true AND a valid HUMAN_HANDOFF_ADVISOR_PHONE is configured (see app.ts). Absent (the default),
+ * every HUMAN_HANDOFF transition happens exactly as in Fase 7J/7J.1 -- no alert is ever attempted,
+ * byte-for-byte unchanged. `handoffReason` is a free parameter so this same interface can serve a
+ * future second alerted cause (e.g. BOOKING_INCONSISTENCY_HANDOFF) -- but per the Fase 7J.2 spec
+ * (item 11), only "UNKNOWN_INTENT_HANDOFF" is ever actually passed this phase; call sites decide
+ * which reasons to alert on, this interface itself imposes no restriction. HumanHandoffAlertService
+ * implements this.
+ */
+export interface HandoffAlertTurnService {
+  alertAdvisorOfHandoff(params: { leadId: string; conversationId: string; whatsappUserId: string; handoffReason: string; now: Date }): Promise<void>;
+}
+
 export interface InboundWhatsAppText {
   whatsappUserId: string;
   phoneRaw: string;
@@ -183,6 +197,11 @@ export interface WhatsAppInboundDeps {
    * Absent/false (the default): byte-for-byte unchanged behavior, no extra read/write, same as
    * every other flag in this project. */
   leadIntegrityEnabled?: boolean;
+  /** Fase 7J.2 -- present only when config.HUMAN_HANDOFF_ALERTS_ENABLED is true AND a valid
+   * advisor phone is configured (see app.ts). Absent (the default), escalateUnknownIntent below
+   * sends no alert -- byte-for-byte the Fase 7J/7J.1 behavior. See HandoffAlertTurnService's own
+   * doc comment. */
+  handoffAlertService?: HandoffAlertTurnService;
 }
 
 /**
@@ -226,7 +245,7 @@ async function applyPassiveWhatsAppPhoneVerification(
  * unconditionally, per state-machine.ts) so this never throws in practice.
  */
 async function escalateUnknownIntent(
-  deps: Pick<WhatsAppInboundDeps, "leadService" | "conversations" | "messaging" | "messages" | "logger">,
+  deps: Pick<WhatsAppInboundDeps, "leadService" | "conversations" | "messaging" | "messages" | "logger" | "handoffAlertService">,
   leadId: string,
   conversationId: string,
   whatsappUserId: string,
@@ -234,6 +253,11 @@ async function escalateUnknownIntent(
   await deps.leadService.requestHumanHandoff(leadId, "UNKNOWN_INTENT_HANDOFF");
   await deps.conversations.update(conversationId, { status: "HUMAN_HANDOFF" });
   await sendAndPersistReply(deps, leadId, conversationId, whatsappUserId, UNKNOWN_INTENT_HANDOFF_MESSAGE);
+  // Fase 7J.2 -- this function ONLY ever escalates for this one reason (see its own call sites),
+  // so the alert fires unconditionally here (never gated on a reason check the way
+  // booking-outcome-dispatch.ts's escalateToHuman needs, since that one serves several reasons).
+  // Absent handoffAlertService (the default) makes this a no-op -- byte-for-byte Fase 7J/7J.1.
+  await deps.handoffAlertService?.alertAdvisorOfHandoff({ leadId, conversationId, whatsappUserId, handoffReason: "UNKNOWN_INTENT_HANDOFF", now: new Date() });
 }
 
 export type WhatsAppInboundOutcome = "DUPLICATE" | "PROCESSED";
