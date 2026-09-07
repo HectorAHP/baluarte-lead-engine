@@ -167,6 +167,25 @@ export const BOOKING_NO_AVAILABILITY_MESSAGE =
   "Por ahora no tengo horarios disponibles para ofrecerte. En cuanto haya opciones te aviso, o si prefieres, un asesor de Baluarte Capital puede contactarte directamente.";
 
 /**
+ * Fase 7I -- SlotOfferingService returned REQUESTED_DATE_UNAVAILABLE: the lead asked for a
+ * specific day/date/time-of-day that produced zero matching slots (a closed day, e.g. Sunday; a
+ * fully booked day; or a date beyond the booking horizon), but real availability DOES exist more
+ * generally -- `fallbackSlots` is always offered right alongside the explanation, reusing
+ * buildSlotOfferMessage's own list formatting (never a duplicated one). Deliberately never names
+ * the specific day/date that was requested (keeps this generic across every possible preference,
+ * never Sunday-specific wording) and never mentions any internal detail (horizon day count,
+ * "Calendar", provider names) -- exactly the same "no internal details" discipline every other
+ * message in this file already follows.
+ */
+export function buildRequestedDateUnavailableMessage(reason: "OUT_OF_HORIZON" | "NO_SLOTS", fallbackSlots: OfferedSlot[], timezone: string): string {
+  const intro =
+    reason === "OUT_OF_HORIZON"
+      ? "Por ahora solo puedo revisar disponibilidad en los próximos días, así que esa fecha está fuera de ese rango. Aquí tienes las opciones más próximas:"
+      : "Para ese día no tengo horarios disponibles. Aquí tienes las opciones más próximas:";
+  return buildSlotOfferMessage(fallbackSlots, timezone, intro);
+}
+
+/**
  * H. Shared by buildBookingPendingFallbackMessage/buildReschedulePendingFallbackMessage below --
  * pre-launch hardening: replaces the old behavior of resending buildInvalidSelectionMessage's
  * terse "Por favor responde 1, 2 o 3" reminder for EVERY unrecognized inbound while

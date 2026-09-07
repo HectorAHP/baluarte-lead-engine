@@ -2,6 +2,7 @@ import type { Lead } from "../domain/lead.js";
 import { isCancellationRequest } from "../domain/cancellation-intent-detection.js";
 import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
+import { parseDatePreference } from "../domain/date-preference-parser.js";
 import { sendAndPersistReply } from "./whatsapp-inbound-service.js";
 import { escalateToHuman, dispatchSlotOfferOutcome, type BookingOutcomeDeps } from "./booking-outcome-dispatch.js";
 import type { SlotOfferingService } from "./slot-offering-service.js";
@@ -72,14 +73,14 @@ export class WhatsAppReactivationHandler implements ReactivationTurnHandler {
       // acknowledgment sent before the slot offer so the lead understands why.
       if (isRescheduleRequest(inboundText)) {
         await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, CANCELLED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE);
-        await this.startNewBooking(lead, conversationId, whatsappUserId, now);
+        await this.startNewBooking(lead, conversationId, whatsappUserId, now, inboundText);
         return;
       }
 
       // Item 2: explicit new-booking intent -- start the booking round directly, no extra
       // acknowledgment needed (the intent is already unambiguous).
       if (isNewBookingRequest(inboundText)) {
-        await this.startNewBooking(lead, conversationId, whatsappUserId, now);
+        await this.startNewBooking(lead, conversationId, whatsappUserId, now, inboundText);
         return;
       }
 
@@ -95,8 +96,11 @@ export class WhatsAppReactivationHandler implements ReactivationTurnHandler {
    * (see the class doc comment) -- no bespoke transition-writing logic here. mode is omitted
    * (booking mode, the default): every new offered_slots row gets reschedule_context_id IS NULL,
    * never treated as -- or counted against -- any reschedule episode's round budget. */
-  private async startNewBooking(lead: Lead, conversationId: string, whatsappUserId: string, now: Date): Promise<void> {
-    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now });
+  private async startNewBooking(lead: Lead, conversationId: string, whatsappUserId: string, now: Date, inboundText: string): Promise<void> {
+    // Fase 7I: same parser as WhatsAppBookingHandler/WhatsAppRescheduleHandler -- never a second,
+    // divergent implementation.
+    const datePreference = parseDatePreference(inboundText, now, this.advisorTimezone) ?? undefined;
+    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, datePreference });
     await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
   }
 

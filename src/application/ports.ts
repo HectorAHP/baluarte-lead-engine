@@ -1,5 +1,6 @@
 import type { Lead, LeadDedupKey } from "../domain/lead.js"; import type { Appointment, AppointmentStatus } from "../domain/appointment.js"; import type { BookingAttempt, BookingAttemptStatus } from "../domain/booking-attempt.js"; import type { Conversation } from "../domain/conversation.js"; import type { Message } from "../domain/message.js"; import type { QualificationAnswer } from "../domain/qualification-answer.js"; import type { LeadScoreRecord } from "../domain/lead-score-record.js"; import type { OfferedSlot } from "../domain/offered-slot.js"; import type { SlotOfferClaim } from "../domain/slot-offer-claim.js"; import type { LeadStatusHistoryEntry } from "../domain/lead-status-history.js"; import type { AppointmentStatusHistoryEntry } from "../domain/appointment-status-history.js"; import type { AppointmentMessageDelivery } from "../domain/appointment-message-delivery.js"; import type { AppointmentCancellation } from "../domain/appointment-cancellation.js"; import type { AppointmentReschedule } from "../domain/appointment-reschedule.js";
 import type { ProcessedEvent } from "../domain/processed-event.js";
+import type { DatePreference } from "../domain/date-preference.js";
 import type { FiscalLeadScore, FiscalScoreClass, FiscalScoreReason, MonthlyIncomeBand, AnnualContributionBand } from "../domain/fiscal-lead-score.js";
 import type { HubSpotSyncOutboxEntry, HubSpotSyncOutboxStatus, HubSpotSyncOutboxPayload } from "../domain/hubspot-sync-outbox.js";
 export interface LeadRepository {
@@ -304,7 +305,14 @@ export interface AppointmentRescheduleRepository {
 
 export interface CalendarSlot{start:Date;end:Date;} export interface CalendarEventInput{title:string;description:string;start:Date;end:Date;attendeeEmail?:string;} export interface CalendarEventResult{eventId:string;meetingUrl?:string;}
 export interface CalendarProvider{
-  getAvailableSlots(from:Date,to:Date,durationMinutes:number):Promise<CalendarSlot[]>;
+  /**
+   * Fase 7I -- `datePreference` (optional, trailing -- every existing call site with 3 args stays
+   * valid unchanged) narrows the returned slots to a user-expressed day/weekday/daypart
+   * preference, applied BEFORE any internal maxSlots truncation (see
+   * domain/availability.ts's computeAvailableSlots, the single source of truth for this ordering).
+   * Omitted (the default) is byte-identical to pre-Fase-7I behavior.
+   */
+  getAvailableSlots(from:Date,to:Date,durationMinutes:number,datePreference?:DatePreference):Promise<CalendarSlot[]>;
   isSlotAvailable(start:Date,end:Date):Promise<boolean>;
   /**
    * Fase 7F -- business-hours-only check (never queries the calendar itself -- see

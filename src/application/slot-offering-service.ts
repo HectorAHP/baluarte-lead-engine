@@ -9,6 +9,8 @@ import { LeadNotOfferableError, SlotOfferClaimInProgressError } from "../domain/
 import { assertSingleActiveRound } from "../domain/active-offer-consistency.js";
 import { recordLeadStatusTransition } from "./lead-status-audit.js";
 import { config } from "../config.js";
+import type { DatePreference } from "../domain/date-preference.js";
+import { localDateString } from "../domain/timezone.js";
 
 /**
  * Lead statuses from which offering booking slots is meaningful. Anything else (HUMAN_HANDOFF,
@@ -100,7 +102,22 @@ export type SlotOfferOutcome =
   | { type: "REUSED"; slots: OfferedSlot[]; lead: Lead }
   | { type: "ALREADY_BOOKED"; appointment: Appointment }
   | { type: "NO_AVAILABILITY" }
-  | { type: "MAX_ROUNDS_REACHED" };
+  | { type: "MAX_ROUNDS_REACHED" }
+  /**
+   * Fase 7I -- a `datePreference` was given but produced zero matching candidate slots, while
+   * availability DOES exist more broadly (an unfiltered search of the same window returned at
+   * least one slot). `fallbackSlots` is a REAL, freshly-persisted round (same claim/round-cap
+   * machinery as CREATED -- see fetchAndPersistRound) the lead can actually select from; it is
+   * NEVER presented as if it matched the request. `reason` distinguishes an explicit date/weekday
+   * that fell outside BOOKING_MAX_DAYS_AHEAD (OUT_OF_HORIZON, detected before ever calling
+   * Calendar for it) from every other case -- a closed day (e.g. Sunday) or a day that's simply
+   * fully booked (NO_SLOTS) -- deliberately not distinguished further, so no day-specific
+   * (e.g. Sunday-only) message logic is ever needed. When even the unfiltered fallback search
+   * comes back empty, this outcome is never returned -- NO_AVAILABILITY is used instead (§13 of
+   * the Fase 7I spec's A/B distinction: no availability at all, vs. availability but not that
+   * day).
+   */
+  | { type: "REQUESTED_DATE_UNAVAILABLE"; requestedPreference: DatePreference; reason: "OUT_OF_HORIZON" | "NO_SLOTS"; fallbackSlots: OfferedSlot[]; lead: Lead };
 
 export interface SlotOfferParams {
   lead: Lead;
@@ -157,6 +174,18 @@ export interface SlotOfferParams {
    * (still evaluated normally, see getOrCreateOffer below) are untouched.
    */
   skipRoundCap?: boolean;
+  /**
+   * Fase 7I -- a temporal preference parsed from the triggering inbound text (see
+   * date-preference-parser.ts). Only ever consulted when a genuinely NEW round is about to be
+   * created (claimAndCreateRound -> fetchAndPersistRound) -- if an active round already exists,
+   * getOrCreateOffer's REUSED path returns it as-is regardless of this field, unchanged from
+   * before Fase 7I. Callers that want a new preference to REPLACE an already-active round (Fase
+   * 7I spec item 15 -- "mejor el sábado" while Monday options are still active) must call
+   * replaceOffer, not getOrCreateOffer, exactly the same decision WhatsAppBookingHandler/
+   * WhatsAppRescheduleHandler already make for a DECLINED reply -- this service stays
+   * policy-free, deciding nothing about WHEN to prefer a fresh round over a REUSED one.
+   */
+  datePreference?: DatePreference;
 }
 
 /** Extracts the round-counting/tagging context id from a SlotOfferParams["mode"] -- undefined for
@@ -241,7 +270,7 @@ export class SlotOfferingService {
    * against MAX_OFFER_ROUNDS -- only an actual new round (Calendar query + createMany) does.
    */
   async getOrCreateOffer(params: SlotOfferParams): Promise<SlotOfferOutcome> {
-    const { lead, conversationId, now, mode, skipRoundCap } = params;
+    const { lead, conversationId, now, mode, skipRoundCap, datePreference } = params;
     this.assertOfferable(lead, mode);
 
     if (mode?.type !== "RESCHEDULE") {
@@ -257,6 +286,9 @@ export class SlotOfferingService {
     }
 
     const activeSlots = await this.offeredSlots.listActiveByConversationId(conversationId, now, rescheduleContextIdOf(mode));
+    // Fase 7I: an active round is always reused as-is here, regardless of `datePreference` -- see
+    // that field's own doc comment on SlotOfferParams for why REPLACING on a new preference is the
+    // caller's decision (replaceOffer), never this method's.
     if (activeSlots.length > 0) return this.resolveReused(lead, now, conversationId, activeSlots, mode);
 
     if (!skipRoundCap) {
@@ -265,7 +297,7 @@ export class SlotOfferingService {
       if (roundIds.length >= MAX_OFFER_ROUNDS) return { type: "MAX_ROUNDS_REACHED" };
     }
 
-    return this.claimAndCreateRound(lead, conversationId, now, mode);
+    return this.claimAndCreateRound(lead, conversationId, now, mode, datePreference);
   }
 
   /**
@@ -290,7 +322,7 @@ export class SlotOfferingService {
    * requires manually expiring one of the two rounds; no automated reconciliation exists yet.
    */
   async replaceOffer(params: SlotOfferParams): Promise<SlotOfferOutcome> {
-    const { lead, conversationId, now, mode } = params;
+    const { lead, conversationId, now, mode, datePreference } = params;
     this.assertOfferable(lead, mode);
 
     if (mode?.type !== "RESCHEDULE") {
@@ -308,8 +340,11 @@ export class SlotOfferingService {
     const roundIds = await this.offeredSlots.listRoundIdsByConversationId(conversationId, rescheduleContextIdOf(mode), since);
     if (roundIds.length >= MAX_OFFER_ROUNDS) return { type: "MAX_ROUNDS_REACHED" };
 
-    const availabilityResult = await this.claimAndCreateRound(lead, conversationId, now, mode);
-    if (availabilityResult.type !== "CREATED") return availabilityResult; // NO_AVAILABILITY -- old round left untouched
+    const availabilityResult = await this.claimAndCreateRound(lead, conversationId, now, mode, datePreference);
+    // Fase 7I: REQUESTED_DATE_UNAVAILABLE also persisted a real fallback round (same as CREATED
+    // would) -- both replace the previous round below. Only NO_AVAILABILITY leaves the old round
+    // untouched (nothing new to switch to).
+    if (availabilityResult.type !== "CREATED" && availabilityResult.type !== "REQUESTED_DATE_UNAVAILABLE") return availabilityResult;
 
     if (activeSlots.length > 0) {
       // Only expire the previous round AFTER the new one is safely persisted -- see the class
@@ -436,14 +471,14 @@ export class SlotOfferingService {
    * ownerToken + intendedRoundId, then tries to win the claim outright. Losing means someone
    * else already holds it -- see waitOrReclaim for what happens next.
    */
-  private async claimAndCreateRound(lead: Lead, conversationId: string, now: Date, mode?: SlotOfferParams["mode"]): Promise<SlotOfferOutcome> {
+  private async claimAndCreateRound(lead: Lead, conversationId: string, now: Date, mode?: SlotOfferParams["mode"], datePreference?: DatePreference): Promise<SlotOfferOutcome> {
     const ownerToken = this.ownerTokenFactory();
     const intendedRoundId = this.roundIdFactory();
 
     const won = await this.slotOfferClaims.tryCreate({ conversationId, ownerToken, intendedRoundId });
-    if (won) return this.runClaimedWork(lead, conversationId, now, ownerToken, intendedRoundId, mode);
+    if (won) return this.runClaimedWork(lead, conversationId, now, ownerToken, intendedRoundId, mode, datePreference);
 
-    return this.waitOrReclaim(lead, conversationId, now, ownerToken, intendedRoundId, mode);
+    return this.waitOrReclaim(lead, conversationId, now, ownerToken, intendedRoundId, mode, datePreference);
   }
 
   /**
@@ -465,6 +500,7 @@ export class SlotOfferingService {
     ownerToken: string,
     intendedRoundId: string,
     mode?: SlotOfferParams["mode"],
+    datePreference?: DatePreference,
   ): Promise<SlotOfferOutcome> {
     const deadline = this.clock().getTime() + OFFER_CLAIM_POLL_BUDGET_MS;
     while (this.clock().getTime() < deadline) {
@@ -482,7 +518,7 @@ export class SlotOfferingService {
       // The claim was released (success or handled failure) without ever producing active
       // slots (e.g. NO_AVAILABILITY) -- free to try winning it ourselves now.
       const won = await this.slotOfferClaims.tryCreate({ conversationId, ownerToken, intendedRoundId });
-      if (won) return this.runClaimedWork(lead, conversationId, now, ownerToken, intendedRoundId, mode);
+      if (won) return this.runClaimedWork(lead, conversationId, now, ownerToken, intendedRoundId, mode, datePreference);
       throw new SlotOfferClaimInProgressError(conversationId); // someone else grabbed it again right as we tried
     }
 
@@ -509,16 +545,16 @@ export class SlotOfferingService {
     });
     if (!reclaimed) throw new SlotOfferClaimInProgressError(conversationId); // lost the reclaim race to another reclaimer
 
-    return this.runClaimedWork(lead, conversationId, now, newOwnerToken, newIntendedRoundId, mode);
+    return this.runClaimedWork(lead, conversationId, now, newOwnerToken, newIntendedRoundId, mode, datePreference);
   }
 
   /** Runs the actual Calendar-query + persist step under an already-won claim, then releases it
    * regardless of outcome (success, NO_AVAILABILITY, or a thrown error) -- best-effort; a failed
    * release just means OFFER_CLAIM_STALE_THRESHOLD_MS is the backstop instead of an immediate
    * retry, never a crash. */
-  private async runClaimedWork(lead: Lead, conversationId: string, now: Date, ownerToken: string, intendedRoundId: string, mode?: SlotOfferParams["mode"]): Promise<SlotOfferOutcome> {
+  private async runClaimedWork(lead: Lead, conversationId: string, now: Date, ownerToken: string, intendedRoundId: string, mode?: SlotOfferParams["mode"], datePreference?: DatePreference): Promise<SlotOfferOutcome> {
     try {
-      return await this.fetchAndPersistRound(lead, conversationId, now, intendedRoundId, mode);
+      return await this.fetchAndPersistRound(lead, conversationId, now, intendedRoundId, mode, datePreference);
     } finally {
       await this.slotOfferClaims.release(conversationId, ownerToken).catch((err) => {
         // Sanitized: conversationId + error name only -- never the ownerToken (an opaque
@@ -541,14 +577,65 @@ export class SlotOfferingService {
    * (claimAndCreateRound/waitOrReclaim) -- never generated here, so every offered_slots row this
    * method persists always matches its claim's intended_round_id exactly.
    */
-  private async fetchAndPersistRound(lead: Lead, conversationId: string, now: Date, roundId: string, mode?: SlotOfferParams["mode"]): Promise<SlotOfferOutcome> {
+  /**
+   * Fase 7I -- with `datePreference` present, this now has THREE possible outcomes instead of
+   * two:
+   *  1. An explicit `targetDate` beyond BOOKING_MAX_DAYS_AHEAD -- OUT_OF_HORIZON, detected BEFORE
+   *     ever calling Calendar for the (structurally unreachable) preferred window. Never silently
+   *     substitutes a different date and pretends it's the one requested (Fase 7I spec item 5).
+   *  2. The preference-filtered search finds real slots -- CREATED, exactly as before, just with
+   *     `datePreference` threaded into the Calendar call so filtering happens BEFORE the
+   *     `slice(0, MAX_OFFERED_SLOTS)` truncation (the actual fix for the real "sábado" incident --
+   *     see domain/availability.ts's computeAvailableSlots).
+   *  3. The preference-filtered search finds nothing, but an UNFILTERED search of the same window
+   *     does -- REQUESTED_DATE_UNAVAILABLE, with that unfiltered result persisted as a real
+   *     fallback round (never a lie -- the caller's message-building must always attribute these
+   *     slots to "here's what IS available", never to the requested day).
+   * With `datePreference` omitted (undefined), this is byte-identical to before Fase 7I: exactly
+   * one Calendar call, exactly two possible outcomes (CREATED / NO_AVAILABILITY).
+   */
+  private async fetchAndPersistRound(lead: Lead, conversationId: string, now: Date, roundId: string, mode?: SlotOfferParams["mode"], datePreference?: DatePreference): Promise<SlotOfferOutcome> {
     const to = new Date(now.getTime() + config.BOOKING_MAX_DAYS_AHEAD * 86_400_000);
-    const available = await this.calendar.getAvailableSlots(now, to, config.MEETING_DURATION_MINUTES);
-    if (available.length === 0) return { type: "NO_AVAILABILITY" };
 
-    const chosen = available.slice(0, MAX_OFFERED_SLOTS);
+    if (datePreference?.targetDate !== undefined && datePreference.targetDate > localDateString(to, config.ADVISOR_TIMEZONE)) {
+      const fallback = await this.calendar.getAvailableSlots(now, to, config.MEETING_DURATION_MINUTES);
+      if (fallback.length === 0) return { type: "NO_AVAILABILITY" };
+      const { persisted, updatedLead } = await this.persistChosenSlots(lead, conversationId, roundId, now, mode, fallback);
+      return { type: "REQUESTED_DATE_UNAVAILABLE", reason: "OUT_OF_HORIZON", requestedPreference: datePreference, fallbackSlots: persisted, lead: updatedLead };
+    }
+
+    const available = datePreference
+      ? await this.calendar.getAvailableSlots(now, to, config.MEETING_DURATION_MINUTES, datePreference)
+      : await this.calendar.getAvailableSlots(now, to, config.MEETING_DURATION_MINUTES);
+
+    if (available.length > 0) {
+      const { persisted, updatedLead } = await this.persistChosenSlots(lead, conversationId, roundId, now, mode, available);
+      return { type: "CREATED", slots: persisted, lead: updatedLead };
+    }
+
+    if (!datePreference) return { type: "NO_AVAILABILITY" };
+
+    // The preference matched nothing (a closed day, or simply fully booked) -- fall back to an
+    // unfiltered search of the exact same window before concluding there's nothing at all.
+    const fallback = await this.calendar.getAvailableSlots(now, to, config.MEETING_DURATION_MINUTES);
+    if (fallback.length === 0) return { type: "NO_AVAILABILITY" };
+    const { persisted, updatedLead } = await this.persistChosenSlots(lead, conversationId, roundId, now, mode, fallback);
+    return { type: "REQUESTED_DATE_UNAVAILABLE", reason: "NO_SLOTS", requestedPreference: datePreference, fallbackSlots: persisted, lead: updatedLead };
+  }
+
+  /** Shared persistence step for every fetchAndPersistRound exit that actually has slots to
+   * offer (CREATED and both REQUESTED_DATE_UNAVAILABLE branches) -- never duplicated three times.
+   * `chosen` is truncated to MAX_OFFERED_SLOTS here, in exactly one place. */
+  private async persistChosenSlots(
+    lead: Lead,
+    conversationId: string,
+    roundId: string,
+    now: Date,
+    mode: SlotOfferParams["mode"] | undefined,
+    candidates: { start: Date; end: Date }[],
+  ): Promise<{ persisted: OfferedSlot[]; updatedLead: Lead }> {
+    const chosen = candidates.slice(0, MAX_OFFERED_SLOTS);
     const expiresAt = new Date(now.getTime() + OFFERED_SLOT_TTL_MS);
-
     const rescheduleContextId = rescheduleContextIdOf(mode);
     const persisted = await this.offeredSlots.createMany(
       chosen.map((slot, i) => ({
@@ -563,8 +650,7 @@ export class SlotOfferingService {
         rescheduleContextId,
       })),
     );
-
     const updatedLead = await this.ensureOfferableLeadStatus(lead, now, mode);
-    return { type: "CREATED", slots: persisted, lead: updatedLead };
+    return { persisted, updatedLead };
   }
 }

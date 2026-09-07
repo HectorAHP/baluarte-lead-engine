@@ -13,6 +13,7 @@ import { sendAndPersistReply, type BookingTurnHandler } from "./whatsapp-inbound
 import type { SlotOfferingService } from "./slot-offering-service.js";
 import { targetStatusForScore, type AppointmentService } from "./services.js";
 import { parseSlotSelection } from "../domain/slot-selection-parser.js";
+import { parseDatePreference } from "../domain/date-preference-parser.js";
 import { markLeadBooked, escalateToHuman, dispatchSlotOfferOutcome } from "./booking-outcome-dispatch.js";
 import { isBookingAbandonRequest } from "../domain/booking-abandon-intent-detection.js";
 import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
@@ -96,7 +97,7 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     // narrow/deterministic as before, unaffected for every OTHER caller/context).
     if ((lead.status === "QUALIFIED_A" || lead.status === "QUALIFIED_B" || lead.status === "NURTURE_C") && (isNewBookingRequest(inboundText) || bookingIntentOverride)) {
       try {
-        await this.startNewBooking(lead, conversationId, whatsappUserId, now);
+        await this.startNewBooking(lead, conversationId, whatsappUserId, now, inboundText);
       } catch (err) {
         await this.handleError(err, lead, conversationId, whatsappUserId);
       }
@@ -112,8 +113,11 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
    * abandon is still live (within its TTL), getOrCreateOffer reuses it as-is (item C.4 of the
    * pre-launch spec: "reofrecer/reutilizar ronda vigente si corresponde") -- otherwise a fresh one
    * is created, subject to the same MAX_OFFER_ROUNDS budget as any other booking round. */
-  private async startNewBooking(lead: Lead, conversationId: string, whatsappUserId: string, now: Date): Promise<void> {
-    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now });
+  private async startNewBooking(lead: Lead, conversationId: string, whatsappUserId: string, now: Date, inboundText: string): Promise<void> {
+    // Fase 7I: the SAME message that triggered this new-booking round ("quiero agendar en
+    // sábado") may itself carry a date preference -- parsed once here, never a second detector.
+    const datePreference = parseDatePreference(inboundText, now, this.advisorTimezone) ?? undefined;
+    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, datePreference });
     await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
   }
 
@@ -147,9 +151,27 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     if (activeSlots.length === 0) {
       // Nothing to interpret the inbound text against yet -- get (or create) an offer first.
       // Never attempts to parse inboundText as a selection when there was no active offer to
-      // select from.
-      const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now });
+      // select from. Fase 7I: this same text may carry a date preference ("quiero agendar en
+      // sábado" arriving right as the prior round just expired) -- parsed here too, so a fresh
+      // round is never blindly chronological when the lead already said which day they want.
+      const datePreference = parseDatePreference(inboundText, now, this.advisorTimezone) ?? undefined;
+      const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, datePreference });
       await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
+      return;
+    }
+
+    // Fase 7I (CAUSE_DATE_PREFERENCE_NOT_PARSED / item 15 of the spec): a NEW explicit date/time
+    // preference arriving while a round is already active REPLACES it, rather than falling
+    // through to parseSlotSelection's INVALID fallback (which would just repeat the SAME,
+    // possibly non-matching, options -- exactly the real "sábado" incident: the bot kept
+    // re-showing Monday). Checked BEFORE parseSlotSelection, using the SAME parser as every other
+    // call site here -- a bare number (never a date preference, see date-preference-parser.ts's
+    // own guard against colliding with "1"/"2") is completely unaffected and still falls straight
+    // through to the selection logic below, unchanged.
+    const newPreference = parseDatePreference(inboundText, now, this.advisorTimezone);
+    if (newPreference) {
+      const replaced = await this.deps.slotOffering.replaceOffer({ lead, conversationId, now, datePreference: newPreference });
+      await dispatchSlotOfferOutcome(this.deps, replaced, lead, conversationId, whatsappUserId, this.advisorTimezone);
       return;
     }
 

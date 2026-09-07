@@ -3,6 +3,7 @@ import { google, type calendar_v3 } from "googleapis";
 import type { CalendarProvider, CalendarSlot, CalendarEventInput, CalendarEventResult } from "../application/ports.js";
 import { CalendarProviderError, SlotUnavailableError } from "../domain/errors.js";
 import { computeAvailableSlots, clampAvailabilityWindow, isWithinBusinessHours, type AvailabilityRules, type BusyPeriod } from "../domain/availability.js";
+import type { DatePreference } from "../domain/date-preference.js";
 import { config } from "../config.js";
 
 export class GoogleCalendarProvider implements CalendarProvider {
@@ -28,12 +29,12 @@ export class GoogleCalendarProvider implements CalendarProvider {
     this.calendarApi = google.calendar({ version: "v3", auth });
   }
 
-  async getAvailableSlots(from: Date, to: Date, durationMinutes: number): Promise<CalendarSlot[]> {
+  async getAvailableSlots(from: Date, to: Date, durationMinutes: number, datePreference?: DatePreference): Promise<CalendarSlot[]> {
     const rules = this.rules();
     const { from: effectiveFrom, to: effectiveTo } = clampAvailabilityWindow(from, to, rules);
     if (effectiveFrom >= effectiveTo) return [];
     const busy = await this.fetchBusyPeriods(effectiveFrom, effectiveTo);
-    return computeAvailableSlots(from, to, durationMinutes, busy, rules);
+    return computeAvailableSlots(from, to, durationMinutes, busy, rules, new Date(), datePreference);
   }
 
   async isSlotAvailable(start: Date, end: Date): Promise<boolean> {

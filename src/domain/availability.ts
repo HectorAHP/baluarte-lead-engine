@@ -1,4 +1,5 @@
-import { zonedDateToUtc, zonedTimeParts } from "./timezone.js";
+import { zonedDateToUtc, zonedTimeParts, weekdayOfLocalDate, localDateString } from "./timezone.js";
+import { DAYPART_WINDOWS_MINUTES, type DatePreference } from "./date-preference.js";
 
 export interface Slot {
   start: Date;
@@ -100,14 +101,56 @@ export function computeAvailableSlots(
   busy: BusyPeriod[],
   rules: AvailabilityRules,
   now: Date = new Date(),
+  datePreference?: DatePreference,
 ): Slot[] {
   const { from: effectiveFrom, to: effectiveTo } = clampAvailabilityWindow(from, to, rules, now);
   if (effectiveFrom >= effectiveTo) return [];
 
   const candidates = enumerateWorkdaySlots(effectiveFrom, effectiveTo, durationMinutes, rules);
   const free = candidates.filter((slot) => !busy.some((b) => slot.start < b.end && slot.end > b.start));
-  free.sort((a, b) => a.start.getTime() - b.start.getTime());
-  return free.slice(0, rules.maxSlots);
+  // Fase 7I -- CRITICAL ordering: the date-preference filter runs AFTER business-hours
+  // (enumerateWorkdaySlots) and busy-period filtering, but BEFORE sort+slice(0, maxSlots). This is
+  // what actually fixes CAUSE_DATE_PREFERENCE_NOT_PARSED/the real "sábado" incident -- filtering
+  // AFTER truncating to maxSlots (3) would have silently dropped every Saturday slot whenever any
+  // earlier weekday had availability first, no matter how correctly a preference was parsed.
+  const preferred = filterSlotsByDatePreference(free, datePreference, rules.timezone);
+  preferred.sort((a, b) => a.start.getTime() - b.start.getTime());
+  return preferred.slice(0, rules.maxSlots);
+}
+
+/**
+ * Fase 7I -- keeps only the candidate slots matching a user-expressed DatePreference. Returns
+ * `candidates` completely unchanged (same array reference contents, same order) when `preference`
+ * is undefined -- the overwhelmingly common case, and the exact guarantee that makes every
+ * pre-existing (no-preference) caller's behavior byte-identical to before this feature existed.
+ *
+ * `targetDate` and `weekday` are evaluated independently (the parser never sets both on the same
+ * preference, but this function doesn't assume that -- both checks simply apply if present) and
+ * `daypart` combines with either: a slot must satisfy ALL fields that are actually set. A slot
+ * must fit ENTIRELY inside a requested daypart window (start >= window start AND end <= window
+ * end) -- never partially, so a slot straddling a boundary belongs to neither window and is
+ * excluded from both (this only matters for a slot duration that doesn't evenly divide the
+ * business's own hour boundaries, which today's 30-minute slots never do at 9/12/18:00).
+ */
+export function filterSlotsByDatePreference(candidates: Slot[], preference: DatePreference | undefined, timezone: string): Slot[] {
+  if (!preference) return candidates;
+  return candidates.filter((slot) => {
+    const startParts = zonedTimeParts(slot.start, timezone);
+    if (preference.targetDate !== undefined && localDateString(slot.start, timezone) !== preference.targetDate) {
+      return false;
+    }
+    if (preference.weekday !== undefined && weekdayOfLocalDate(startParts.year, startParts.month, startParts.day) !== preference.weekday) {
+      return false;
+    }
+    if (preference.daypart !== undefined) {
+      const endParts = zonedTimeParts(slot.end, timezone);
+      const window = DAYPART_WINDOWS_MINUTES[preference.daypart];
+      const startMinute = startParts.hour * 60 + startParts.minute;
+      const endMinute = endParts.hour * 60 + endParts.minute;
+      if (startMinute < window.startMinute || endMinute > window.endMinute) return false;
+    }
+    return true;
+  });
 }
 
 function enumerateWorkdaySlots(from: Date, to: Date, durationMinutes: number, rules: AvailabilityRules): Slot[] {

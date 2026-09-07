@@ -1,19 +1,31 @@
 import { randomUUID } from "node:crypto";
 import type { CalendarProvider, CalendarSlot, CalendarEventInput, CalendarEventResult } from "../application/ports.js";
 import { SlotUnavailableError } from "../domain/errors.js";
+import { filterSlotsByDatePreference } from "../domain/availability.js";
+import type { DatePreference } from "../domain/date-preference.js";
 
 export class FakeCalendarProvider implements CalendarProvider {
   private busy: Array<{ id: string; start: Date; end: Date }> = [];
 
-  async getAvailableSlots(from: Date, to: Date, durationMinutes: number): Promise<CalendarSlot[]> {
-    const out: CalendarSlot[] = [];
+  /**
+   * Fase 7I -- `datePreference` (when given) is applied via the REAL
+   * filterSlotsByDatePreference (never a second, duplicate implementation), BEFORE the existing
+   * `out.length >= 3` truncation below -- same "filter before truncate" ordering
+   * domain/availability.ts's computeAvailableSlots enforces for the real provider. This fake still
+   * has NO real business-hours concept (see isWithinBusinessHours's own doc comment just below --
+   * that stays deliberately permissive) -- date-preference filtering is an orthogonal concern:
+   * with `datePreference` omitted (every pre-existing call site), this method is byte-identical to
+   * before this feature existed.
+   */
+  async getAvailableSlots(from: Date, to: Date, durationMinutes: number, datePreference?: DatePreference): Promise<CalendarSlot[]> {
+    const candidates: CalendarSlot[] = [];
     const d = durationMinutes * 60000;
     for (let c = from.getTime(); c + d <= to.getTime(); c += d) {
       const start = new Date(c), end = new Date(c + d);
-      if (await this.isSlotAvailable(start, end)) out.push({ start, end });
-      if (out.length >= 3) break;
+      if (await this.isSlotAvailable(start, end)) candidates.push({ start, end });
     }
-    return out;
+    const filtered = filterSlotsByDatePreference(candidates, datePreference, "America/Mexico_City");
+    return filtered.slice(0, 3);
   }
 
   async isSlotAvailable(start: Date, end: Date) {

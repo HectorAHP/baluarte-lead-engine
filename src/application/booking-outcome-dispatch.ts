@@ -8,7 +8,7 @@ import { recordLeadStatusTransition } from "./lead-status-audit.js";
 import { conversationalFirstName } from "../domain/conversation-name.js";
 import {
   buildSlotOfferMessage, buildBookingStartIntro, SLOT_UNAVAILABLE_INTRO, buildExistingBookingMessage, formatSlotForDisplay,
-  BOOKING_NO_AVAILABILITY_MESSAGE, QUALIFIER_HUMAN_HANDOFF_MESSAGE,
+  BOOKING_NO_AVAILABILITY_MESSAGE, QUALIFIER_HUMAN_HANDOFF_MESSAGE, buildRequestedDateUnavailableMessage,
 } from "../domain/message-templates.js";
 
 export interface BookingOutcomeDeps {
@@ -152,6 +152,17 @@ export async function dispatchSlotOfferOutcome(
       return;
     case "MAX_ROUNDS_REACHED":
       await escalateToHuman(deps, lead, conversationId, whatsappUserId);
+      return;
+    // Fase 7I: the lead asked for a specific day/date/daypart that produced zero matches, but a
+    // real fallback round WAS created and persisted (same as CREATED) -- never silence, never
+    // presented as if it matched the request. No lead-status write here: fetchAndPersistRound
+    // already performed the exact same ensureOfferableLeadStatus transition CREATED/REUSED rely
+    // on, before this outcome was ever returned.
+    case "REQUESTED_DATE_UNAVAILABLE":
+      await sendAndPersistReply(
+        deps, lead.id, conversationId, whatsappUserId,
+        buildRequestedDateUnavailableMessage(outcome.reason, outcome.fallbackSlots, advisorTimezone),
+      );
       return;
   }
 }

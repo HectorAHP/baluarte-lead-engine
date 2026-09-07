@@ -2,6 +2,7 @@ import type { Lead } from "../domain/lead.js";
 import { isCancellationRequest } from "../domain/cancellation-intent-detection.js";
 import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
+import { parseDatePreference } from "../domain/date-preference-parser.js";
 import { detectQualifiedLeadIntent } from "../domain/qualified-lead-intent-detection.js";
 import { qualifiedMainMenuMetadata, qualifiedOptionsMenuMetadata } from "../domain/qualified-lead-menu-state.js";
 import { pastBookedReactivationMetadata, hasPastBookedReactivationBeenShown } from "../domain/past-booked-reactivation-state.js";
@@ -100,7 +101,7 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
       // booking-adjacent text, but only this branch sends the acknowledgment first).
       if (isRescheduleRequest(inboundText)) {
         await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, PAST_BOOKED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE);
-        await this.startNewBooking(lead, conversationId, whatsappUserId, now);
+        await this.startNewBooking(lead, conversationId, whatsappUserId, now, inboundText);
         return;
       }
 
@@ -112,7 +113,7 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
       // comment) -- this is THE fix for "agendar" landing on HUMAN_HANDOFF instead of real
       // availability.
       if (isNewBookingRequest(inboundText)) {
-        await this.startNewBooking(lead, conversationId, whatsappUserId, now);
+        await this.startNewBooking(lead, conversationId, whatsappUserId, now, inboundText);
         return;
       }
 
@@ -184,7 +185,7 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
           // KEYWORDS) catches but isNewBookingRequest's phrase list above didn't -- same action,
           // no separate acknowledgment (the intent is already unambiguous, same reasoning as the
           // isNewBookingRequest branch above).
-          await this.startNewBooking(lead, conversationId, whatsappUserId, now);
+          await this.startNewBooking(lead, conversationId, whatsappUserId, now, inboundText);
           return;
         case "IDENTITY":
           await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE);
@@ -239,8 +240,11 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
    * guard above already ensures that), so `skipRoundCap: true` is unconditional here -- there is
    * no other kind of call this method ever makes.
    */
-  private async startNewBooking(lead: Lead, conversationId: string, whatsappUserId: string, now: Date): Promise<void> {
-    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, skipRoundCap: true });
+  private async startNewBooking(lead: Lead, conversationId: string, whatsappUserId: string, now: Date, inboundText: string): Promise<void> {
+    // Fase 7I: same parser as every other booking/reschedule entry point -- never a second,
+    // divergent implementation.
+    const datePreference = parseDatePreference(inboundText, now, this.advisorTimezone) ?? undefined;
+    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, skipRoundCap: true, datePreference });
     await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
   }
 

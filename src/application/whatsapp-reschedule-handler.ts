@@ -14,6 +14,7 @@ import { escalateToHuman, dispatchSlotOfferOutcome, type BookingOutcomeDeps } fr
 import type { SlotOfferingService } from "./slot-offering-service.js";
 import type { AppointmentRescheduleService } from "./appointment-reschedule-service.js";
 import { parseSlotSelection } from "../domain/slot-selection-parser.js";
+import { parseDatePreference } from "../domain/date-preference-parser.js";
 import {
   RESCHEDULE_INTRO_MESSAGE, buildRescheduleConfirmedMessage, RESCHEDULE_TECHNICAL_ERROR_MESSAGE,
   RESCHEDULE_IN_PROGRESS_MESSAGE, buildInvalidSelectionMessage, buildReschedulePendingFallbackMessage,
@@ -68,7 +69,7 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
 
     try {
       if (lead.status === "BOOKED") {
-        await this.handleIntentTurn(lead, conversationId, whatsappUserId, now);
+        await this.handleIntentTurn(lead, conversationId, whatsappUserId, now, inboundText);
       } else {
         await this.handleRescheduleRequestedTurn(lead, conversationId, whatsappUserId, inboundText, now);
       }
@@ -84,7 +85,7 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
    * see that file's routing comment). This method's job is purely: find the target appointment,
    * transition the lead, and kick off slot offering in RESCHEDULE mode.
    */
-  private async handleIntentTurn(lead: Lead, conversationId: string, whatsappUserId: string, now: Date): Promise<void> {
+  private async handleIntentTurn(lead: Lead, conversationId: string, whatsappUserId: string, now: Date, inboundText: string): Promise<void> {
     const oldAppointment = await this.findTargetAppointment(lead.id);
     if (oldAppointment === "INCONSISTENT") throw new AppointmentRescheduleInconsistentError(lead.id, "MULTIPLE_APPOINTMENTS");
     if (!oldAppointment) throw new AppointmentRescheduleInconsistentError(lead.id, "NO_APPOINTMENT");
@@ -92,7 +93,10 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     const updatedLead = await this.transitionLead(lead, "RESCHEDULE_REQUESTED", "RESCHEDULE_REQUESTED");
     await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, RESCHEDULE_INTRO_MESSAGE);
 
-    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead: updatedLead, conversationId, now, mode: { type: "RESCHEDULE", oldAppointmentId: oldAppointment.id } });
+    // Fase 7I: the SAME message that carried the reschedule-intent ("reagendar para el sábado")
+    // may itself carry a date preference -- parsed once here, same parser as booking.
+    const datePreference = parseDatePreference(inboundText, now, this.advisorTimezone) ?? undefined;
+    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead: updatedLead, conversationId, now, mode: { type: "RESCHEDULE", oldAppointmentId: oldAppointment.id }, datePreference });
     await dispatchSlotOfferOutcome(this.deps, outcome, updatedLead, conversationId, whatsappUserId, this.advisorTimezone);
   }
 
@@ -119,9 +123,19 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     if (activeSlots.length === 0) {
       // Nothing to interpret the inbound text against (e.g. the round expired, or this is a
       // recovery retry) -- get (or create) a fresh offer first, same bootstrap as
-      // WhatsAppBookingHandler.
-      const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, mode: rescheduleMode });
+      // WhatsAppBookingHandler. Fase 7I: this same text may carry a date preference.
+      const datePreference = parseDatePreference(inboundText, now, this.advisorTimezone) ?? undefined;
+      const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, mode: rescheduleMode, datePreference });
       await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
+      return;
+    }
+
+    // Fase 7I: same "a new explicit preference replaces the active round" rule as
+    // WhatsAppBookingHandler -- checked BEFORE parseSlotSelection so a bare number is unaffected.
+    const newPreference = parseDatePreference(inboundText, now, this.advisorTimezone);
+    if (newPreference) {
+      const replaced = await this.deps.slotOffering.replaceOffer({ lead, conversationId, now, mode: rescheduleMode, datePreference: newPreference });
+      await dispatchSlotOfferOutcome(this.deps, replaced, lead, conversationId, whatsappUserId, this.advisorTimezone);
       return;
     }
 
