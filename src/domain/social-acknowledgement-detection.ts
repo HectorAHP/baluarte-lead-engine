@@ -44,3 +44,49 @@ function normalize(text: string): string {
 export function isSocialAcknowledgement(text: string): boolean {
   return ACKNOWLEDGEMENT_PHRASES.has(normalize(text));
 }
+
+/**
+ * A bare greeting/opener ("hola", "buenas", "hey", ...) -- distinct from an acknowledgement (this
+ * is the START of a turn, not the end of one), but the same reasoning applies: it carries no
+ * semantic content of its own to classify, so it is never grounds for escalating to a human or
+ * repeating a menu. Same exact-match, closed-list discipline as isSocialAcknowledgement above --
+ * "Hola, tengo una duda sobre mi seguro" is NOT a bare greeting here, only the literal opener
+ * alone is.
+ */
+const GREETING_PHRASES: ReadonlySet<string> = new Set([
+  "hola",
+  "hi",
+  "hello",
+  "hey",
+  "buenas",
+  "buenos dias",
+  "buenas tardes",
+  "buenas noches",
+]);
+
+export function isBareGreeting(text: string): boolean {
+  return GREETING_PHRASES.has(normalize(text));
+}
+
+/**
+ * A bare expression of indecision ("no sé", "cualquiera", "no importa", ...) in reply to a
+ * slot-selection prompt -- still squarely ABOUT the active booking decision (the lead can't
+ * choose, they're not raising a new, unrelated topic), so this is grouped with the other two
+ * closed-list carve-outs above: never grounds to escalate a WhatsApp turn to a human, or to treat
+ * it as a genuinely unrelated message. Reuses this file's shared `normalize` (exact-match only,
+ * same discipline as isSocialAcknowledgement/isBareGreeting).
+ */
+const INDECISION_PHRASES: ReadonlySet<string> = new Set([
+  "no se",
+  "no se cual",
+  "no se cual escoger",
+  "no se cual elegir",
+  "cualquiera",
+  "no importa",
+  "me da igual",
+  "no tengo preferencia",
+]);
+
+export function isBookingIndecisionReply(text: string): boolean {
+  return INDECISION_PHRASES.has(normalize(text));
+}

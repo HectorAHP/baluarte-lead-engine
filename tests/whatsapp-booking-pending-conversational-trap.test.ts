@@ -9,6 +9,7 @@ import {
   InMemoryAppointmentRescheduleRepository,
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
+import { UNKNOWN_INTENT_HANDOFF_MESSAGE } from "../src/domain/message-templates.js";
 import type { Lead, LeadStatus } from "../src/domain/lead.js";
 
 /**
@@ -164,7 +165,13 @@ describe("Pre-launch hardening -- BOOKING_PENDING conversational trap", () => {
     expect(await repos.appointmentsRepo.listAllByLeadId(lead.id)).toEqual([]);
   });
 
-  it("4: BOOKING_PENDING + '¿Cuáles son los servicios?' -> no slot reminder, lead stays BOOKING_PENDING", async () => {
+  it("4: BOOKING_PENDING + '¿Cuáles son los servicios?' -> UNKNOWN_INTENT_HANDOFF, never a repeated/irrelevant slot reminder", async () => {
+    // Fase 7J product decision (docs/security/FASE7J-UNKNOWN-INTENT-HANDOFF.md): before this
+    // phase, ANY unrecognized text (including a real, unrelated question) got the SAME slot
+    // reminder forever -- this test used to assert exactly that. The new rule: a message that is
+    // semantically unrelated to the active booking flow (not a plausible slot-selection attempt,
+    // not an acknowledgement/greeting) escalates to a human instead of repeating an irrelevant
+    // menu indefinitely.
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214778891004", "BOOKING_PENDING");
@@ -173,11 +180,11 @@ describe("Pre-launch hardening -- BOOKING_PENDING conversational trap", () => {
     await send(app, "5214778891004", "wamid.g4a", "¿Cuáles son los servicios?");
 
     const finalLead = await repos.leadsRepo.findById(lead.id);
-    expect(finalLead?.status).toBe("BOOKING_PENDING");
+    expect(finalLead?.status).toBe("HUMAN_HANDOFF");
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(1);
     expect(outbound[0].body).not.toContain("Por favor responde");
-    expect(outbound[0].body).toContain("Estamos en el proceso de agendar tu cita");
+    expect(outbound[0].body).toBe(UNKNOWN_INTENT_HANDOFF_MESSAGE);
   });
 
   it("5: BOOKING_PENDING + 'Hola quiero información' -> no slot reminder", async () => {
@@ -193,7 +200,13 @@ describe("Pre-launch hardening -- BOOKING_PENDING conversational trap", () => {
     expect(outbound[0].body).not.toContain("Por favor responde");
   });
 
-  it("6: BOOKING_PENDING + texto basura -> recoverable fallback, no dangerous mutation", async () => {
+  it("6: BOOKING_PENDING + texto basura -> UNKNOWN_INTENT_HANDOFF, no dangerous mutation", async () => {
+    // Fase 7J product decision (docs/security/FASE7J-UNKNOWN-INTENT-HANDOFF.md): unparseable
+    // gibberish is exactly the kind of message the router cannot safely classify -- it now
+    // escalates to a human instead of repeating the slot reminder forever (this test used to
+    // assert the reminder). Still "recoverable" and "no dangerous mutation" in the sense that
+    // matters: no appointment is created, score/product/qualification data are untouched, and the
+    // lead reaches a state (HUMAN_HANDOFF) a human can act on.
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214778891006", "BOOKING_PENDING", { score: 71, scoreClass: "B", productInterest: "GMM" });
@@ -202,13 +215,50 @@ describe("Pre-launch hardening -- BOOKING_PENDING conversational trap", () => {
     await send(app, "5214778891006", "wamid.g6a", "asdkjfh qlwkejr");
 
     const finalLead = await repos.leadsRepo.findById(lead.id);
-    expect(finalLead?.status).toBe("BOOKING_PENDING");
+    expect(finalLead?.status).toBe("HUMAN_HANDOFF");
     expect(finalLead?.score).toBe(71);
     expect(finalLead?.scoreClass).toBe("B");
     expect(finalLead?.productInterest).toBe("GMM");
     expect(await repos.appointmentsRepo.listAllByLeadId(lead.id)).toEqual([]);
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(1);
+    expect(outbound[0].body).toBe(UNKNOWN_INTENT_HANDOFF_MESSAGE);
+  });
+
+  it("6b: BOOKING_PENDING + '7' (out-of-range slot number, only 3 exist) -> keeps the existing slot-reminder fallback, never escalates", async () => {
+    // Fase 7J explicit carve-out: a number-shaped reply is still a plausible selection attempt
+    // (a typo, or a stale offer the lead remembers differently), not a new, unrelated topic --
+    // this exact "wrong-but-plausible selection" behavior (item C.3) must NOT change.
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
+    const { lead, conversation } = await createLeadAtStatus(repos, "5214778891012", "BOOKING_PENDING");
+    await seedActiveRound(repos, lead.id, conversation.id);
+
+    await send(app, "5214778891012", "wamid.g12a", "7");
+
+    const finalLead = await repos.leadsRepo.findById(lead.id);
+    expect(finalLead?.status).toBe("BOOKING_PENDING");
+    const outbound = await outboundMessages(repos, conversation.id);
+    expect(outbound).toHaveLength(1);
+    expect(outbound[0].body).toContain("Estamos en el proceso de agendar tu cita");
+  });
+
+  it("6c: BOOKING_PENDING + 'hola' (bare greeting) -> keeps the existing slot-reminder fallback, never escalates", async () => {
+    // Fase 7J explicit carve-out: a bare greeting carries no semantic content of its own to
+    // classify -- same reasoning as a trivial acknowledgement (isSocialAcknowledgement). Escalating
+    // a plain "hola" would be a false positive, not a genuinely unsupported message.
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
+    const { lead, conversation } = await createLeadAtStatus(repos, "5214778891013", "BOOKING_PENDING");
+    await seedActiveRound(repos, lead.id, conversation.id);
+
+    await send(app, "5214778891013", "wamid.g13a", "hola");
+
+    const finalLead = await repos.leadsRepo.findById(lead.id);
+    expect(finalLead?.status).toBe("BOOKING_PENDING");
+    const outbound = await outboundMessages(repos, conversation.id);
+    expect(outbound).toHaveLength(1);
+    expect(outbound[0].body).toContain("Estamos en el proceso de agendar tu cita");
   });
 
   it("7: after abandoning BOOKING_PENDING, 'agendar' resumes and offers slots again", async () => {
@@ -274,6 +324,25 @@ describe("Pre-launch hardening -- BOOKING_PENDING conversational trap", () => {
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(1);
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("QUALIFIED_B");
+  });
+
+  it("11: after UNKNOWN_INTENT_HANDOFF, a further message stays silent -- terminal suppression, never a repeated escalation or a second message", async () => {
+    // Fase 7J item 15 (idempotency) + the pre-existing, protected DO_NOT_CONTACT/HUMAN_HANDOFF
+    // suppression in whatsapp-inbound-service.ts's wasAlreadySuppressed check: once escalated, the
+    // lead must stop receiving automated replies entirely, not just avoid re-escalating.
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
+    const { lead, conversation } = await createLeadAtStatus(repos, "5214778891014", "BOOKING_PENDING");
+    await seedActiveRound(repos, lead.id, conversation.id);
+
+    await send(app, "5214778891014", "wamid.g14a", "¿Cuáles son los servicios?");
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF");
+
+    await send(app, "5214778891014", "wamid.g14b", "hola, siguen ahi?");
+
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF"); // unchanged
+    const outbound = await outboundMessages(repos, conversation.id);
+    expect(outbound).toHaveLength(1); // only the original escalation message -- never a second one
   });
 
   it("flag-off regression: with WHATSAPP_BOOKING_ENABLED off, BOOKING_PENDING is never reached by this handler (byte-for-byte prior behavior)", async () => {

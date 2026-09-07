@@ -14,6 +14,7 @@ import type { SlotOfferingService } from "./slot-offering-service.js";
 import { targetStatusForScore, type AppointmentService } from "./services.js";
 import { parseSlotSelection } from "../domain/slot-selection-parser.js";
 import { parseDatePreference } from "../domain/date-preference-parser.js";
+import { isSocialAcknowledgement, isBareGreeting, isBookingIndecisionReply } from "../domain/social-acknowledgement-detection.js";
 import { markLeadBooked, escalateToHuman, dispatchSlotOfferOutcome } from "./booking-outcome-dispatch.js";
 import { isBookingAbandonRequest } from "../domain/booking-abandon-intent-detection.js";
 import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
@@ -25,7 +26,7 @@ import {
   buildInvalidSelectionMessage, buildBookingConfirmedMessage, buildExistingBookingMessage,
   buildBookingPendingFallbackMessage, BOOKING_ABANDONED_MESSAGE,
   BOOKING_IN_PROGRESS_MESSAGE, BOOKING_TECHNICAL_ERROR_MESSAGE, SLOT_OFFER_CLAIM_IN_PROGRESS_MESSAGE,
-  formatSlotForDisplay,
+  formatSlotForDisplay, UNKNOWN_INTENT_HANDOFF_MESSAGE,
 } from "../domain/message-templates.js";
 import { config } from "../config.js";
 
@@ -178,20 +179,46 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     const selection = parseSlotSelection(inboundText, activeSlots, now);
 
     if (selection.type === "INVALID") {
-      // Pre-launch hardening (item C.3): a general question ("¿Cuáles son los servicios?") or any
-      // other unrecognized text no longer gets the terse "Por favor responde 1, 2 o 3" reminder --
-      // buildBookingPendingFallbackMessage restates the SAME active options (so item C.4's
-      // "reofrecer ronda vigente" still holds for a vague retry) but frames it informatively and
-      // names the abandon escape hatch, instead of only ever repeating the same instruction.
-      // Reuses the SAME active offered_slots already loaded above -- never a new round, never a
-      // new Calendar call.
-      //
-      // Fase 7J audit note: evaluated escalating genuinely unrelated content (vs. this generic
-      // reminder) here instead -- reverted after the full suite showed it conflicts with this
-      // exact hardening contract (e.g. gibberish input is explicitly expected to land here, not
-      // escalate -- see whatsapp-booking-pending-conversational-trap.test.ts). See the Fase 7J
-      // report for the conflict and the options for reconciling it.
-      await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildBookingPendingFallbackMessage(activeSlots, this.advisorTimezone));
+      // Fase 7J (product decision, see docs/security/FASE7J-UNKNOWN-INTENT-HANDOFF.md): split
+      // "plausibly still part of this exact slot-selection attempt" from "semantically unrelated
+      // to booking", built ONLY from signals with an existing, narrow, exact-match/pattern
+      // definition (never a new keyword/topic heuristic, never an LLM):
+      //  - a number-shaped reply (e.g. "7" when only 3 positions exist, or "opcion 5") -- still a
+      //    plausible selection attempt, not a new topic. Kept EXACTLY as before: the informative
+      //    reminder (item C.3), restating the SAME active options, never a new round.
+      //  - a trivial acknowledgement ("gracias"), a bare greeting ("hola"), or an expression of
+      //    indecision about which slot ("no sé", "cualquiera") -- none carry semantic content
+      //    that constitutes a new, unrelated topic; also kept on the same reminder, unchanged from
+      //    before this phase (these were never silent here, and inventing a NEW silent branch for
+      //    them would be its own, unreviewed behavior change).
+      //  - text isNewBookingRequest already recognizes (e.g. a bare "agendar", exactly what
+      //    PAST_BOOKED_GENERIC_INBOUND_MESSAGE/CANCELLED_GENERIC_INBOUND_MESSAGE instruct a lead
+      //    to reply with) -- unambiguously about booking, reused verbatim from Fase 6E.2, never a
+      //    new pattern list.
+      //  - anything else (a real question -- "¿Cuáles son los servicios?" -- or genuinely
+      //    unparseable content) -- escalates instead of repeating the same three slots forever.
+      //    Reuses escalateToHuman verbatim (never a second, parallel handoff mechanism), with its
+      //    own distinct eventType and copy so this cause is never conflated with a genuine booking
+      //    data-consistency error (handleError's ActiveOfferInconsistentError/
+      //    BookingAttemptInconsistentError branch, untouched) nor with the generic
+      //    QUALIFIER_HUMAN_HANDOFF_MESSAGE.
+      const looksLikeSelectionAttempt = /^(?:opcion |la |el )?[1-9]\d*$/i.test(inboundText.trim());
+      if (
+        looksLikeSelectionAttempt
+        || isSocialAcknowledgement(inboundText)
+        || isBareGreeting(inboundText)
+        || isBookingIndecisionReply(inboundText)
+        || isNewBookingRequest(inboundText)
+      ) {
+        // Pre-launch hardening (item C.3): buildBookingPendingFallbackMessage restates the SAME
+        // active options (so item C.4's "reofrecer ronda vigente" still holds for a vague retry)
+        // but frames it informatively and names the abandon escape hatch, instead of only ever
+        // repeating the same instruction. Reuses the SAME active offered_slots already loaded
+        // above -- never a new round, never a new Calendar call.
+        await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildBookingPendingFallbackMessage(activeSlots, this.advisorTimezone));
+        return;
+      }
+      await escalateToHuman(this.deps, lead, conversationId, whatsappUserId, "UNKNOWN_INTENT_HANDOFF", UNKNOWN_INTENT_HANDOFF_MESSAGE);
       return;
     }
 

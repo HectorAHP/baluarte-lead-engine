@@ -95,6 +95,11 @@ export async function escalateToHuman(
   conversationId: string,
   whatsappUserId: string,
   eventType: string = "BOOKING_INCONSISTENCY_HANDOFF",
+  // Fase 7J: optional override, defaulting to the original copy so every existing call site
+  // (the booking data-consistency error path) keeps sending byte-identical text. Lets a distinct
+  // cause (e.g. "UNKNOWN_INTENT_HANDOFF") use its own copy without a second, parallel handoff
+  // mechanism -- see UNKNOWN_INTENT_HANDOFF_MESSAGE's own doc comment for why the wording differs.
+  message: string = QUALIFIER_HUMAN_HANDOFF_MESSAGE,
 ): Promise<void> {
   const target: LeadStatus = "HUMAN_HANDOFF";
   if (lead.status !== target) {
@@ -108,7 +113,7 @@ export async function escalateToHuman(
     });
   }
   await deps.conversations.update(conversationId, { status: "HUMAN_HANDOFF" });
-  await sendAndPersistReply(deps, lead.id, conversationId, whatsappUserId, QUALIFIER_HUMAN_HANDOFF_MESSAGE);
+  await sendAndPersistReply(deps, lead.id, conversationId, whatsappUserId, message);
 }
 
 /**

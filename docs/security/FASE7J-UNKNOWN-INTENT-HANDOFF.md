@@ -1,4 +1,4 @@
-# FASE 7J — Unknown Intent → Human Handoff (auditoría + intento de implementación, revertido)
+# FASE 7J — Unknown Intent → Human Handoff (auditoría, revertido, y decisión de producto §10)
 
 ## 1. Resumen ejecutivo
 
@@ -7,9 +7,14 @@ Se intentó implementar el fallback final del router (`whatsapp-inbound-service.
 intent/flujo soportado. La implementación inicial (commit no pusheado, revertido en esta misma
 rama) rompió **20 tests en 10 archivos** de la suite completa (de 128 archivos/1548 tests en verde
 a 115/1523, con 13 archivos/25 tests fallando tras incluir el nuevo archivo de tests). Se
-diagnosticó la causa raíz, se revirtió la parte que causaba la regresión, y se documenta aquí el
-conflicto estructural encontrado para que Héctor decida cómo proceder — **no se forzó ningún
-cambio que rompiera un contrato de test ya existente.**
+diagnosticó la causa raíz, se revirtió la parte que causaba la regresión, y se documentó el
+conflicto estructural encontrado (§3, §4) para que Héctor decidiera cómo proceder.
+
+**Actualización — decisión de producto tomada:** Héctor revisó el conflicto y decidió explícitamente
+relajar, de forma acotada, únicamente los tests de §4 (BOOKING_PENDING) cuyo comportamiento
+esperado contradecía la nueva regla de negocio, dejando intactos §3 (los casos de flag apagado) y
+todos los tests de hardening/seguridad no relacionados. Ver §10 para la implementación final,
+qué tests cambiaron y por qué, y la confirmación de que ninguna otra protección se debilitó.
 
 ## 2. Auditoría del orden de routing (`whatsapp-inbound-service.ts`, ítem 1 del spec)
 
@@ -161,7 +166,7 @@ archivos que el spec de esta fase pidió explícitamente NO tocar (ítem 19).
 Sin una de estas dos decisiones explícitas, cualquier implementación de la escalada real
 necesariamente rompe tests de hardening ya aprobados — por eso se revirtió en vez de forzarla.
 
-## 9. Validación final
+## 9. Validación de la fase de reversión (previa a §10)
 
 - `npm run typecheck` — limpio.
 - `npm run build` — limpio.
@@ -170,5 +175,133 @@ necesariamente rompe tests de hardening ya aprobados — por eso se revirtió en
 - `npm audit --production` — 4 vulnerabilidades moderadas preexistentes, no relacionadas con esta
   fase (`uuid` vía `googleapis`/`gaxios`/`googleapis-common`; el fix requiere un upgrade breaking
   de `googleapis` — fuera de alcance, no aplicado).
+
+## 10. Decisión de producto e implementación final
+
+Héctor decidió explícitamente (ver el prompt de esta fase): **Opción A, acotada solo a §4
+(BOOKING_PENDING), NO a §3 (los casos de flag apagado).** Regla de negocio explícita: un mensaje
+realmente no soportado (`UNKNOWN_INTENT`) debe escalar de inmediato a `HUMAN_HANDOFF` -- nunca
+silencio, nunca una respuesta inventada, nunca repetir un menú irrelevante indefinidamente -- pero
+sin relajar NINGÚN test de seguridad de forma global, y conservando explícitamente: DO_NOT_CONTACT,
+supresión terminal de HUMAN_HANDOFF, idempotencia/deduplicación, autenticación/admin, firma del
+webhook de Meta, rate limiting, `BOOKING_INCONSISTENCY_HANDOFF`, `MAX_ROUNDS_REACHED`,
+cancelación, reagenda, preferencias de fecha, reagenda contextual, acuses/mensajes sociales
+conocidos, selección numérica de slots, y los flujos de booking/qualification ya conocidos.
+
+### 10.1 Alcance: solo BOOKING_PENDING, NO BOOKED
+
+`BOOKED`-genérico (§4, primera mitad) se dejó **intacto, sin ningún cambio** -- los tests que lo
+protegen (`whatsapp-booked-generic-fallback-e2e.test.ts`, ese archivo entero está construido
+alrededor de un post-mortem real, "post-mortem item A") son más numerosos, más antiguos, y cubren
+un incidente de producción específico ya documentado como tal. La instrucción explícita de Héctor
+daba UN ejemplo concreto, y ese ejemplo era exclusivamente sobre `BOOKING_PENDING`:
+
+> Antes: BOOKING_PENDING + gibberish → repite menú/no escalation
+> Ahora: BOOKING_PENDING + mensaje semánticamente ajeno a booking → UNKNOWN_INTENT_HANDOFF
+
+Se interpretó "mínimo cambio de superficie posible" como razón suficiente para NO extender el
+mismo cambio a `BOOKED` sin una instrucción igual de explícita para esa rama -- queda como
+decisión pendiente, a confirmar en una fase futura si Héctor lo pide.
+
+### 10.2 Implementación
+
+`WhatsAppBookingHandler`'s `selection.type === "INVALID"` branch
+([whatsapp-booking-handler.ts](../../src/application/whatsapp-booking-handler.ts)) ahora distingue,
+usando ÚNICAMENTE señales deterministas ya existentes o de definición igual de estrecha (nunca un
+nuevo heurístico de temas/keywords, nunca un LLM):
+
+**Se queda con el fallback existente** (`buildBookingPendingFallbackMessage`, sin cambio, sin
+escalar) cuando el texto es:
+- un intento de selección numérica, en o fuera de rango (`/^(?:opcion |la |el )?[1-9]\d*$/i`) --
+  sin cambio, ya existía.
+- un acuse social exacto ("gracias", "ok", "👍", ...) -- `isSocialAcknowledgement`
+  ([social-acknowledgement-detection.ts](../../src/domain/social-acknowledgement-detection.ts)).
+- un saludo simple exacto ("hola", "buenas", ...) -- nueva función `isBareGreeting`, mismo archivo.
+  Necesario porque `tests/whatsapp-booking-e2e.test.ts`'s test K usa "hola" como texto INVALID
+  representativo y espera el fallback existente, no una escalada.
+- una expresión de indecisión exacta ("no sé", "cualquiera", "no importa", ...) -- nueva función
+  `isBookingIndecisionReply`, mismo archivo. Necesario porque
+  `tests/whatsapp-booking-handler.test.ts`'s test C usa "no se" como respuesta a un prompt de
+  selección de slot -- sigue siendo sobre la MISMA decisión de booking, no un tema nuevo.
+- texto que `isNewBookingRequest` ya reconoce (p. ej. un "agendar" suelto) --
+  [new-booking-intent-detection.ts](../../src/domain/new-booking-intent-detection.ts), reutilizado
+  verbatim de Fase 6E.2. Necesario porque
+  `tests/whatsapp-past-booked-rebook-fix.test.ts`'s test 1 envía "Agendar" dos veces; la segunda
+  vez el lead ya está en BOOKING_PENDING con una ronda activa, y ese "Agendar" cae en esta misma
+  rama -- inequívocamente sobre booking, nunca debe escalar.
+
+**Escala a `HUMAN_HANDOFF`** (todo lo demás -- una pregunta real como "¿Cuáles son los
+servicios?", o contenido genuinamente no interpretable como "asdkjfh qlwkejr") vía
+`escalateToHuman` ([booking-outcome-dispatch.ts](../../src/application/booking-outcome-dispatch.ts)),
+reutilizado verbatim (nunca un segundo mecanismo de handoff), extendido con un sexto parámetro
+opcional `message` (retrocompatible -- todo call site existente sigue enviando
+`QUALIFIER_HUMAN_HANDOFF_MESSAGE`, sin cambio) para poder pasar el copy específico
+`UNKNOWN_INTENT_HANDOFF_MESSAGE` sin conflar esta causa con `BOOKING_INCONSISTENCY_HANDOFF` ni con
+las demás causas de handoff ya existentes. `eventType` pasado explícitamente como
+`"UNKNOWN_INTENT_HANDOFF"`.
+
+`BOOKING_PENDING → HUMAN_HANDOFF` ya era una transición válida en `state-machine.ts` (sin cambios
+ahí). La supresión terminal de `HUMAN_HANDOFF` (`wasAlreadySuppressed`, ya existente en
+`whatsapp-inbound-service.ts`, sin ningún cambio) garantiza automáticamente que un mensaje
+posterior del mismo lead no reciba una segunda escalada ni una segunda respuesta -- verificado con
+un test dedicado (11).
+
+### 10.3 Tests preexistentes modificados -- qué, por qué, y qué NO cambió
+
+Solo se modificaron los **dos** tests cuyo comportamiento esperado contradecía directamente la
+nueva regla de negocio, ambos en
+[whatsapp-booking-pending-conversational-trap.test.ts](../../tests/whatsapp-booking-pending-conversational-trap.test.ts):
+
+| Test | Antes | Por qué contradice la nueva regla | Ahora |
+|---|---|---|---|
+| "4: BOOKING_PENDING + '¿Cuáles son los servicios?'" | esperaba quedarse en `BOOKING_PENDING` con el recordatorio de slots | una pregunta real sobre otro tema, sin relación con la selección de slots, es exactamente `UNKNOWN_INTENT` -- repetir el recordatorio para siempre es precisamente el patrón que esta fase prohíbe (ítem 12 del spec original) | espera `HUMAN_HANDOFF` + `UNKNOWN_INTENT_HANDOFF_MESSAGE` |
+| "6: BOOKING_PENDING + texto basura ('asdkjfh qlwkejr')" | esperaba quedarse en `BOOKING_PENDING` con el recordatorio | gibberish irreconocible es el ejemplo canónico de `UNKNOWN_INTENT` en el spec original (ítem 2: "asdf quiero saber algo raro") | espera `HUMAN_HANDOFF` + `UNKNOWN_INTENT_HANDOFF_MESSAGE`; se preservaron TODAS las demás aserciones (score/scoreClass/productInterest/cero appointments intactos) |
+
+Ningún otro test de este archivo (ni de ningún otro) tuvo su *expected outcome* cambiado. Se
+añadieron, no modificaron, 3 tests nuevos para fijar explícitamente el comportamiento que debía
+seguir intacto (evitando que una futura regresión los rompa en silencio):
+- "6b": "7" (número fuera de rango) -- sigue sin escalar.
+- "6c": "hola" (saludo simple) -- sigue sin escalar.
+- "11": tras una escalada, un segundo mensaje no dispara ni una segunda escalada ni una segunda
+  respuesta (supresión terminal, ya existente, ahora verificada explícitamente para esta ruta).
+
+El test 5 ("Hola quiero información") y el test K de `whatsapp-booking-e2e.test.ts` ya usaban
+aserciones lo bastante laxas (`not.toContain(...)`) que siguen pasando sin modificación bajo el
+nuevo comportamiento -- no se tocaron, tal como pide la instrucción de cambiar solo lo necesario.
+
+### 10.4 Qué NO se tocó (confirmación explícita)
+
+- **DO_NOT_CONTACT**: sin cambios en `wasAlreadySuppressed` ni en ningún test de opt-out.
+- **Supresión terminal de HUMAN_HANDOFF**: mismo mecanismo preexistente, ahora ejercitado (no
+  modificado) por el nuevo test 11.
+- **Idempotencia/deduplicación**: sin cambios en `message-ingestion.ts`; los tests de dedupe de
+  este mismo archivo (test 10) y de otros no se tocaron.
+- **Autenticación/admin, firma del webhook de Meta, rate limiting**: cero archivos de esas fases
+  (`admin-auth.ts`, `app.ts`'s rate-limit config, verificación HMAC) tocados en este diff.
+- **`BOOKING_INCONSISTENCY_HANDOFF` (handleError)**: `escalateToHuman`'s default de `eventType`
+  y `message` no cambió; el único call site nuevo pasa AMBOS explícitamente.
+- **`MAX_ROUNDS_REACHED`**: `slot-offering-service.ts` no se tocó.
+- **Cancelación, reagenda, preferencias de fecha, reagenda contextual**: `isBookingAbandonRequest`,
+  `parseDatePreference`, `isContextualRescheduleRequest`, `isCancellationRequest` -- ninguno
+  modificado; todos siguen evaluándose ANTES de llegar a la rama `INVALID` que sí cambió.
+- **Selección numérica de slots**: `parseSlotSelection`/`slot-selection-parser.ts` sin cambios.
+- **Flujos de booking/qualification ya conocidos**: `WhatsAppQualificationHandler`,
+  `dispatchSlotOfferOutcome`, `SlotOfferingService` -- ningún archivo tocado.
+- **§3 (los casos de flag apagado -- CONTACTED, CANCELLED, etc.)**: el fallback final de
+  `whatsapp-inbound-service.ts` permanece exactamente como en la reversión de §5 -- silencioso,
+  sin escalar. Fuera del alcance que Héctor autorizó.
+- **`BOOKED`-genérico**: sin ningún cambio (§10.1).
+
+## 11. Validación final (tras §10)
+
+- `npm run typecheck` — limpio.
+- `npm run build` — limpio.
+- `npx vitest run` — **129 archivos / 1615 tests, 0 fallos** (128/1548 original + 28 de
+  `isSocialAcknowledgement` + 19 de `isBareGreeting` + 17 de `isBookingIndecisionReply` + 3 tests
+  nuevos de hardening en `whatsapp-booking-pending-conversational-trap.test.ts` [6b, 6c, 11] =
+  1548 + 67 = 1615; los tests 4 y 6, modificados in-place, cuentan dentro del total -- no se sumó
+  ni restó ningún archivo de test).
+- `npm audit --production` — mismas 4 vulnerabilidades moderadas preexistentes, no relacionadas,
+  no aplicadas (ver §9).
 
 **NO tocar producción.**
