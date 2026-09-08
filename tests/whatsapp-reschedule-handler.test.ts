@@ -64,10 +64,17 @@ describe("WhatsAppRescheduleHandler -- intent turn (BOOKED)", () => {
 
     await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "quiero reagendar", now: NOW });
 
+    // Fase 7K section 2/3/18: no daypart yet -- the daypart question is asked instead of an
+    // immediate offer, RESCHEDULE_INTRO_MESSAGE still unconditional as before.
     expect((await h.leads.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
     expect(h.messaging.sentTexts.length).toBeGreaterThanOrEqual(2);
     expect(h.messaging.sentTexts[0].body).toContain("puedo ayudarte a cambiar tu cita");
-    expect(h.messaging.sentTexts[1].body).toContain("¿Cuál te funciona mejor?");
+    expect(h.messaging.sentTexts[1].body).toContain("por la mañana o por la tarde");
+
+    const updatedLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: updatedLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "por la mañana", now: NOW });
+    expect(h.messaging.sentTexts[2].body).toContain("¿Cuál te funciona mejor?");
+
     const history = await h.leadStatusHistory.listByLeadId(lead.id);
     expect(history).toHaveLength(1);
     expect(history[0]).toMatchObject({ fromStatus: "BOOKED", toStatus: "RESCHEDULE_REQUESTED", eventType: "RESCHEDULE_REQUESTED" });
@@ -97,8 +104,13 @@ describe("WhatsAppRescheduleHandler -- intent turn (BOOKED)", () => {
 async function toRescheduleRequested(h: ReturnType<typeof makeHandler>) {
   const ctx = await makeBookedLeadWithAppointment(h);
   await h.handler.handleTurn({ lead: ctx.lead, conversationId: ctx.conversation.id, whatsappUserId: "5214771234567", inboundText: "quiero reagendar", now: NOW });
+  // Fase 7K section 2/3/18: reschedule-intent alone (no daypart) now only asks the daypart
+  // question -- answer it here so every test built on this helper still starts with a genuinely
+  // ACTIVE round, exactly as before this feature existed.
+  const afterIntentLead = (await h.leads.findById(ctx.lead.id))!;
+  await h.handler.handleTurn({ lead: afterIntentLead, conversationId: ctx.conversation.id, whatsappUserId: "5214771234567", inboundText: "por la mañana", now: NOW });
   const pendingLead = (await h.leads.findById(ctx.lead.id))!;
-  const activeSlots = await h.offeredSlots.listActiveByConversationId(ctx.conversation.id, NOW);
+  const activeSlots = await h.offeredSlots.listActiveByConversationId(ctx.conversation.id, NOW, ctx.appointment.id);
   return { ...ctx, pendingLead, activeSlots };
 }
 
@@ -109,7 +121,8 @@ describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
     const originalBookedAt = pendingLead.bookedAt;
     expect(originalBookedAt).toBeTruthy();
 
-    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW }); // commitment question
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "no", now: NOW }); // CONFIRMED -> reschedules
 
     const finalLead = await h.leads.findById(pendingLead.id);
     expect(finalLead?.status).toBe("BOOKED");
@@ -142,12 +155,17 @@ describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
     const h = makeHandler();
     const { pendingLead, conversation } = await toRescheduleRequested(h);
     await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "no", now: NOW });
     const afterFirst = (await h.leads.findById(pendingLead.id))!;
     const newAppt = await h.appointments.findActiveByLeadId(pendingLead.id);
     expect(afterFirst.meetingAt?.getTime()).toBe(newAppt!.startsAt.getTime());
     const historyCountAfterFirst = (await h.leadStatusHistory.listByLeadId(pendingLead.id)).length;
 
     // A retry turn holding the SAME stale RESCHEDULE_REQUESTED snapshot as before the first call.
+    // Fase 7K: by now the round is fully consumed and no DAYPART/COMMITMENT marker is pending (the
+    // confirmation message carries none), so this bare "1" is read as fresh generic text against
+    // findTargetAppointment's NOW-current (new) active appointment -- harmlessly absorbed exactly
+    // as before, just via the daypart question this time instead of a repeated offer.
     await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
 
     const afterRetry = await h.leads.findById(pendingLead.id);
@@ -160,10 +178,14 @@ describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
   it("C2: TWO genuinely concurrent selections of the SAME slot (both reading the old appointment as still-active before either's CAS lands) converge through ensureLeadBookedAfterReschedule's idempotent/self-heal branch -- meetingAt is set exactly once, to the new appointment's time, never duplicated or reverted", async () => {
     const h = makeHandler();
     const { pendingLead, conversation } = await toRescheduleRequested(h);
+    // Fase 7K: selection itself now only starts the commitment check (single turn, not
+    // concurrent) -- the genuinely concurrent race this test proves safe is now at the
+    // CONFIRMED-reply step.
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
 
     await Promise.all([
-      h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW }),
-      h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW }),
+      h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "no", now: NOW }),
+      h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "no", now: NOW }),
     ]);
 
     const finalLead = await h.leads.findById(pendingLead.id);
@@ -178,6 +200,7 @@ describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
     const h = makeHandler();
     const { pendingLead, conversation, appointment } = await toRescheduleRequested(h);
     await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "no", now: NOW });
     const newAppt = (await h.appointments.findActiveByLeadId(pendingLead.id))!;
     // Simulate the exact legacy artifact the real production lead had: lead BOOKED, meetingAt
     // still the OLD appointment's time.
@@ -239,10 +262,11 @@ describe("WhatsAppRescheduleHandler -- RESCHEDULE_REQUESTED turn", () => {
   it("duplicate selection (two turns racing the same RESCHEDULE_REQUESTED slot) is idempotent: exactly one reschedule, lead ends BOOKED once, no duplicate appointment history", async () => {
     const h = makeHandler();
     const { pendingLead, conversation, appointment } = await toRescheduleRequested(h);
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
 
     await Promise.all([
-      h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW }),
-      h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW }),
+      h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "no", now: NOW }),
+      h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "no", now: NOW }),
     ]);
 
     expect((await h.leads.findById(pendingLead.id))?.status).toBe("BOOKED");
@@ -263,8 +287,10 @@ describe("WhatsAppRescheduleHandler -- item 13: cancellation-vs-reschedule race"
     // cancellation handoff never touches the appointment, only the lead).
     await h.leads.update(pendingLead.id, { status: "CANCEL_PENDING" });
 
-    // Turn A (a valid slot selection, "1") still holds the STALE RESCHEDULE_REQUESTED snapshot.
+    // Turn A (a valid slot selection, "1" then the CONFIRMED reply) still holds the STALE
+    // RESCHEDULE_REQUESTED snapshot.
     await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "no", now: NOW });
 
     // The reschedule's own DB truth still lands correctly.
     expect((await h.appointments.findById(appointment.id))?.status).toBe("RESCHEDULED");
@@ -283,9 +309,10 @@ describe("WhatsAppRescheduleHandler -- item 13: cancellation-vs-reschedule race"
     const h = makeHandler();
     const { pendingLead, conversation, appointment } = await toRescheduleRequested(h);
 
-    // Simulate Turn A (a valid slot selection) completing FIRST -- lead now BOOKED with a new
-    // appointment.
+    // Simulate Turn A (a valid slot selection, then its CONFIRMED reply) completing FIRST -- lead
+    // now BOOKED with a new appointment.
     await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "no", now: NOW });
     expect((await h.leads.findById(pendingLead.id))?.status).toBe("BOOKED");
     const messageCountBeforeRace = h.messaging.sentTexts.length;
 
@@ -312,26 +339,38 @@ describe("WhatsAppRescheduleHandler -- item 9/12.B/12.C: mandatory reschedule-co
     // produce this on its own now (see the root-cause fix), so this directly exercises the
     // handler's OWN defense-in-depth check rather than the repository's filter.
     const leakedSlot = { id: "leaked-booking-slot", conversationId: conversation.id, leadId: pendingLead.id, roundId: "leaked-round", slotStart: new Date("2026-03-02T18:00:00.000Z"), slotEnd: new Date("2026-03-02T18:30:00.000Z"), position: 1, expiresAt: new Date("2026-03-01T10:00:00.000Z"), selected: false, createdAt: NOW, rescheduleContextId: undefined };
+    // Fase 7K: the leaked slot only affects the ONE call it's mocked for -- the "1" turn's own
+    // activeSlots fetch (parseSlotSelection/initiateCommitmentCheck). By the time the CONFIRMED
+    // reply arrives, handleCommitmentReply re-fetches activeSlots through the REAL, correctly
+    // scoped repository (never mocked again), so the leaked slot is never found there -- it's
+    // treated as "lost" (never as a wrongly-scoped invariant violation specifically), but the
+    // SAME critical safety property holds: no Calendar call, no appointment, old untouched.
     vi.spyOn(h.offeredSlots, "listActiveByConversationId").mockResolvedValueOnce([leakedSlot]);
     const createEventSpy = vi.spyOn(h.calendar, "createEvent");
 
     await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "no", now: NOW });
 
     expect(createEventSpy).not.toHaveBeenCalled();
     expect((await h.appointments.findById(appointment.id))?.status).toBe("BOOKED"); // untouched
     expect((await h.leads.findById(pendingLead.id))?.status).toBe("RESCHEDULE_REQUESTED"); // untouched
     const lastMessage = h.messaging.sentTexts[h.messaging.sentTexts.length - 1];
-    expect(lastMessage.body).toContain("Por favor responde");
+    expect(lastMessage.body).toContain("Ese horario acaba de dejar de estar disponible");
   });
 
   it("item 12.C: never accepts a selected slot whose rescheduleContextId belongs to a DIFFERENT reschedule episode (old=B when the current old appointment is A) -- no Calendar call, no appointment created, old untouched", async () => {
     const h = makeHandler();
     const { pendingLead, conversation, appointment } = await toRescheduleRequested(h);
     const wrongContextSlot = { id: "wrong-context-slot", conversationId: conversation.id, leadId: pendingLead.id, roundId: "other-episode-round", slotStart: new Date("2026-03-02T18:00:00.000Z"), slotEnd: new Date("2026-03-02T18:30:00.000Z"), position: 1, expiresAt: new Date("2026-03-01T10:00:00.000Z"), selected: false, createdAt: NOW, rescheduleContextId: "some-other-old-appointment-id" };
+    // Fase 7K: same note as item 12.B -- the mock only affects the "1" turn's own fetch; the
+    // CONFIRMED reply re-fetches through the real, correctly scoped repository and never finds
+    // this slot, so it's treated as "lost" rather than re-hitting handleSelection's explicit
+    // rescheduleContextId check -- same critical safety property either way.
     vi.spyOn(h.offeredSlots, "listActiveByConversationId").mockResolvedValueOnce([wrongContextSlot]);
     const createEventSpy = vi.spyOn(h.calendar, "createEvent");
 
     await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "1", now: NOW });
+    await h.handler.handleTurn({ lead: pendingLead, conversationId: conversation.id, whatsappUserId: "5214771234567", inboundText: "no", now: NOW });
 
     expect(createEventSpy).not.toHaveBeenCalled();
     expect((await h.appointments.findById(appointment.id))?.status).toBe("BOOKED"); // untouched

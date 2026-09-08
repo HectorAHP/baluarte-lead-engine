@@ -223,10 +223,13 @@ describe("Fase 7I.2 -- item 11/13/12: real-case reproduction (lead eb95060d shap
     const { lead, appointment, conversation } = await makeBookedLeadWithFutureAppointment(repos, "5214779990401");
 
     const res = await send(app, "5214779990401", "wamid.1", "Mejor el domingo");
-
     expect(res.statusCode).toBe(200);
+    const afterIntentLead = await repos.leadsRepo.findById(lead.id);
+    expect(afterIntentLead?.status).toBe("RESCHEDULE_REQUESTED"); // contextual reschedule detected -- daypart question first (no daypart in "el domingo")
+    await send(app, "5214779990401", "wamid.1b", "por la mañana");
+
     const finalLead = await repos.leadsRepo.findById(lead.id);
-    expect(finalLead?.status).toBe("RESCHEDULE_REQUESTED"); // contextual reschedule detected
+    expect(finalLead?.status).toBe("RESCHEDULE_REQUESTED");
     expect(finalLead?.status).not.toBe("HUMAN_HANDOFF"); // item 12
 
     const reread = await repos.appointmentsRepo.findById(appointment.id);

@@ -77,26 +77,34 @@ describe("computeAvailableSlots", () => {
   });
 
   it("respects the requested meeting duration", () => {
+    // Fase 7K section 6/7 -- previously (pre-diversity) this asserted three CONSECUTIVE
+    // same-day slots (9/10/11h Monday) because computeAvailableSlots simply sliced the first
+    // maxSlots chronological candidates. With no explicit targetDate/weekday, the new default is
+    // diversity across distinct local dates (one slot per day, chronological across days) -- this
+    // is the exact product behavior 7K introduces, so only the expected slot dates change here;
+    // the duration assertion below (still 60 minutes per slot) is untouched.
     const rules: AvailabilityRules = { ...baseRules, maxSlots: 3 };
     const slots = computeAvailableSlots(from, fiveDaysOut, 60, [], rules, now);
     expect(slots.map((s) => s.start.getTime())).toEqual([
-      localSlotStart(9, 0).getTime(),
-      localSlotStart(10, 0).getTime(),
-      localSlotStart(11, 0).getTime(),
+      localSlotStart(9, 0, 0).getTime(),
+      localSlotStart(9, 0, 1).getTime(),
+      localSlotStart(9, 0, 2).getTime(),
     ]);
     for (const slot of slots) {
       expect(slot.end.getTime() - slot.start.getTime()).toBe(60 * 60_000);
     }
   });
 
-  it("returns at most the configured maximum number of slots, chronologically", () => {
+  it("returns at most the configured maximum number of slots, diversified across distinct days", () => {
+    // Fase 7K section 6/7 -- see the comment on the test above: same contradiction, same fix.
+    // The "chronologically increasing" invariant (still true across distinct days) is preserved.
     const rules: AvailabilityRules = { ...baseRules, maxSlots: 3 };
     const slots = computeAvailableSlots(from, fiveDaysOut, 30, [], rules, now);
     expect(slots).toHaveLength(3);
     expect(slots.map((s) => s.start.getTime())).toEqual([
-      localSlotStart(9, 0).getTime(),
-      localSlotStart(9, 30).getTime(),
-      localSlotStart(10, 0).getTime(),
+      localSlotStart(9, 0, 0).getTime(),
+      localSlotStart(9, 0, 1).getTime(),
+      localSlotStart(9, 0, 2).getTime(),
     ]);
     for (let i = 1; i < slots.length; i++) {
       expect(slots[i].start.getTime()).toBeGreaterThan(slots[i - 1].start.getTime());

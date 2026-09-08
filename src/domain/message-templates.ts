@@ -96,6 +96,20 @@ export function formatSlotForDisplay(date: Date, timezone: string): string {
   return `${weekday} ${parts.day}, ${hour12}:${minute} ${period}`;
 }
 
+/** Fase 7K section 12 -- "miércoles 10 a las 11:30 a.m." prose phrasing for the Sandler
+ * commitment question, distinct from formatSlotForDisplay's own "Miércoles 10, 11:30 a.m." list
+ * format (both share the same WEEKDAY_ES/zonedTimeParts building blocks -- no duplicated data,
+ * only a different join). */
+function formatSlotForProse(date: Date, timezone: string): string {
+  const parts = zonedTimeParts(date, timezone);
+  const weekdayShort = new Intl.DateTimeFormat("en-US", { timeZone: timezone, weekday: "short" }).format(date);
+  const weekday = (WEEKDAY_ES[weekdayShort] ?? weekdayShort).toLowerCase();
+  const hour12 = parts.hour % 12 === 0 ? 12 : parts.hour % 12;
+  const period = parts.hour < 12 ? "a.m." : "p.m.";
+  const minute = String(parts.minute).padStart(2, "0");
+  return `${weekday} ${parts.day} a las ${hour12}:${minute} ${period}`;
+}
+
 function positionList(slots: OfferedSlot[]): string {
   const positions = [...slots].map((s) => s.position).sort((a, b) => a - b);
   if (positions.length <= 1) return String(positions[0] ?? "");
@@ -131,6 +145,56 @@ export function buildSlotOfferMessage(
 
 /** C. Sent after SlotUnavailableError triggers a replaceOffer() that produced a new round. */
 export const SLOT_UNAVAILABLE_INTRO = "Ese horario acaba de dejar de estar disponible. No pasa nada, aquí tienes otras opciones:";
+
+// ---------------------------------------------------------------------------------------------
+// Fase 7K -- "Sandler Booking Flow" (spec sections 2/12/15/16). Deterministic copy for the two
+// new turns: the daypart question (asked before the first offer of a round, once per round
+// unless the preference is already known -- section 3) and the Sandler-style commitment check
+// (asked after a slot is chosen, before anything is booked -- section 11/12). Same constraints as
+// every other lead-facing message in this file: no "bot"/"sistema"/SLA promises, and specifically
+// for the commitment copy, never a manipulative/pressuring phrasing ("¿me lo prometes?"/"no me
+// vas a cancelar, ¿verdad?") -- see the spec's own explicit negative examples.
+// ---------------------------------------------------------------------------------------------
+
+/** Section 2 -- verbatim required copy. Accepts "1"/"mañana"/"por la mañana"/"temprano" ->
+ * MORNING and "2"/"tarde"/"por la tarde" -> AFTERNOON (see daypart-preference-detection.ts);
+ * never requires the numeric form. */
+export const DAYPART_QUESTION_MESSAGE =
+  "Perfecto. Para buscar algo que realmente te funcione, ¿te acomoda mejor por la mañana o por la tarde?";
+
+/** Section 12 -- verbatim required phrasing, with the chosen slot's day/time substituted in.
+ * Deliberately neutral/professional: never "¿me prometes?", never "no me vas a cancelar,
+ * ¿verdad?", never "necesito que te comprometas". */
+export function buildCommitmentCheckMessage(slotStart: Date, timezone: string): string {
+  return `Perfecto. Antes de dejarla reservada: ¿hay algo que pudiera impedirte conectarte el ${formatSlotForProse(slotStart, timezone)}?`;
+}
+
+/** Section 16 -- asked ONCE when a commitment reply is AMBIGUOUS; a second AMBIGUOUS reply in a
+ * row escalates via the existing UNKNOWN_INTENT_HANDOFF path instead of asking a third time. */
+export const COMMITMENT_CLARIFICATION_MESSAGE =
+  "Solo para confirmar: ¿ese horario lo puedes apartar sin algún compromiso que ya sepas que podría impedirte conectarte?";
+
+/** Section 15 -- sent when the commitment reply is an OBSTACLE. Combines the required empathetic
+ * intro with a FRESH slot offer in the SAME message (rather than the spec's own two-step example
+ * of asking "¿quieres que revisemos otra opción?" and waiting for a reply) -- a deliberate,
+ * disclosed deviation: a bare "sí" reply to that question is not itself a slot number or a
+ * recognized phrase anywhere else in this codebase's parsers, which would risk exactly the kind
+ * of dead-end loop Fase 7J/7J.3 already had to fix elsewhere. Giving concrete next options
+ * immediately keeps the required, non-manipulative empathetic phrasing while never introducing a
+ * new ambiguous-reply trap. See booking-commitment-flow.ts. */
+export function buildCommitmentObstacleMessage(newSlots: OfferedSlot[], timezone: string): string {
+  return buildSlotOfferMessage(
+    newSlots,
+    timezone,
+    "Entendido. Prefiero que encontremos un horario que sí puedas proteger. Aquí tienes otras opciones:",
+  );
+}
+
+/** Fallback for the rare case a fresh offer after an OBSTACLE reply comes back empty (e.g. round
+ * budget genuinely exhausted) -- explanation-only, same "never fabricate a list" posture as
+ * buildRequestedDateUnavailableMessage's own "NONE" branch. */
+export const COMMITMENT_OBSTACLE_NO_SLOTS_MESSAGE =
+  "Entendido. Prefiero que encontremos un horario que sí puedas proteger. Por ahora no tengo más horarios disponibles en los próximos días -- si quieres, cuéntame qué día te gustaría intentar y con gusto reviso.";
 
 /** B. Invalid selection -- resends the SAME active slots (never a new round), with the exact
  * currently-valid position numbers spelled out (never hardcoded "1, 2 o 3": a round can have

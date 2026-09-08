@@ -233,9 +233,10 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779970008", "wamid.8a", "Agendar");
+    await send(app, "5214779970008", "wamid.8a2", "por la mañana");
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
   });
 
@@ -250,13 +251,14 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     await seedExhaustedRoundBudget(repos, conversation.id, lead.id);
 
     await send(app, "5214779970009", "wamid.9a", "Agendar");
+    await send(app, "5214779970009", "wamid.9a2", "por la mañana");
 
     const after = await repos.leadsRepo.findById(lead.id);
     expect(after?.status).not.toBe("HUMAN_HANDOFF");
     expect(after?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toContain("Tengo estos horarios disponibles");
-    expect(outbound[0].body).not.toContain("orientación adecuada"); // never the handoff copy
+    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound[1].body).not.toContain("orientación adecuada"); // never the handoff copy
   });
 
   it("10. offered slots for the rebooking come exclusively from CalendarProvider -- never invented", async () => {
@@ -269,6 +271,7 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     await repos.calendar.createEvent({ title: "busy", description: "", start: busyStart, end: busyEnd });
 
     await send(app, "5214779970010", "wamid.10a", "Agendar");
+    await send(app, "5214779970010", "wamid.10a2", "por la mañana");
 
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     expect(offered.length).toBeGreaterThan(0);
@@ -284,7 +287,9 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     const stale = await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779970011", "wamid.11a", "Agendar");
+    await send(app, "5214779970011", "wamid.11a2", "por la mañana");
     await send(app, "5214779970011", "wamid.11b", "1");
+    await send(app, "5214779970011", "wamid.11b2", "no");
 
     // Fase 7H: see the identical assertion's doc comment in
     // whatsapp-past-booked-rebook-fix.test.ts item 8 -- same fix, same reasoning.
@@ -300,7 +305,9 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     const stale = await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779970012", "wamid.12a", "Agendar");
+    await send(app, "5214779970012", "wamid.12a2", "por la mañana");
     await send(app, "5214779970012", "wamid.12b", "1");
+    await send(app, "5214779970012", "wamid.12b2", "no");
 
     const all = await repos.appointmentsRepo.listAllByLeadId(lead.id);
     expect(all).toHaveLength(2);
@@ -328,9 +335,11 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     const { lead } = await createLeadAtStatus(repos, "5214779970014", "BOOKED");
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
     await send(app, "5214779970014", "wamid.14a", "Agendar");
+    await send(app, "5214779970014", "wamid.14a2", "por la mañana");
+    await send(app, "5214779970014", "wamid.14b", "1"); // commitment question
 
-    await send(app, "5214779970014", "wamid.dup14", "1");
-    await send(app, "5214779970014", "wamid.dup14", "1"); // exact redelivery of the slot selection
+    await send(app, "5214779970014", "wamid.dup14", "no");
+    await send(app, "5214779970014", "wamid.dup14", "no"); // exact redelivery of the CONFIRMED reply
 
     const all = await repos.appointmentsRepo.listAllByLeadId(lead.id);
     expect(all.filter((a) => a.startsAt.getTime() !== PAST_STARTS_AT.getTime())).toHaveLength(1);
@@ -355,11 +364,12 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     }
 
     await send(app, "5214779970015", "wamid.15a", "Agendar");
+    await send(app, "5214779970015", "wamid.15a2", "por la mañana");
 
     const after = await repos.leadsRepo.findById(lead.id);
     expect(after?.status).toBe("HUMAN_HANDOFF"); // legitimate escalation still works
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toContain("orientación adecuada");
+    expect(outbound[1].body).toContain("orientación adecuada");
   });
 
   it("16. DO_NOT_CONTACT stays fully suppressed", async () => {
@@ -395,9 +405,10 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779970018", "wamid.18a", "Agendar");
+    await send(app, "5214779970018", "wamid.18a2", "por la mañana");
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toContain("Juan");
+    expect(outbound[1].body).toContain("Juan");
   });
 
   it("19. HubSpot fiscal sync is unaffected by this WhatsApp-router-only fix", async () => {
@@ -465,7 +476,9 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     await send(app, "5214779970022", "wamid.22a", "¿Qué es un PPR?");
     await send(app, "5214779970022", "wamid.22b", "Sí");
     await send(app, "5214779970022", "wamid.22c", "Agendar");
+    await send(app, "5214779970022", "wamid.22c2", "por la mañana");
     await send(app, "5214779970022", "wamid.22d", "1");
+    await send(app, "5214779970022", "wamid.22d2", "no");
 
     const after = await repos.leadsRepo.findById(lead.id);
     expect(after?.score).toBe(74);

@@ -141,12 +141,18 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     const { conversation } = await createLeadAtStatus(repos, "5214776100002", "QUALIFIED_A");
     await send(app, "5214776100002", "wamid.2a", "Hola, tengo una duda"); // main menu shown
 
+    // Fase 7K section 2/3/8: the daypart question is asked before Calendar is ever consulted.
     await send(app, "5214776100002", "wamid.2b", "3");
+    const outboundAfterIntent = await outboundMessages(repos, conversation.id);
+    expect(outboundAfterIntent).toHaveLength(2);
+    expect(outboundAfterIntent[1].body).toContain("por la mañana o por la tarde");
+
+    await send(app, "5214776100002", "wamid.2c", "por la mañana");
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound).toHaveLength(2);
-    expect(outbound[1].body).not.toBe(QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE);
-    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound).toHaveLength(3);
+    expect(outbound[2].body).not.toBe(QUALIFIED_LEAD_BOOKING_FALLBACK_MESSAGE);
+    expect(outbound[2].body).toContain("Tengo estos horarios disponibles");
     // 3 real slots came from FakeCalendarProvider (max 3, same cap GoogleCalendarProvider uses).
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     expect(offered.length).toBeGreaterThan(0);
@@ -158,10 +164,15 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     const { conversation } = await createLeadAtStatus(repos, "5214776100003", "QUALIFIED_A");
 
     await send(app, "5214776100003", "wamid.3a", "Quiero agendar una asesoría");
+    const outboundAfterIntent = await outboundMessages(repos, conversation.id);
+    expect(outboundAfterIntent).toHaveLength(1);
+    expect(outboundAfterIntent[0].body).toContain("por la mañana o por la tarde");
+
+    await send(app, "5214776100003", "wamid.3b", "por la mañana");
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound).toHaveLength(1);
-    expect(outbound[0].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound).toHaveLength(2);
+    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
   });
 
   it("4+5. offered slots come exclusively from CalendarProvider.getAvailableSlots -- never invented", async () => {
@@ -176,6 +187,7 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     await repos.calendar.createEvent({ title: "busy", description: "", start: busyStart, end: busyEnd });
 
     await send(app, "5214776100004", "wamid.4a", "Quiero agendar una cita");
+    await send(app, "5214776100004", "wamid.4a2", "por la mañana");
 
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     // FakeCalendarProvider caps at 3 slots per query, same cap GoogleCalendarProvider's own
@@ -192,10 +204,12 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214776100006", "QUALIFIED_A");
     await send(app, "5214776100006", "wamid.6a", "Quiero agendar una cita");
+    await send(app, "5214776100006", "wamid.6a2", "por la mañana");
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     const first = [...offered].sort((a, b) => a.position - b.position)[0];
 
-    await send(app, "5214776100006", "wamid.6b", "1");
+    await send(app, "5214776100006", "wamid.6b", "1"); // commitment question
+    await send(app, "5214776100006", "wamid.6c", "no"); // CONFIRMED -> books
 
     const appt = (await repos.appointmentsRepo.listAllByLeadId(lead.id))[0];
     expect(appt.startsAt.getTime()).toBe(first.slotStart.getTime());
@@ -206,13 +220,15 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { conversation } = await createLeadAtStatus(repos, "5214776100007", "QUALIFIED_A");
     await send(app, "5214776100007", "wamid.7a", "Quiero agendar una cita");
+    await send(app, "5214776100007", "wamid.7a2", "por la mañana");
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     const first = [...offered].sort((a, b) => a.position - b.position)[0];
 
     // Race: something else takes that exact slot on the real calendar between offer and selection.
     await repos.calendar.createEvent({ title: "race", description: "", start: first.slotStart, end: first.slotEnd });
 
-    await send(app, "5214776100007", "wamid.7b", "1");
+    await send(app, "5214776100007", "wamid.7b", "1"); // commitment question
+    await send(app, "5214776100007", "wamid.7c", "no"); // CONFIRMED -> revalidates, finds it taken
 
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound[outbound.length - 1].body).toContain("Ese horario acaba de dejar de estar disponible"); // SLOT_UNAVAILABLE_INTRO path
@@ -225,8 +241,10 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead } = await createLeadAtStatus(repos, "5214776100009", "QUALIFIED_A");
     await send(app, "5214776100009", "wamid.9a", "Quiero agendar una cita");
+    await send(app, "5214776100009", "wamid.9a2", "por la mañana");
 
     await send(app, "5214776100009", "wamid.9b", "1");
+    await send(app, "5214776100009", "wamid.9c", "no");
 
     const after = await repos.leadsRepo.findById(lead.id);
     expect(after?.status).toBe("BOOKED");
@@ -240,9 +258,11 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead } = await createLeadAtStatus(repos, "5214776100011", "QUALIFIED_A");
     await send(app, "5214776100011", "wamid.11a", "Quiero agendar una cita");
+    await send(app, "5214776100011", "wamid.11a2", "por la mañana");
     await send(app, "5214776100011", "wamid.11b", "1");
+    await send(app, "5214776100011", "wamid.11c", "no");
 
-    await send(app, "5214776100011", "wamid.11b", "1"); // exact retry, same providerMessageId
+    await send(app, "5214776100011", "wamid.11c", "no"); // exact retry, same providerMessageId
 
     const appts = await repos.appointmentsRepo.listAllByLeadId(lead.id);
     expect(appts).toHaveLength(1);
@@ -253,9 +273,11 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead } = await createLeadAtStatus(repos, "5214776100012", "QUALIFIED_A");
     await send(app, "5214776100012", "wamid.12a", "Quiero agendar una cita");
+    await send(app, "5214776100012", "wamid.12a2", "por la mañana");
     await send(app, "5214776100012", "wamid.12b", "1");
+    await send(app, "5214776100012", "wamid.12c", "no");
 
-    await send(app, "5214776100012", "wamid.12c", "1"); // different providerMessageId, same selection -- already BOOKED
+    await send(app, "5214776100012", "wamid.12d", "no"); // different providerMessageId, same reply -- already BOOKED
 
     const appts = await repos.appointmentsRepo.listAllByLeadId(lead.id);
     expect(appts).toHaveLength(1);
@@ -266,11 +288,14 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     const app = await buildTestApp({ ...repos, calendar: new FailingCalendar(), whatsappBookingEnabled: true });
     const { conversation } = await createLeadAtStatus(repos, "5214776100013", "QUALIFIED_A");
 
-    const res = await send(app, "5214776100013", "wamid.13a", "Quiero agendar una cita");
+    // Fase 7K: the daypart question doesn't touch Calendar, so the FailingCalendar only actually
+    // gets exercised once a daypart is given.
+    await send(app, "5214776100013", "wamid.13a", "Quiero agendar una cita");
+    const res = await send(app, "5214776100013", "wamid.13b", "por la mañana");
 
     expect(res.statusCode).toBe(200); // webhook always acks -- never a 500 out to Meta
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toBe(BOOKING_TECHNICAL_ERROR_MESSAGE);
+    expect(outbound[outbound.length - 1].body).toBe(BOOKING_TECHNICAL_ERROR_MESSAGE);
   });
 
   it("14. no availability from the provider produces a safe, non-inventive reply", async () => {
@@ -279,9 +304,10 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     const { conversation } = await createLeadAtStatus(repos, "5214776100014", "QUALIFIED_A");
 
     await send(app, "5214776100014", "wamid.14a", "Quiero agendar una cita");
+    await send(app, "5214776100014", "wamid.14b", "por la mañana");
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toBe(BOOKING_NO_AVAILABILITY_MESSAGE);
+    expect(outbound[outbound.length - 1].body).toBe(BOOKING_NO_AVAILABILITY_MESSAGE);
   });
 
   it("15. the confirmed appointment time is expressed in America/Mexico_City, not raw UTC", async () => {
@@ -289,10 +315,12 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead } = await createLeadAtStatus(repos, "5214776100015", "QUALIFIED_A");
     await send(app, "5214776100015", "wamid.15a", "Quiero agendar una cita");
+    await send(app, "5214776100015", "wamid.15a2", "por la mañana");
     const conversation = (await repos.conversationsRepo.findActiveByLeadId(lead.id))!;
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
 
     await send(app, "5214776100015", "wamid.15b", "1");
+    await send(app, "5214776100015", "wamid.15c", "no");
 
     const outbound = await outboundMessages(repos, conversation.id);
     const confirmedBody = outbound[outbound.length - 1].body!;
@@ -314,7 +342,9 @@ describe("Fase 6D -- WhatsApp qualified-lead router restores real Google Calenda
     await seedFiscalScore(repos.fiscalLeadScoresRepo, lead.id);
 
     await send(app, "5214776100016", "wamid.16a", "Quiero agendar una cita");
+    await send(app, "5214776100016", "wamid.16a2", "por la mañana");
     await send(app, "5214776100016", "wamid.16b", "1");
+    await send(app, "5214776100016", "wamid.16c", "no");
 
     const after = await repos.leadsRepo.findById(lead.id);
     expect(after?.status).toBe("BOOKED");

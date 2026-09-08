@@ -324,9 +324,10 @@ describe("Fase 6E.4 -- HTTP-level: CONTACTED reproduction, idempotency, and surr
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2020-01-01T10:00:00.000Z"), endsAt: new Date("2020-01-01T10:30:00.000Z"), timezone: "America/Mexico_City" });
 
     await sendWebhook(app, "5214779930116", "wamid.16a", "Agendar");
+    await sendWebhook(app, "5214779930116", "wamid.16a2", "por la mañana");
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toContain("Tengo estos horarios disponibles"); // real booking, not the past-booked loop
+    expect(outbound[1].body).toContain("Tengo estos horarios disponibles"); // real booking, not the past-booked loop
   });
 
   it("17. the Fase 6E.3.1 episode-scoped booking round cap remains intact", async () => {
@@ -338,9 +339,10 @@ describe("Fase 6E.4 -- HTTP-level: CONTACTED reproduction, idempotency, and surr
     } satisfies Omit<Lead, "id" | "createdAt" | "updatedAt">);
     const conversation = await repos.conversationsRepo.create({ leadId: lead.id, channel: "WHATSAPP", status: "ACTIVE" });
 
-    await sendWebhook(app, "5214779930117", "wamid.17a", "Quiero agendar una cita"); // round 1
+    await sendWebhook(app, "5214779930117", "wamid.17a", "Quiero agendar una cita");
+    await sendWebhook(app, "5214779930117", "wamid.17a2", "por la mañana"); // round 1
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
   });
 
   it("18. HubSpot fiscal sync remains fully functional -- unaffected by this WhatsApp-router-only fix", async () => {

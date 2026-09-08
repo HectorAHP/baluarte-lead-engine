@@ -295,8 +295,19 @@ describe("Fase 6E.5 -- remaining test matrix", () => {
     });
     await app.inject({ method: "POST", url: "/webhooks/whatsapp", payload, headers: { "content-type": "application/json", "x-hub-signature-256": sign(payload, TEST_META_APP_SECRET) } });
 
+    // Fase 7K: no daypart yet -- the first reply is the daypart question; answer it to reach the
+    // real offer.
+    const daypartPayload = JSON.stringify({
+      object: "whatsapp_business_account",
+      entry: [{ id: "waba-1", changes: [{ field: "messages", value: {
+        messaging_product: "whatsapp", contacts: [{ profile: { name: "Juan" }, wa_id: "5214779940015" }],
+        messages: [{ from: "5214779940015", id: "wamid.15b", type: "text", text: { body: "por la mañana" } }],
+      } }] }],
+    });
+    await app.inject({ method: "POST", url: "/webhooks/whatsapp", payload: daypartPayload, headers: { "content-type": "application/json", "x-hub-signature-256": sign(daypartPayload, TEST_META_APP_SECRET) } });
+
     const outbound = await outboundMessages(repos.messagesRepo, conversation.id);
-    expect(outbound[0]!.body).toContain("Tengo estos horarios disponibles");
+    expect(outbound[1]!.body).toContain("Tengo estos horarios disponibles");
   });
 
   it("16. booking round-cap episode scoping (Fase 6E.3.1) is unaffected by the fiscal welcome fix -- no file this phase touches overlaps slot-offering-service.ts", async () => {

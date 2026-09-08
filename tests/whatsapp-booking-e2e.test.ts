@@ -230,13 +230,19 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     for (const [i, t] of SAVINGS_TO_QUALIFIED_A_TURNS.entries()) await send(app, from, `wamid.e2ea.${i}`, t);
     const beforeSelection = messaging.sentTexts.length;
 
+    // Fase 7K section 11: selecting a slot starts the Sandler commitment check instead of
+    // booking immediately -- a second turn (a CONFIRMED reply) is now needed to actually book.
     await send(app, from, "wamid.e2ea.select", "1");
+    expect(messaging.sentTexts).toHaveLength(beforeSelection + 1);
+    expect(messaging.sentTexts.at(-1)?.body).toContain("Antes de dejarla reservada");
+
+    await send(app, from, "wamid.e2ea.confirm", "no");
 
     const lead = await repos.leadsRepo.findByDedupKey({ whatsappUserId: from });
     expect(lead?.status).toBe("BOOKED");
     const appointment = await repos.appointmentsRepo.findActiveByLeadId(lead!.id);
     expect(appointment).toBeTruthy();
-    expect(messaging.sentTexts).toHaveLength(beforeSelection + 1); // exactly one confirmation
+    expect(messaging.sentTexts).toHaveLength(beforeSelection + 2); // commitment question + exactly one confirmation
     expect(messaging.sentTexts.at(-1)?.body).toContain("quedó agendada");
   });
 
@@ -251,6 +257,7 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     expect(lead?.status).toBe("BOOKING_PENDING");
 
     await send(app, from, "wamid.e2eb.select", "1");
+    await send(app, from, "wamid.e2eb.confirm", "no");
 
     const reloaded = await repos.leadsRepo.findById(lead!.id);
     expect(reloaded?.status).toBe("BOOKED");
@@ -291,7 +298,12 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
       ]);
     }
 
+    // Fase 7K: the daypart question is asked (and doesn't touch round budget) before the
+    // round-cap check inside getOrCreateOffer is ever reached.
     await handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: "5214778000006", inboundText: "hola", now });
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
+
+    await handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: "5214778000006", inboundText: "por la mañana", now });
 
     const reloaded = await repos.leadsRepo.findById(lead.id);
     expect(reloaded?.status).toBe("HUMAN_HANDOFF");
@@ -310,7 +322,8 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     if (offer.type !== "CREATED") throw new Error("unreachable");
     await calendar.createEvent({ title: "other", description: "", start: offer.slots[0].slotStart, end: offer.slots[0].slotEnd });
 
-    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: "5214778000007", inboundText: "1", now });
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: "5214778000007", inboundText: "1", now }); // commitment question
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: "5214778000007", inboundText: "no", now }); // CONFIRMED -> revalidates, finds it taken
 
     expect(await repos.appointmentsRepo.findActiveByLeadId(lead.id)).toBeNull();
     expect(await repos.offeredSlotsRepo.listRoundIdsByConversationId(conversation.id)).toHaveLength(2);
@@ -338,17 +351,20 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     const app = await buildTestApp({ messaging, qualificationEngineEnabled: true, whatsappBookingEnabled: true, ...repos });
     const from = "5214777000009";
     for (const [i, t] of SAVINGS_TO_QUALIFIED_A_TURNS.entries()) await send(app, from, `wamid.dup.${i}`, t);
-    const beforeSelection = messaging.sentTexts.length;
 
-    // Same providerMessageId sent twice -- the existing dedup (messages.findByProviderMessageId,
-    // checked before any handler ever runs) must short-circuit the second delivery entirely.
+    // Fase 7K: select first (unique id, starts the commitment check), THEN duplicate the
+    // CONFIRMED reply's own providerMessageId -- the existing dedup
+    // (messages.findByProviderMessageId, checked before any handler ever runs) must short-circuit
+    // the second delivery entirely, same guarantee as before, now proven at the commitment step.
     await send(app, from, "wamid.dup.select", "1");
-    await send(app, from, "wamid.dup.select", "1");
+    const afterSelection = messaging.sentTexts.length;
+    await send(app, from, "wamid.dup.confirm", "no");
+    await send(app, from, "wamid.dup.confirm", "no");
 
     const lead = await repos.leadsRepo.findByDedupKey({ whatsappUserId: from });
     const appointment = await repos.appointmentsRepo.findActiveByLeadId(lead!.id);
     expect(appointment).toBeTruthy();
-    expect(messaging.sentTexts).toHaveLength(beforeSelection + 1); // not +2 -- the duplicate never ran
+    expect(messaging.sentTexts).toHaveLength(afterSelection + 1); // not +2 -- the duplicate never ran
   });
 
   it("J: two near-simultaneous inbounds selecting the same slot -- at most one Calendar event, at most one appointment", async () => {
@@ -359,10 +375,14 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
     const now = new Date("2026-03-02T12:00:00.000Z");
     const offer = await new SlotOfferingService(calendar, repos.offeredSlotsRepo, repos.appointmentsRepo, repos.leadsRepo, repos.slotOfferClaimsRepo, repos.leadStatusHistoryRepo, new FakeLogger()).getOrCreateOffer({ lead, conversationId: conversation.id, now });
     if (offer.type !== "CREATED") throw new Error("unreachable");
+    // Fase 7K: selection itself now only starts the commitment check (single turn, not
+    // concurrent) -- the race this test proves safe is now at the CONFIRMED-reply step, where
+    // AppointmentService.book()'s idempotency key is actually exercised.
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: "5214778000010", inboundText: "1", now });
 
     await Promise.all([
-      handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: "5214778000010", inboundText: "1", now }),
-      handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: "5214778000010", inboundText: "1", now }),
+      handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: "5214778000010", inboundText: "no", now }),
+      handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: "5214778000010", inboundText: "no", now }),
     ]);
 
     expect(calendar.createEventCalls).toBe(1); // the booking_attempts CAS foundation makes this safe
@@ -431,13 +451,27 @@ describe("Phase 3C -- full E2E (in-memory, no real network)", () => {
       "America/Mexico_City",
     );
 
+    // Fase 7K: the commitment question itself must actually be SENT (and thus persisted --
+    // sendAndPersistReply never persists a message whose send failed, same rule the "K" test
+    // above already documents) for its pending state to exist at all, so this selection turn
+    // uses a WORKING messaging provider -- exactly like a real lead would experience up to this
+    // point. The confirmation reply below is the one that hits the failing provider, matching
+    // this test's actual subject: "the CONFIRMATION outbound fails after the appointment is
+    // created" (booking itself happens inside handleCommitmentReply's CONFIRMED branch, strictly
+    // before the confirmation is ever sent).
+    const selectingHandler = new WhatsAppBookingHandler(
+      { leads: repos.leadsRepo, conversations: repos.conversationsRepo, appointments: repos.appointmentsRepo, offeredSlots: repos.offeredSlotsRepo, slotOffering, appointmentService, messaging: new FakeMessagingProvider(), messages: repos.messagesRepo, leadStatusHistory: repos.leadStatusHistoryRepo, logger: new FakeLogger() },
+      "America/Mexico_City",
+    );
+    await selectingHandler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: "5214778000012", inboundText: "1", now });
+
     // Booking itself (appointment creation, slot selected, lead BOOKED) all happen BEFORE the
     // confirmation send -- the send failing afterward must never roll any of that back. There is
     // no automatic outbound retry for a delivery failure: recovery here means the appointment
     // remains correctly BOOKED and discoverable, never that the confirmation is resent
     // automatically -- an operator/future feature can resend from the persisted appointment data,
     // but this handler never recreates an appointment to "retry" a confirmation.
-    await failingHandler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: "5214778000012", inboundText: "1", now });
+    await failingHandler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: "5214778000012", inboundText: "no", now });
 
     const afterFirst = await repos.appointmentsRepo.findActiveByLeadId(lead.id);
     expect(afterFirst).toBeTruthy();

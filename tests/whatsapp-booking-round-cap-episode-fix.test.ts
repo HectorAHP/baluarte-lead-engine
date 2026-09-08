@@ -140,14 +140,15 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
 
     await send(app, "5214779950001", "wamid.r1", "Agendar");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
+    await send(app, "5214779950001", "wamid.r1b", "por la mañana"); // episode round 1
 
-    await send(app, "5214779950001", "wamid.r2", "otros horarios");
+    await send(app, "5214779950001", "wamid.r2", "otros horarios"); // episode round 2
 
     const after = await repos.leadsRepo.findById(lead.id);
     expect(after?.status).toBe("BOOKING_PENDING"); // NOT HUMAN_HANDOFF -- this was the exact residual bug
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[1]!.body).toContain("Perfecto");
-    expect(outbound[1]!.body).not.toContain("orientación adecuada");
+    expect(outbound[2]!.body).toContain("Perfecto");
+    expect(outbound[2]!.body).not.toContain("orientación adecuada");
   }, GENEROUS_TIMEOUT_MS);
 
   it("A. episode start after past appointment: 3 historical rounds do not block round 1 of the new episode", async () => {
@@ -158,9 +159,10 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     await seedHistoricalRounds(repos, conversation.id, lead.id, 3);
 
     await send(app, "5214779950002", "wamid.a1", "Agendar");
+    await send(app, "5214779950002", "wamid.a1b", "por la mañana");
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0]!.body).toContain("Tengo estos horarios disponibles");
+    expect(outbound[1]!.body).toContain("Tengo estos horarios disponibles");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
   }, GENEROUS_TIMEOUT_MS);
 
@@ -171,12 +173,13 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
     await seedHistoricalRounds(repos, conversation.id, lead.id, 3);
     await send(app, "5214779950003", "wamid.b1", "Agendar");
+    await send(app, "5214779950003", "wamid.b1b", "por la mañana");
 
     await send(app, "5214779950003", "wamid.b2", "otros horarios");
 
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[1]!.body).toContain("horarios");
+    expect(outbound[2]!.body).toContain("horarios");
   }, GENEROUS_TIMEOUT_MS);
 
   it("C. same episode, round 3: 'ninguno' succeeds", async () => {
@@ -186,13 +189,14 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
     await seedHistoricalRounds(repos, conversation.id, lead.id, 3);
     await send(app, "5214779950004", "wamid.c1", "Agendar");
+    await send(app, "5214779950004", "wamid.c1b", "por la mañana");
     await send(app, "5214779950004", "wamid.c2", "otros horarios");
 
     await send(app, "5214779950004", "wamid.c3", "ninguno");
 
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[2]!.body).toContain("horarios");
+    expect(outbound[3]!.body).toContain("horarios");
   }, GENEROUS_TIMEOUT_MS);
 
   it("D. same episode, round 4: MAX_ROUNDS_REACHED / handoff, correctly scoped to THIS episode's own 3 rounds", async () => {
@@ -201,7 +205,8 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     const { lead, conversation } = await createLeadAtStatus(repos, "5214779950005", "BOOKED");
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
     await seedHistoricalRounds(repos, conversation.id, lead.id, 3);
-    await send(app, "5214779950005", "wamid.d1", "Agendar"); // episode round 1
+    await send(app, "5214779950005", "wamid.d1", "Agendar"); // daypart question
+    await send(app, "5214779950005", "wamid.d1b", "por la mañana"); // episode round 1
     await send(app, "5214779950005", "wamid.d2", "otros horarios"); // episode round 2
     await send(app, "5214779950005", "wamid.d3", "ninguno"); // episode round 3
 
@@ -210,7 +215,7 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     const after = await repos.leadsRepo.findById(lead.id);
     expect(after?.status).toBe("HUMAN_HANDOFF"); // the cap DOES still protect within-episode
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[3]!.body).toContain("orientación adecuada");
+    expect(outbound[4]!.body).toContain("orientación adecuada");
   }, GENEROUS_TIMEOUT_MS);
 
   it("E. 10 historical rounds from previous episodes never affect the new episode's own count", async () => {
@@ -221,13 +226,14 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     await seedHistoricalRounds(repos, conversation.id, lead.id, 10);
 
     await send(app, "5214779950006", "wamid.e1", "Agendar");
+    await send(app, "5214779950006", "wamid.e1b", "por la mañana");
     await send(app, "5214779950006", "wamid.e2", "otros horarios");
     await send(app, "5214779950006", "wamid.e3", "ninguno");
 
     // All 3 rounds of the new episode succeeded despite 10 unrelated historical rounds.
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound).toHaveLength(3);
+    expect(outbound).toHaveLength(4); // daypart question + 3 rounds
     expect(outbound.every((m) => !m.body?.includes("orientación adecuada"))).toBe(true);
   }, GENEROUS_TIMEOUT_MS);
 
@@ -246,6 +252,10 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     }
 
     await send(app, "5214779950007", "wamid.f1", "Agendar");
+    // Fase 7K: the inconsistency (2 simultaneously active rounds) is only discoverable once
+    // getOrCreateOffer actually runs -- deferred until daypart is answered, since the daypart
+    // question itself never touches offered_slots.
+    await send(app, "5214779950007", "wamid.f1b", "por la mañana");
 
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF");
   });
@@ -256,9 +266,10 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     const { lead, conversation } = await createLeadAtStatus(repos, "5214779950008", "BOOKED");
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
     await seedHistoricalRounds(repos, conversation.id, lead.id, 3);
+    await send(app, "5214779950008", "wamid.a1", "Agendar");
 
-    await send(app, "5214779950008", "wamid.dup", "Agendar");
-    await send(app, "5214779950008", "wamid.dup", "Agendar"); // exact redelivery
+    await send(app, "5214779950008", "wamid.dup", "por la mañana");
+    await send(app, "5214779950008", "wamid.dup", "por la mañana"); // exact redelivery
 
     const roundIds = new Set((await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date())).map((s) => s.roundId));
     expect(roundIds.size).toBe(1); // still exactly one round for the new episode
@@ -271,8 +282,10 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     const stale = await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
     await seedHistoricalRounds(repos, conversation.id, lead.id, 3);
     await send(app, "5214779950009", "wamid.h1", "Agendar");
+    await send(app, "5214779950009", "wamid.h1b", "por la mañana");
 
     await send(app, "5214779950009", "wamid.h2", "1"); // select the first offered slot
+    await send(app, "5214779950009", "wamid.h2b", "no"); // CONFIRMED -> books
 
     const all = await repos.appointmentsRepo.listAllByLeadId(lead.id);
     const newAppt = all.find((a) => a.id !== stale.id);

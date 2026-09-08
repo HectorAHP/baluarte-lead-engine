@@ -218,10 +218,11 @@ describe("Fase 6E -- Lía natural conversation experience", () => {
     const { conversation } = await createLeadAtStatus(repos, "5214776200910", "QUALIFIED_A", { firstName: "Juan" });
 
     await send(app, "5214776200910", "wamid.1", "Quiero agendar una cita");
+    await send(app, "5214776200910", "wamid.1b", "por la mañana");
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toContain("Perfecto, Juan");
-    expect(outbound[0].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound[1].body).toContain("Perfecto, Juan");
+    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     const realSlots = await repos.calendar.getAvailableSlots(new Date(), new Date(Date.now() + 7 * 86400000), 30);
     expect(offered.length).toBeLessThanOrEqual(realSlots.length + 1); // provider-bounded, never invented beyond what it can return
@@ -233,8 +234,10 @@ describe("Fase 6E -- Lía natural conversation experience", () => {
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { conversation } = await createLeadAtStatus(repos, "5214776200911", "QUALIFIED_A", { firstName: "Juan" });
     await send(app, "5214776200911", "wamid.1", "Quiero agendar una cita");
+    await send(app, "5214776200911", "wamid.1b", "por la mañana");
 
     await send(app, "5214776200911", "wamid.2", "1");
+    await send(app, "5214776200911", "wamid.2b", "no");
 
     const outbound = await outboundMessages(repos, conversation.id);
     const confirmed = outbound[outbound.length - 1].body!;
@@ -248,10 +251,11 @@ describe("Fase 6E -- Lía natural conversation experience", () => {
     const { conversation } = await createLeadAtStatus(repos, "5214776200912", "QUALIFIED_A", { firstName: "Juan" });
 
     await send(app, "5214776200912", "wamid.1", "Quiero agendar una cita");
+    await send(app, "5214776200912", "wamid.1b", "por la mañana");
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toBe(BOOKING_TECHNICAL_ERROR_MESSAGE);
-    const lower = outbound[0].body!.toLowerCase();
+    expect(outbound[1].body).toBe(BOOKING_TECHNICAL_ERROR_MESSAGE);
+    const lower = outbound[1].body!.toLowerCase();
     expect(lower).not.toContain("google");
     expect(lower).not.toContain("api");
     expect(lower).not.toContain("provider");
@@ -263,11 +267,13 @@ describe("Fase 6E -- Lía natural conversation experience", () => {
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { conversation } = await createLeadAtStatus(repos, "5214776200913", "QUALIFIED_A", { firstName: "Juan" });
     await send(app, "5214776200913", "wamid.1", "Quiero agendar una cita");
+    await send(app, "5214776200913", "wamid.1b", "por la mañana");
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     const first = [...offered].sort((a, b) => a.position - b.position)[0];
     await repos.calendar.createEvent({ title: "race", description: "", start: first.slotStart, end: first.slotEnd });
 
     await send(app, "5214776200913", "wamid.2", "1");
+    await send(app, "5214776200913", "wamid.2b", "no");
 
     const outbound = await outboundMessages(repos, conversation.id);
     const lastReply = outbound[outbound.length - 1].body!;
@@ -346,8 +352,10 @@ describe("Fase 6E -- Lía natural conversation experience", () => {
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead } = await createLeadAtStatus(repos, "5214776200922", "QUALIFIED_A", { firstName: "Juan" });
     await send(app, "5214776200922", "wamid.1", "Quiero agendar una cita");
+    await send(app, "5214776200922", "wamid.1b", "por la mañana");
 
     await send(app, "5214776200922", "wamid.2", "1");
+    await send(app, "5214776200922", "wamid.2b", "no");
 
     const after = await repos.leadsRepo.findById(lead.id);
     expect(after?.status).toBe("BOOKED");

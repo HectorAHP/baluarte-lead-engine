@@ -179,12 +179,13 @@ describe("Pre-launch hardening -- stale/past BOOKED appointment recovery", () =>
     const staleAppointment = await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779990003", "wamid.3a", "Quiero agendar");
+    await send(app, "5214779990003", "wamid.3a2", "por la mañana");
 
     const finalLead = await repos.leadsRepo.findById(lead.id);
     expect(finalLead?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound).toHaveLength(1);
-    expect(outbound[0].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound).toHaveLength(2); // daypart question + real new offer
+    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
     // The stale appointment row itself is never touched.
     const reloadedStale = await repos.appointmentsRepo.findById(staleAppointment.id);
     expect(reloadedStale?.status).toBe("BOOKED");
@@ -217,13 +218,14 @@ describe("Pre-launch hardening -- stale/past BOOKED appointment recovery", () =>
     const staleAppointment = await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779990005", "wamid.5a", "Reagendar");
+    await send(app, "5214779990005", "wamid.5a2", "por la mañana");
 
     const finalLead = await repos.leadsRepo.findById(lead.id);
     expect(finalLead?.status).toBe("BOOKING_PENDING"); // NOT RESCHEDULE_REQUESTED
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound).toHaveLength(2); // acknowledgment + real new offer
+    expect(outbound).toHaveLength(3); // acknowledgment + daypart question + real new offer
     expect(outbound[0].body).toContain("ya pasó");
-    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound[2].body).toContain("Tengo estos horarios disponibles");
     // The old appointment never transitions to RESCHEDULED -- it was never "the" old appointment
     // of a reschedule, just an untouched stale row.
     const reloadedStale = await repos.appointmentsRepo.findById(staleAppointment.id);

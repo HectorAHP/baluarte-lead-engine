@@ -4,8 +4,10 @@ import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
 import { parseDatePreference } from "../domain/date-preference-parser.js";
 import { sendAndPersistReply } from "./whatsapp-inbound-service.js";
-import { escalateToHuman, dispatchSlotOfferOutcome, type BookingOutcomeDeps } from "./booking-outcome-dispatch.js";
+import { escalateToHuman, type BookingOutcomeDeps } from "./booking-outcome-dispatch.js";
+import { offerWithDaypartGate } from "./booking-commitment-flow.js";
 import type { SlotOfferingService } from "./slot-offering-service.js";
+import type { OfferedSlotRepository } from "./ports.js";
 import { ActiveOfferInconsistentError, SlotOfferClaimInProgressError } from "../domain/errors.js";
 import {
   CANCELLED_GENERIC_INBOUND_MESSAGE, CANCELLED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE, CANCELLED_ALREADY_MESSAGE,
@@ -15,6 +17,8 @@ import { config } from "../config.js";
 
 export interface WhatsAppReactivationHandlerDeps extends BookingOutcomeDeps {
   slotOffering: SlotOfferingService;
+  // Fase 7K -- required by offerWithDaypartGate/booking-commitment-flow.ts's CommitmentFlowDeps.
+  offeredSlots: OfferedSlotRepository;
 }
 
 export interface ReactivationTurnHandler {
@@ -98,10 +102,13 @@ export class WhatsAppReactivationHandler implements ReactivationTurnHandler {
    * never treated as -- or counted against -- any reschedule episode's round budget. */
   private async startNewBooking(lead: Lead, conversationId: string, whatsappUserId: string, now: Date, inboundText: string): Promise<void> {
     // Fase 7I: same parser as WhatsAppBookingHandler/WhatsAppRescheduleHandler -- never a second,
-    // divergent implementation.
+    // divergent implementation. Fase 7K section 19: gated on daypart -- same
+    // offerWithDaypartGate every other booking-episode entry point uses.
     const datePreference = parseDatePreference(inboundText, now, this.advisorTimezone) ?? undefined;
-    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, datePreference });
-    await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
+    await offerWithDaypartGate(this.deps, {
+      lead, conversationId, whatsappUserId, now, datePreference,
+      mode: "BOOKING", offerAction: "NEW", advisorTimezone: this.advisorTimezone,
+    });
   }
 
   /**

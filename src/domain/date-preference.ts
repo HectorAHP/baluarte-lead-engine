@@ -1,4 +1,4 @@
-import { localDateString } from "./timezone.js";
+import { localDateString, zonedTimeParts } from "./timezone.js";
 
 /**
  * Fase 7I -- a deterministic, user-expressed temporal preference for booking/reschedule slot
@@ -33,6 +33,13 @@ export interface DatePreference {
    * occurrence) purely as a byproduct of "filter, then take the earliest" -- no separate "resolve
    * to next Saturday" date arithmetic is needed or performed anywhere. */
   weekday?: 0 | 1 | 2 | 3 | 4 | 5 | 6;
+  /** Fase 7K section 22 -- "YYYY-MM-DD" local dates to exclude from the result, regardless of
+   * whether they'd otherwise match. Never produced by parseDatePreference itself (no inbound text
+   * ever expresses this directly) -- only ever set programmatically by a handler reacting to
+   * "otro día"/"otros días", populated from the local dates already shown in the CURRENTLY active
+   * round, so a fresh offer prefers genuinely different days over repeating the same ones. A
+   * simple exclusion list, deliberately never a second diversity pass or its own algorithm. */
+  excludeLocalDates?: readonly string[];
   daypart?: Daypart;
 }
 
@@ -60,6 +67,51 @@ export const DAYPART_WINDOWS_MINUTES: Record<Daypart, { startMinute: number; end
   AFTERNOON: { startMinute: 12 * 60, endMinute: 18 * 60 },
   EVENING: { startMinute: 18 * 60, endMinute: 24 * 60 },
 };
+
+/**
+ * Fase 7K -- recovers WHICH daypart an already-offered slot belongs to, from the slot's own
+ * start/end time alone -- no separate persistence needed. Safe precisely because, by
+ * construction (offerWithDaypartGate, booking-commitment-flow.ts), every round created after this
+ * feature exists is only ever created once a daypart is known, so any slot reaching this function
+ * necessarily already falls within SOME daypart window. Checked in MORNING -> AFTERNOON ->
+ * EVENING order, same full-containment rule filterSlotsByDatePreference itself uses (start >=
+ * window.start AND end <= window.end) so this is guaranteed consistent with what actually
+ * produced the slot. Falls back to "MORNING" only for a slot that (should never happen) doesn't
+ * fully fit any window -- documented rather than silently guessed, and never thrown: this is used
+ * only to re-offer alternatives after an OBSTACLE reply (section 15/21), not for anything that
+ * gates booking correctness itself.
+ */
+export function resolveDaypartForSlot(slotStart: Date, slotEnd: Date, timezone: string): Daypart {
+  const startParts = zonedTimeParts(slotStart, timezone);
+  const endParts = zonedTimeParts(slotEnd, timezone);
+  const startMinute = startParts.hour * 60 + startParts.minute;
+  const endMinute = endParts.hour * 60 + endParts.minute;
+  for (const daypart of ["MORNING", "AFTERNOON", "EVENING"] as const) {
+    const window = DAYPART_WINDOWS_MINUTES[daypart];
+    if (startMinute >= window.startMinute && endMinute <= window.endMinute) return daypart;
+  }
+  return "MORNING";
+}
+
+/**
+ * Fase 7K section 21 -- a plain DECLINED reply ("otro horario"/"ninguno"/etc) must keep BOTH the
+ * daypart AND the date preference already active for this round, never just the daypart alone.
+ * Derives the daypart from the first slot (resolveDaypartForSlot, see its own doc comment), and
+ * ALSO pins targetDate when every currently active slot already falls on the SAME local calendar
+ * date -- the one case where "this round was already scoped to one specific day" can be inferred
+ * safely from the slots themselves (a diversified, unconstrained round spreads across distinct
+ * dates almost always, by construction -- see selectDiverseSlots), without needing a separate
+ * persistence mechanism for the preference that produced them. When the active slots span more
+ * than one date, targetDate/weekday are left unset -- exactly the diversified, no-single-day-
+ * pinned case, where "keep the same days" doesn't mean anything narrower than "keep the daypart".
+ */
+export function resolveDatePreferenceForRound(activeSlots: ReadonlyArray<{ slotStart: Date; slotEnd: Date }>, timezone: string): DatePreference {
+  const daypart = resolveDaypartForSlot(activeSlots[0].slotStart, activeSlots[0].slotEnd, timezone);
+  const dates = new Set(activeSlots.map((s) => localDateString(s.slotStart, timezone)));
+  const preference: DatePreference = { daypart };
+  if (dates.size === 1) preference.targetDate = [...dates][0];
+  return preference;
+}
 
 /**
  * Fase 7I.1 -- CAUSE_ROUND_CAP_ESCALATION fix. A `targetDate` that is already in the past, or

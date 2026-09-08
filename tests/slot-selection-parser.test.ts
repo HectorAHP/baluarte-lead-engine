@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseSlotSelection } from "../src/domain/slot-selection-parser.js";
+import { parseSlotSelection, isOtherDayDeclineRequest } from "../src/domain/slot-selection-parser.js";
 import { ActiveOfferInconsistentError } from "../src/domain/errors.js";
 import type { OfferedSlot } from "../src/domain/offered-slot.js";
 
@@ -109,5 +109,18 @@ describe("parseSlotSelection -- round consistency", () => {
     const slots = makeActiveSlots();
     slots[2] = { ...slots[2], roundId: "round-2" };
     expect(() => parseSlotSelection("1", slots, now)).toThrow(ActiveOfferInconsistentError);
+  });
+});
+
+describe("isOtherDayDeclineRequest (Fase 7K section 22)", () => {
+  it("1. 'otro dia' -> true", () => expect(isOtherDayDeclineRequest("otro dia")).toBe(true));
+  it("2. 'otro día' (accented) -> true", () => expect(isOtherDayDeclineRequest("otro día")).toBe(true));
+  it("3. 'otros dias' -> true", () => expect(isOtherDayDeclineRequest("otros días")).toBe(true));
+  it("4. case/whitespace insensitive", () => expect(isOtherDayDeclineRequest("  OTRO   DIA  ")).toBe(true));
+  it("5. 'otro horario' -> false (a different TIME, not a different day)", () => expect(isOtherDayDeclineRequest("otro horario")).toBe(false));
+  it("6. 'ninguno' -> false", () => expect(isOtherDayDeclineRequest("ninguno")).toBe(false));
+  it("7. both DECLINED phrases are still recognized by parseSlotSelection itself", () => {
+    expect(parseSlotSelection("otro dia", makeActiveSlots(), now)).toEqual({ type: "DECLINED" });
+    expect(parseSlotSelection("otros dias", makeActiveSlots(), now)).toEqual({ type: "DECLINED" });
   });
 });

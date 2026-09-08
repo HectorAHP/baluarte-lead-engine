@@ -490,8 +490,19 @@ export class SlotOfferingService {
    * transition itself, on detecting reschedule-intent, before calling getOrCreateOffer). There is
    * no equivalent "offer started" event to record here; CANCELLATION_REQUESTED-shaped semantics
    * don't apply to a status the lead already durably holds.
+   *
+   * Fase 7K -- promoted from private to public: booking-commitment-flow.ts's offerWithDaypartGate
+   * calls this SAME method (never a second, divergent transition) at the moment it asks the
+   * daypart question, i.e. BEFORE any round exists -- otherwise a lead answering that question
+   * would still be sitting on QUALIFIED_A/B/NURTURE_C/CANCELLED/BOOKED, and
+   * whatsapp-inbound-service.ts's routing (by lead.status alone) would send that answer to the
+   * qualified-lead menu instead of back to WhatsAppBookingHandler. Idempotent either way (a no-op
+   * once already BOOKING_PENDING), so both callers can safely call it. This also means a booking
+   * "episode" (see episodeScopedSince above) now begins at the daypart question, not at the first
+   * round -- a strictly earlier, still-correct boundary: every round in the episode is created
+   * only after this same call already ran once for it.
    */
-  private async ensureOfferableLeadStatus(lead: Lead, now: Date, mode?: SlotOfferParams["mode"]): Promise<Lead> {
+  async ensureOfferableLeadStatus(lead: Lead, now: Date, mode?: SlotOfferParams["mode"]): Promise<Lead> {
     if (mode?.type === "RESCHEDULE") return lead;
     if (lead.status === "BOOKING_PENDING") return lead;
     assertTransition(lead.status, "BOOKING_PENDING");

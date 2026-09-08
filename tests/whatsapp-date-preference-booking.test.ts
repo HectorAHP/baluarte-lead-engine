@@ -133,14 +133,19 @@ describe("Fase 7I -- WhatsApp booking: item 1/26 (the real incident, reproduced 
     const h = makeBookingHandler();
     const { lead, conversation } = await makeBookingPendingLead(h);
 
+    // Fase 7K section 2/3: "sábado" alone carries no daypart -- the daypart question is asked
+    // first (no Calendar call, no round consumed yet), then the real offer follows.
     await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Quiero agendar en sábado", now: NOW });
+    const afterIntentLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: afterIntentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "por la mañana", now: NOW });
 
     const activeSlots = await h.offeredSlots.listActiveByConversationId(conversation.id, NOW);
     expect(activeSlots.length).toBeGreaterThan(0);
     for (const s of activeSlots) expect(localDow(s.slotStart)).toBe(6);
 
     // The exact real incident's expected outcome (Fase 7I-DIAG item 26): next Saturday = 2026-09-12,
-    // first three slots 09:00/09:30/10:00 local, never Monday.
+    // first three slots 09:00/09:30/10:00 local, never Monday. Unchanged by the MORNING filter --
+    // all three already fall within 09:00-12:00.
     const sorted = [...activeSlots].sort((a, b) => a.position - b.position);
     const localTimes = sorted.map((s) => {
       const p = zonedTimeParts(s.slotStart, "America/Mexico_City");
@@ -157,14 +162,19 @@ describe("Fase 7I -- WhatsApp booking: item 3 (active round replaced by a new pr
     const h = makeBookingHandler();
     const { lead, conversation } = await makeBookingPendingLead(h);
 
-    // First turn: no preference -- bootstraps the default (chronological) round.
+    // First turn: no preference -- no daypart yet either, so this only asks the daypart question.
     await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "hola", now: NOW });
+    const afterIntentLead = (await h.leads.findById(lead.id))!;
+    // Second turn: answers the daypart question -- bootstraps the default (chronological) round.
+    await h.handler.handleTurn({ lead: afterIntentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "por la mañana", now: NOW });
     const firstRound = await h.offeredSlots.listActiveByConversationId(conversation.id, NOW);
     expect(firstRound.length).toBeGreaterThan(0);
     expect(localDow(firstRound[0].slotStart)).toBe(1); // Monday, unfiltered default
 
-    // Second turn: "mejor el sábado" -- must REPLACE the round, never fall through to
+    // Third turn: "mejor el sábado" -- must REPLACE the round, never fall through to
     // parseSlotSelection's INVALID fallback (which would just repeat the same Monday options).
+    // Fase 7K section 3/23: the MORNING preference already established for the active round is
+    // inherited here, never re-asked -- a day-only change stays a single turn.
     await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "mejor el sábado", now: NOW });
 
     const stillActive = await h.offeredSlots.listActiveByConversationId(conversation.id, NOW);
@@ -182,6 +192,8 @@ describe("Fase 7I -- WhatsApp booking: item 4 (Sunday -> explanation + real fall
     const { lead, conversation } = await makeBookingPendingLead(h);
 
     await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "quiero agendar el domingo", now: NOW });
+    const afterIntentLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: afterIntentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "por la mañana", now: NOW });
 
     const activeSlots = await h.offeredSlots.listActiveByConversationId(conversation.id, NOW);
     expect(activeSlots.length).toBeGreaterThan(0); // a real fallback round WAS created
@@ -211,11 +223,13 @@ describe("Fase 7I -- WhatsApp booking: item 5 (a specific day with zero availabi
     const { lead, conversation } = await makeBookingPendingLead(h);
 
     await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "quiero agendar en sábado", now: NOW });
+    const afterIntentLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: afterIntentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "por la mañana", now: NOW });
 
     const activeSlots = await h.offeredSlots.listActiveByConversationId(conversation.id, NOW);
     expect(activeSlots.length).toBeGreaterThan(0); // real fallback, not silence
     expect(activeSlots.every((s) => localDow(s.slotStart) !== 6)).toBe(true); // never lies about being Saturday
-    expect(h.messaging.sentTexts[0].body).toContain("Para ese día no tengo horarios disponibles");
+    expect(h.messaging.sentTexts[1].body).toContain("Para ese día no tengo horarios disponibles");
   });
 });
 
@@ -225,6 +239,8 @@ describe("Fase 7I -- WhatsApp booking: item 6 (date beyond BOOKING_MAX_DAYS_AHEA
     const { lead, conversation } = await makeBookingPendingLead(h);
 
     await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "quiero agendar el 25 de diciembre", now: NOW });
+    const afterIntentLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: afterIntentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "por la mañana", now: NOW });
 
     const activeSlots = await h.offeredSlots.listActiveByConversationId(conversation.id, NOW);
     expect(activeSlots.length).toBeGreaterThan(0);
@@ -232,7 +248,7 @@ describe("Fase 7I -- WhatsApp booking: item 6 (date beyond BOOKING_MAX_DAYS_AHEA
       const p = zonedTimeParts(s.slotStart, "America/Mexico_City");
       expect(p.month).not.toBe(12); // never actually offers December 25th
     }
-    expect(h.messaging.sentTexts[0].body).toContain("fuera de ese rango");
+    expect(h.messaging.sentTexts[1].body).toContain("fuera de ese rango");
   });
 });
 
@@ -242,6 +258,9 @@ describe("Fase 7I -- WhatsApp reschedule: item 2 (reagendar para sábado)", () =
     const { lead, conversation } = await makeBookedLeadWithAppointment(h);
 
     await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "reagendar para sábado", now: NOW });
+    expect((await h.leads.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
+    const afterIntentLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: afterIntentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "por la mañana", now: NOW });
 
     expect((await h.leads.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
     const activeSlots = await h.offeredSlots.listActiveByConversationId(conversation.id, NOW, (await h.appointments.listAllByLeadId(lead.id)).find((a) => a.status === "BOOKED")!.id);
@@ -260,8 +279,11 @@ describe("Fase 7I -- WhatsApp reschedule: item 7 (old appointment untouched unti
     const reread = await h.appointments.findById(appointment.id);
     expect(reread?.status).toBe("BOOKED"); // still untouched -- no slot has been SELECTED yet
 
-    // A further preference change ("mejor domingo" -> replaces the round again) must ALSO never
-    // touch the old appointment.
+    // Fase 7K: "sábado" carries no daypart, so the turn above only asked the daypart question --
+    // no round exists yet at all. "mejor domingo" (a further date-only change, still no daypart)
+    // updates the pending question's target weekday and re-asks -- section 3/23's "never
+    // misread a date-only follow-up as unrelated content" case -- and must, like everything
+    // before an actual slot is SELECTED, never touch the old appointment either way.
     await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "mejor domingo", now: NOW });
     const rereadAgain = await h.appointments.findById(appointment.id);
     expect(rereadAgain?.status).toBe("BOOKED");
@@ -273,25 +295,32 @@ describe("Fase 7I.1 -- CAUSE_ROUND_CAP_ESCALATION fix: exact real-incident repro
     const h = makeBookingHandler();
     const { lead, conversation } = await makeBookingPendingLead(h);
 
-    // The exact real conversation, in order (Fase 7I.1-DIAG item 26/7):
-    await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Quiero agendar en sábado", now: NOW }); // round 1
+    // The exact real conversation, in order (Fase 7I.1-DIAG item 26/7). Fase 7K section 2/3/24:
+    // none of "sábado"/"domingo" carries a daypart, so the first two turns only negotiate the
+    // daypart question (updating the pending target weekday each time, per section 3/23) -- a
+    // genuine PRODUCT IMPROVEMENT this phase introduces: daypart negotiation never consumes round
+    // budget at all (section 24), so only the THIRD turn (which finally states a daypart) creates
+    // round 1 -- there is no round 2/3 to create, unlike the pre-7K flow.
+    await h.handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Quiero agendar en sábado", now: NOW }); // daypart question (weekday=6 pending)
     let currentLead = (await h.leads.findById(lead.id))!;
-    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Mejor domingo", now: new Date(NOW.getTime() + 31_000) }); // round 2 (fallback)
+    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Mejor domingo", now: new Date(NOW.getTime() + 31_000) }); // still no daypart -- re-asks (weekday=0 pending)
     currentLead = (await h.leads.findById(lead.id))!;
-    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Sábado por la mañana", now: new Date(NOW.getTime() + 50_000) }); // round 3 -- ACTIVE, never expires in this test
+    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Sábado por la mañana", now: new Date(NOW.getTime() + 50_000) }); // daypart resolved -- round 1 created (Saturday, MORNING)
     currentLead = (await h.leads.findById(lead.id))!;
 
-    expect(await h.offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(3);
+    expect(await h.offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(1);
     const activeBefore = await h.offeredSlots.listActiveByConversationId(conversation.id, new Date(NOW.getTime() + 70_000));
     expect(activeBefore.length).toBeGreaterThan(0);
     for (const s of activeBefore) expect(localDow(s.slotStart)).toBe(6); // Saturday
 
-    // The real trigger.
+    // The real trigger. Fase 7K: the Saturday/MORNING preference of the still-active round 1 is
+    // inherited (section 3/23) -- never re-asked -- so this goes straight to the same
+    // OUT_OF_HORIZON / ACTIVE_ROUND fallback the pre-7K flow already relied on.
     await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "Quiero agendar el 15 de diciembre", now: new Date(NOW.getTime() + 70_000) });
 
     const finalLead = await h.leads.findById(lead.id);
     expect(finalLead?.status).toBe("BOOKING_PENDING"); // NEVER HUMAN_HANDOFF
-    expect(await h.offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(3); // still 3 -- no round 4
+    expect(await h.offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(1); // still round 1 -- no round 2
 
     const activeAfter = await h.offeredSlots.listActiveByConversationId(conversation.id, new Date(NOW.getTime() + 70_000));
     expect(activeAfter.map((s) => s.id).sort()).toEqual(activeBefore.map((s) => s.id).sort()); // the exact same Saturday round, untouched
@@ -320,7 +349,9 @@ describe("Fase 7I.1 -- CAUSE_ROUND_CAP_ESCALATION fix: exact real-incident repro
     currentLead = (await h.leads.findById(lead.id))!;
     expect(currentLead.status).toBe("BOOKING_PENDING");
 
-    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now: new Date(NOW.getTime() + 90_000) });
+    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now: new Date(NOW.getTime() + 90_000) }); // commitment question
+    currentLead = (await h.leads.findById(lead.id))!;
+    await h.handler.handleTurn({ lead: currentLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now: new Date(NOW.getTime() + 95_000) }); // CONFIRMED -> books
 
     const booked = await h.leads.findById(lead.id);
     expect(booked?.status).toBe("BOOKED");

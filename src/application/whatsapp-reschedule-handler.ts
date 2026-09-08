@@ -13,8 +13,12 @@ import { sendAndPersistReply } from "./whatsapp-inbound-service.js";
 import { escalateToHuman, dispatchSlotOfferOutcome, type BookingOutcomeDeps } from "./booking-outcome-dispatch.js";
 import type { SlotOfferingService } from "./slot-offering-service.js";
 import type { AppointmentRescheduleService } from "./appointment-reschedule-service.js";
-import { parseSlotSelection } from "../domain/slot-selection-parser.js";
+import { parseSlotSelection, isOtherDayDeclineRequest } from "../domain/slot-selection-parser.js";
 import { parseDatePreference } from "../domain/date-preference-parser.js";
+import { resolveDaypartForSlot, resolveDatePreferenceForRound, type DatePreference } from "../domain/date-preference.js";
+import { localDateString } from "../domain/timezone.js";
+import { resolvePendingBookingFlowState } from "../domain/booking-flow-state.js";
+import { offerWithDaypartGate, handleDaypartReply, initiateCommitmentCheck, handleCommitmentReply } from "./booking-commitment-flow.js";
 import {
   RESCHEDULE_INTRO_MESSAGE, buildRescheduleConfirmedMessage, RESCHEDULE_TECHNICAL_ERROR_MESSAGE,
   RESCHEDULE_IN_PROGRESS_MESSAGE, buildInvalidSelectionMessage, buildReschedulePendingFallbackMessage,
@@ -95,9 +99,12 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
 
     // Fase 7I: the SAME message that carried the reschedule-intent ("reagendar para el sábado")
     // may itself carry a date preference -- parsed once here, same parser as booking.
+    // Fase 7K section 18: gated on daypart, same as WhatsAppBookingHandler.startNewBooking.
     const datePreference = parseDatePreference(inboundText, now, this.advisorTimezone) ?? undefined;
-    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead: updatedLead, conversationId, now, mode: { type: "RESCHEDULE", oldAppointmentId: oldAppointment.id }, datePreference });
-    await dispatchSlotOfferOutcome(this.deps, outcome, updatedLead, conversationId, whatsappUserId, this.advisorTimezone);
+    await offerWithDaypartGate(this.deps, {
+      lead: updatedLead, conversationId, whatsappUserId, now, datePreference,
+      mode: "RESCHEDULE", oldAppointmentId: oldAppointment.id, offerAction: "NEW", advisorTimezone: this.advisorTimezone,
+    });
   }
 
   /** RESCHEDULE_REQUESTED: cancellation-intent is checked FIRST, before ever trying to parse a
@@ -115,6 +122,23 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     if (!oldAppointment) throw new AppointmentRescheduleInconsistentError(lead.id, "NO_APPOINTMENT");
     const rescheduleMode = { type: "RESCHEDULE" as const, oldAppointmentId: oldAppointment.id };
 
+    // Fase 7K section 5/18/27/29: a pending daypart question or Sandler commitment check takes
+    // priority over everything below -- checked AFTER the cancellation-intent guard above
+    // (section 29), mirroring WhatsAppBookingHandler exactly.
+    const priorMessages = await this.deps.messages.listByConversationId(conversationId);
+    const pendingFlow = resolvePendingBookingFlowState(priorMessages);
+    if (pendingFlow?.type === "DAYPART") {
+      await handleDaypartReply(this.deps, { lead, conversationId, whatsappUserId, now, inboundText, pending: pendingFlow.data, advisorTimezone: this.advisorTimezone });
+      return;
+    }
+    if (pendingFlow?.type === "COMMITMENT") {
+      await handleCommitmentReply(this.deps, {
+        lead, conversationId, whatsappUserId, now, inboundText, pending: pendingFlow.data, advisorTimezone: this.advisorTimezone,
+        commitSlot: (slot, activeSlots) => this.handleSelection(slot, activeSlots, lead, conversationId, whatsappUserId, now),
+      });
+      return;
+    }
+
     // Phase 4C post-mortem fix: MUST be scoped by reschedule context -- an unscoped call here was
     // the actual root cause of a reschedule silently reusing unselected leftover slots from the
     // conversation's ORIGINAL booking round (whenever that round hadn't fully expired yet).
@@ -123,19 +147,30 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     if (activeSlots.length === 0) {
       // Nothing to interpret the inbound text against (e.g. the round expired, or this is a
       // recovery retry) -- get (or create) a fresh offer first, same bootstrap as
-      // WhatsAppBookingHandler. Fase 7I: this same text may carry a date preference.
+      // WhatsAppBookingHandler. Fase 7I: this same text may carry a date preference. Fase 7K:
+      // gated on daypart, same as WhatsAppBookingHandler.
       const datePreference = parseDatePreference(inboundText, now, this.advisorTimezone) ?? undefined;
-      const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, mode: rescheduleMode, datePreference });
-      await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
+      await offerWithDaypartGate(this.deps, {
+        lead, conversationId, whatsappUserId, now, datePreference,
+        mode: "RESCHEDULE", oldAppointmentId: oldAppointment.id, offerAction: "NEW", advisorTimezone: this.advisorTimezone,
+      });
       return;
     }
 
     // Fase 7I: same "a new explicit preference replaces the active round" rule as
     // WhatsAppBookingHandler -- checked BEFORE parseSlotSelection so a bare number is unaffected.
+    // Fase 7K: gated on daypart, same as WhatsAppBookingHandler -- and same inheritance from the
+    // currently active round (section 3/23) so a day-only change never re-asks a daypart already
+    // established for this reschedule episode.
     const newPreference = parseDatePreference(inboundText, now, this.advisorTimezone);
     if (newPreference) {
-      const replaced = await this.deps.slotOffering.replaceOffer({ lead, conversationId, now, mode: rescheduleMode, datePreference: newPreference });
-      await dispatchSlotOfferOutcome(this.deps, replaced, lead, conversationId, whatsappUserId, this.advisorTimezone);
+      if (newPreference.daypart === undefined) {
+        newPreference.daypart = resolveDaypartForSlot(activeSlots[0].slotStart, activeSlots[0].slotEnd, this.advisorTimezone);
+      }
+      await offerWithDaypartGate(this.deps, {
+        lead, conversationId, whatsappUserId, now, datePreference: newPreference,
+        mode: "RESCHEDULE", oldAppointmentId: oldAppointment.id, offerAction: "REPLACE", advisorTimezone: this.advisorTimezone,
+      });
       return;
     }
 
@@ -153,12 +188,30 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     }
 
     if (selection.type === "DECLINED") {
-      const replacement = await this.deps.slotOffering.replaceOffer({ lead, conversationId, now, mode: rescheduleMode });
+      // Fase 7K section 21: keep BOTH the round's own daypart AND date preference on a fresh
+      // re-offer. Section 22: "otro día"/"otros días" is the opposite of "keep the same day" --
+      // drops any inferred targetDate and excludes the dates already shown instead.
+      let datePreference: DatePreference = resolveDatePreferenceForRound(activeSlots, this.advisorTimezone);
+      if (isOtherDayDeclineRequest(inboundText)) {
+        datePreference = {
+          daypart: datePreference.daypart,
+          excludeLocalDates: [...new Set(activeSlots.map((s) => localDateString(s.slotStart, this.advisorTimezone)))],
+        };
+      }
+      const replacement = await this.deps.slotOffering.replaceOffer({ lead, conversationId, now, mode: rescheduleMode, datePreference });
       await dispatchSlotOfferOutcome(this.deps, replacement, lead, conversationId, whatsappUserId, this.advisorTimezone, "slot_unavailable");
       return;
     }
 
-    await this.handleSelection(selection.slot, activeSlots, lead, conversationId, whatsappUserId, now);
+    // Fase 7K section 11/18: selecting a slot starts the Sandler commitment check instead of
+    // rescheduling immediately -- rescheduling now only ever happens from
+    // handleCommitmentReply's CONFIRMED branch, which delegates back to this SAME
+    // handleSelection, unchanged.
+    const daypart = resolveDaypartForSlot(selection.slot.slotStart, selection.slot.slotEnd, this.advisorTimezone);
+    await initiateCommitmentCheck(this.deps, {
+      lead, conversationId, whatsappUserId, now, slot: selection.slot, mode: "RESCHEDULE", oldAppointmentId: oldAppointment.id,
+      datePreference: { daypart }, advisorTimezone: this.advisorTimezone,
+    });
   }
 
   private async handleSelection(

@@ -12,10 +12,14 @@ import {
 import { sendAndPersistReply, type BookingTurnHandler, type HandoffAlertTurnService } from "./whatsapp-inbound-service.js";
 import type { SlotOfferingService } from "./slot-offering-service.js";
 import { targetStatusForScore, type AppointmentService } from "./services.js";
-import { parseSlotSelection } from "../domain/slot-selection-parser.js";
+import { parseSlotSelection, isOtherDayDeclineRequest } from "../domain/slot-selection-parser.js";
 import { parseDatePreference } from "../domain/date-preference-parser.js";
 import { isSocialAcknowledgement, isBareGreeting, isBookingIndecisionReply } from "../domain/social-acknowledgement-detection.js";
 import { markLeadBooked, escalateToHuman, dispatchSlotOfferOutcome } from "./booking-outcome-dispatch.js";
+import { offerWithDaypartGate, handleDaypartReply, initiateCommitmentCheck, handleCommitmentReply } from "./booking-commitment-flow.js";
+import { resolvePendingBookingFlowState } from "../domain/booking-flow-state.js";
+import { resolveDaypartForSlot, resolveDatePreferenceForRound, type DatePreference } from "../domain/date-preference.js";
+import { localDateString } from "../domain/timezone.js";
 import { isBookingAbandonRequest } from "../domain/booking-abandon-intent-detection.js";
 import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
 import { isUpcomingBooked } from "../domain/appointment-timing.js";
@@ -122,9 +126,14 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
   private async startNewBooking(lead: Lead, conversationId: string, whatsappUserId: string, now: Date, inboundText: string): Promise<void> {
     // Fase 7I: the SAME message that triggered this new-booking round ("quiero agendar en
     // sábado") may itself carry a date preference -- parsed once here, never a second detector.
+    // Fase 7K section 2/3/8: gated on daypart -- offerWithDaypartGate asks first when it's not
+    // already known (e.g. "quiero agendar" alone), or proceeds straight to the offer when it is
+    // (e.g. "quiero el sábado por la mañana"), byte-identical to before for that case.
     const datePreference = parseDatePreference(inboundText, now, this.advisorTimezone) ?? undefined;
-    const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, datePreference });
-    await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
+    await offerWithDaypartGate(this.deps, {
+      lead, conversationId, whatsappUserId, now, datePreference,
+      mode: "BOOKING", offerAction: "NEW", advisorTimezone: this.advisorTimezone,
+    });
   }
 
   private async handleTurnInner(lead: Lead, conversationId: string, whatsappUserId: string, inboundText: string, now: Date): Promise<void> {
@@ -152,6 +161,25 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
       return;
     }
 
+    // Fase 7K section 5/27/29: a pending daypart question or Sandler commitment check takes
+    // priority over everything below -- checked AFTER the abandon-intent guard above (section 29:
+    // "cancelar" must keep working in either new state, so it must never be shadowed by this) and
+    // AFTER the existingAppointment guard (unchanged). Reuses the SAME priorMessages read
+    // resolvePendingQualifiedMenu's callers already established elsewhere in this codebase.
+    const priorMessages = await this.deps.messages.listByConversationId(conversationId);
+    const pendingFlow = resolvePendingBookingFlowState(priorMessages);
+    if (pendingFlow?.type === "DAYPART") {
+      await handleDaypartReply(this.deps, { lead, conversationId, whatsappUserId, now, inboundText, pending: pendingFlow.data, advisorTimezone: this.advisorTimezone });
+      return;
+    }
+    if (pendingFlow?.type === "COMMITMENT") {
+      await handleCommitmentReply(this.deps, {
+        lead, conversationId, whatsappUserId, now, inboundText, pending: pendingFlow.data, advisorTimezone: this.advisorTimezone,
+        commitSlot: (slot, activeSlots) => this.handleSelection(slot, activeSlots, lead, conversationId, whatsappUserId, now),
+      });
+      return;
+    }
+
     const activeSlots = await this.deps.offeredSlots.listActiveByConversationId(conversationId, now);
 
     if (activeSlots.length === 0) {
@@ -160,9 +188,12 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
       // select from. Fase 7I: this same text may carry a date preference ("quiero agendar en
       // sábado" arriving right as the prior round just expired) -- parsed here too, so a fresh
       // round is never blindly chronological when the lead already said which day they want.
+      // Fase 7K section 2/3/8: gated on daypart, same as startNewBooking above.
       const datePreference = parseDatePreference(inboundText, now, this.advisorTimezone) ?? undefined;
-      const outcome = await this.deps.slotOffering.getOrCreateOffer({ lead, conversationId, now, datePreference });
-      await dispatchSlotOfferOutcome(this.deps, outcome, lead, conversationId, whatsappUserId, this.advisorTimezone);
+      await offerWithDaypartGate(this.deps, {
+        lead, conversationId, whatsappUserId, now, datePreference,
+        mode: "BOOKING", offerAction: "NEW", advisorTimezone: this.advisorTimezone,
+      });
       return;
     }
 
@@ -176,8 +207,20 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     // through to the selection logic below, unchanged.
     const newPreference = parseDatePreference(inboundText, now, this.advisorTimezone);
     if (newPreference) {
-      const replaced = await this.deps.slotOffering.replaceOffer({ lead, conversationId, now, datePreference: newPreference });
-      await dispatchSlotOfferOutcome(this.deps, replaced, lead, conversationId, whatsappUserId, this.advisorTimezone);
+      // Fase 7K section 3/8/23: a daypart already established for the CURRENTLY active round is
+      // inherited here, never re-asked -- "mejor el sábado" (a day-only change) keeps whatever
+      // morning/afternoon preference the lead already gave, exactly like section 3 requires for
+      // an explicit preference already known. Only a message that itself changes the daypart (or
+      // the very first offer of a booking episode, with no active round to inherit from at all)
+      // ever reaches the question again. Derived from the active round's own slots -- no separate
+      // persistence needed, same mechanism as the DECLINED branch above.
+      if (newPreference.daypart === undefined) {
+        newPreference.daypart = resolveDaypartForSlot(activeSlots[0].slotStart, activeSlots[0].slotEnd, this.advisorTimezone);
+      }
+      await offerWithDaypartGate(this.deps, {
+        lead, conversationId, whatsappUserId, now, datePreference: newPreference,
+        mode: "BOOKING", offerAction: "REPLACE", advisorTimezone: this.advisorTimezone,
+      });
       return;
     }
 
@@ -228,12 +271,33 @@ export class WhatsAppBookingHandler implements BookingTurnHandler {
     }
 
     if (selection.type === "DECLINED") {
-      const replacement = await this.deps.slotOffering.replaceOffer({ lead, conversationId, now });
+      // Fase 7K section 21: "otro horario"/"ninguno"/etc keep BOTH the round's own daypart AND
+      // its date preference (never dropped back to an undiversified/unfiltered re-offer) --
+      // derived from the still-active slots themselves, never a second, separate persistence
+      // mechanism. Section 22: "otro día"/"otros días" is the opposite of "keep the same day" --
+      // it explicitly wants a DIFFERENT one, so that one case drops any inferred targetDate and
+      // instead excludes the dates already shown, keeping only the daypart.
+      let datePreference: DatePreference = resolveDatePreferenceForRound(activeSlots, this.advisorTimezone);
+      if (isOtherDayDeclineRequest(inboundText)) {
+        datePreference = {
+          daypart: datePreference.daypart,
+          excludeLocalDates: [...new Set(activeSlots.map((s) => localDateString(s.slotStart, this.advisorTimezone)))],
+        };
+      }
+      const replacement = await this.deps.slotOffering.replaceOffer({ lead, conversationId, now, datePreference });
       await dispatchSlotOfferOutcome(this.deps, replacement, lead, conversationId, whatsappUserId, this.advisorTimezone);
       return;
     }
 
-    await this.handleSelection(selection.slot, activeSlots, lead, conversationId, whatsappUserId, now);
+    // Fase 7K section 11: selecting a slot no longer books immediately -- it starts the Sandler
+    // commitment check instead (see initiateCommitmentCheck's own doc comment). Booking now only
+    // ever happens from handleCommitmentReply's CONFIRMED branch above, which delegates back to
+    // this SAME handleSelection method, unchanged.
+    const daypart = resolveDaypartForSlot(selection.slot.slotStart, selection.slot.slotEnd, this.advisorTimezone);
+    await initiateCommitmentCheck(this.deps, {
+      lead, conversationId, whatsappUserId, now, slot: selection.slot, mode: "BOOKING",
+      datePreference: { daypart }, advisorTimezone: this.advisorTimezone,
+    });
   }
 
   private async handleSelection(

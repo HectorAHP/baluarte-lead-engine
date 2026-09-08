@@ -226,6 +226,7 @@ describe("Fase 7J.2 -- advisor WhatsApp alert on UNKNOWN_INTENT_HANDOFF (E2E)", 
     await seedActiveRound(repos, lead.id, conversation.id);
 
     await send(app, "5214779992114", "wamid.14c", "1");
+    await send(app, "5214779992114", "wamid.14c2", "no");
 
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKED"); // never HUMAN_HANDOFF
     expect(messaging.sentTemplates).toHaveLength(0);

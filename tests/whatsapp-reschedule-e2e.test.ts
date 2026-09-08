@@ -121,11 +121,13 @@ describe("Phase 4C post-mortem -- item F: meeting-time sync, full E2E through th
     const { lead } = await createLeadAtStatus(repos, "5214778890199", "BOOKING_PENDING", { bookingStartedAt: new Date() });
     const conversation = await repos.conversationsRepo.findActiveByLeadId(lead.id);
 
-    // Real booking flow -- offer, select position 1 (09:00).
-    await send(app, "5214778890199", "wamid.f1", "hola");
+    // Real booking flow -- daypart question, offer, select position 1 (09:00), commitment confirm.
+    await send(app, "5214778890199", "wamid.f0", "hola");
+    await send(app, "5214778890199", "wamid.f1", "por la mañana");
     const bookingRound = await repos.offeredSlotsRepo.listActiveByConversationId(conversation!.id, new Date());
     const position1 = bookingRound.find((s) => s.position === 1)!;
     await send(app, "5214778890199", "wamid.f2", "1");
+    await send(app, "5214778890199", "wamid.f2b", "no");
 
     const bookedLead = await repos.leadsRepo.findById(lead.id);
     expect(bookedLead?.status).toBe("BOOKED");
@@ -135,16 +137,19 @@ describe("Phase 4C post-mortem -- item F: meeting-time sync, full E2E through th
     const oldAppointment = await repos.appointmentsRepo.findActiveByLeadId(lead.id);
     expect(oldAppointment!.startsAt.getTime()).toBe(position1.slotStart.getTime());
 
-    // Real reschedule flow -- request, then select the new offer's position 1 (the calendar's
-    // next available slot, distinct from the original -- the original time is now Calendar-busy).
+    // Real reschedule flow -- request (RESCHEDULE_INTRO_MESSAGE is unconditional, sent before the
+    // daypart gate), daypart, then select the new offer's position 1 (the calendar's next
+    // available slot, distinct from the original -- the original time is now Calendar-busy).
     await send(app, "5214778890199", "wamid.f3", "quiero reagendar");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
+    await send(app, "5214778890199", "wamid.f3b", "por la mañana");
     const rescheduleRound = await repos.offeredSlotsRepo.listActiveByConversationId(conversation!.id, new Date(), oldAppointment!.id);
     expect(rescheduleRound.length).toBeGreaterThan(0);
     const newPosition1 = rescheduleRound.find((s) => s.position === 1)!;
     expect(newPosition1.slotStart.getTime()).not.toBe(position1.slotStart.getTime()); // genuinely a different, fresh time
 
     await send(app, "5214778890199", "wamid.f4", "1");
+    await send(app, "5214778890199", "wamid.f4b", "no");
 
     const finalLead = await repos.leadsRepo.findById(lead.id);
     expect(finalLead?.status).toBe("BOOKED");
@@ -171,8 +176,10 @@ describe("Phase 4C -- full in-memory E2E through the real webhook pipeline", () 
 
     await send(app, "5214778890004", "wamid.r4", "quiero reagendar");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
+    await send(app, "5214778890004", "wamid.r4b", "por la mañana");
 
     await send(app, "5214778890004", "wamid.r5", "1");
+    await send(app, "5214778890004", "wamid.r5b", "no");
 
     const finalLead = await repos.leadsRepo.findById(lead.id);
     expect(finalLead?.status).toBe("BOOKED");
@@ -238,11 +245,13 @@ describe("Phase 4C -- full in-memory E2E through the real webhook pipeline", () 
     const { lead } = await createLeadAtStatus(repos, "5214778890007", "BOOKING_PENDING", { bookingStartedAt: new Date() });
 
     await send(app, "5214778890007", "wamid.r11", "hola");
+    await send(app, "5214778890007", "wamid.r11b", "por la mañana");
     const conversation = await repos.conversationsRepo.findActiveByLeadId(lead.id);
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation!.id, new Date());
     expect(offered.length).toBeGreaterThan(0);
 
     await send(app, "5214778890007", "wamid.r12", "1");
+    await send(app, "5214778890007", "wamid.r12b", "no");
 
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKED");
   });
@@ -256,7 +265,8 @@ describe("Phase 4C post-mortem -- item 13: the missing E2E (real booking, then r
     const conversation = await repos.conversationsRepo.findActiveByLeadId(lead.id);
 
     // Real booking flow, through the real webhook pipeline -- no direct repo seeding.
-    await send(app, "5214778890099", "wamid.pm1", "hola");
+    await send(app, "5214778890099", "wamid.pm0", "hola");
+    await send(app, "5214778890099", "wamid.pm1", "por la mañana");
     const bookingRound = await repos.offeredSlotsRepo.listActiveByConversationId(conversation!.id, new Date());
     expect(bookingRound).toHaveLength(3);
     expect(bookingRound.every((s) => s.rescheduleContextId === undefined)).toBe(true);
@@ -264,7 +274,8 @@ describe("Phase 4C post-mortem -- item 13: the missing E2E (real booking, then r
     const position2Id = bookingRound.find((s) => s.position === 2)!.id;
     const position3Id = bookingRound.find((s) => s.position === 3)!.id;
 
-    await send(app, "5214778890099", "wamid.pm2", "1"); // selects position 1 -- real booking
+    await send(app, "5214778890099", "wamid.pm2", "1"); // commitment question
+    await send(app, "5214778890099", "wamid.pm2b", "no"); // CONFIRMED -- real booking
 
     const bookedLead = await repos.leadsRepo.findById(lead.id);
     expect(bookedLead?.status).toBe("BOOKED");
@@ -279,6 +290,7 @@ describe("Phase 4C post-mortem -- item 13: the missing E2E (real booking, then r
     // Now request a reschedule, through the real webhook pipeline, on the SAME conversation.
     await send(app, "5214778890099", "wamid.pm3", "quiero reagendar");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
+    await send(app, "5214778890099", "wamid.pm3b", "por la mañana");
 
     const rescheduleRound = await repos.offeredSlotsRepo.listActiveByConversationId(conversation!.id, new Date(), oldAppointment!.id);
     expect(rescheduleRound.length).toBeGreaterThan(0); // a genuinely new round WAS created

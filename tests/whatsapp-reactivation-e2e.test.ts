@@ -122,6 +122,12 @@ describe("Pre-launch hardening -- reactivating a CANCELLED lead", () => {
     const { conversation } = await makeCancelledLeadWithOldAppointment(repos, "5214778890402");
 
     await send(app, "5214778890402", "wamid.b1", "Quiero agendar");
+    // Fase 7K section 2/3/19: no daypart yet -- the daypart question is asked first, but the lead
+    // is ALREADY transitioned to BOOKING_PENDING at that point (offerWithDaypartGate), so this
+    // still reaches the correct state-machine target one turn earlier than the actual offer.
+    const leadAfterIntent = (await repos.leadsRepo.findById((await repos.conversationsRepo.findById(conversation.id))!.leadId))!;
+    expect(leadAfterIntent.status).toBe("BOOKING_PENDING");
+    await send(app, "5214778890402", "wamid.b1b", "por la mañana");
 
     const lead = (await repos.leadsRepo.findById((await repos.conversationsRepo.findById(conversation.id))!.leadId))!;
     expect(lead.status).toBe("BOOKING_PENDING");
@@ -138,6 +144,7 @@ describe("Pre-launch hardening -- reactivating a CANCELLED lead", () => {
     const { lead, conversation } = await makeCancelledLeadWithOldAppointment(repos, "5214778890403");
 
     await send(app, "5214778890403", "wamid.c1", "Quiero reagendar");
+    await send(app, "5214778890403", "wamid.c1b", "por la mañana");
 
     const finalLead = await repos.leadsRepo.findById(lead.id);
     expect(finalLead?.status).toBe("BOOKING_PENDING"); // never RESCHEDULE_REQUESTED
@@ -171,7 +178,9 @@ describe("Pre-launch hardening -- reactivating a CANCELLED lead", () => {
     const originalBookedAt = lead.bookedAt!;
 
     await send(app, "5214778890405", "wamid.e1", "Quiero agendar");
+    await send(app, "5214778890405", "wamid.e1b", "por la mañana");
     await send(app, "5214778890405", "wamid.e2", "1");
+    await send(app, "5214778890405", "wamid.e2b", "no");
 
     const finalLead = await repos.leadsRepo.findById(lead.id);
     expect(finalLead?.status).toBe("BOOKED");
@@ -230,7 +239,9 @@ describe("Pre-launch hardening -- reactivating a CANCELLED lead", () => {
 
     await send(app, "5214778890408", "wamid.h1", "Quiero reagendar");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
+    await send(app, "5214778890408", "wamid.h1b", "por la mañana");
     await send(app, "5214778890408", "wamid.h2", "1");
+    await send(app, "5214778890408", "wamid.h2b", "no");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKED");
 
     const { lead: lead2 } = await createLeadAtStatus(repos, "5214778890409", "BOOKED");

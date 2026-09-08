@@ -176,8 +176,10 @@ describe("Pre-launch hardening -- BOOKED lead + generic inbound (post-mortem ite
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: new Date("2030-06-15T15:30:00.000Z"), endsAt: new Date("2030-06-15T16:00:00.000Z"), timezone: "America/Mexico_City" });
     await send(app, "5214778890305", "wamid.d1", "Quiero reagendar");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
+    await send(app, "5214778890305", "wamid.d1b", "por la mañana");
 
     await send(app, "5214778890305", "wamid.d2", "1");
+    await send(app, "5214778890305", "wamid.d2b", "no");
 
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKED");
     const outbound = await outboundMessages(repos, conversation.id);

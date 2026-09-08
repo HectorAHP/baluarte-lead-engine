@@ -141,14 +141,25 @@ describe("WhatsAppBookingHandler -- success", () => {
 
     const handled = await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
 
+    // Fase 7K section 11: selecting a slot no longer books immediately -- it starts the Sandler
+    // commitment check instead (no Calendar mutation, no appointment yet).
     expect(handled).toBe(true); // pre-launch fix: BOOKING_PENDING always reports it acted
+    expect(messaging.sentTexts).toHaveLength(1);
+    expect(messaging.sentTexts[0].body).toContain("Antes de dejarla reservada");
+    const stillPending = await leads.findById(lead.id);
+    expect(stillPending?.status).toBe("BOOKING_PENDING");
+    expect(await appointments.findActiveByLeadId(lead.id)).toBeNull();
+
+    const handled2 = await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now });
+
+    expect(handled2).toBe(true);
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKED");
     const stillActive = await offeredSlots.listActiveByConversationId(conversation.id, now);
     expect(stillActive.find((s) => s.id === offer.slots[0].id)).toBeUndefined(); // no longer active -- selected
     expect(await appointments.findActiveByLeadId(lead.id)).toBeTruthy();
-    expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("quedó agendada");
+    expect(messaging.sentTexts).toHaveLength(2);
+    expect(messaging.sentTexts[1].body).toContain("quedó agendada");
   });
 
   it("M: the confirmation includes the real meetingUrl when the provider returns one", async () => {
@@ -159,8 +170,9 @@ describe("WhatsAppBookingHandler -- success", () => {
     if (offer.type !== "CREATED") throw new Error("unreachable");
 
     await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now });
 
-    expect(messaging.sentTexts[0].body).toContain("meet.google.com");
+    expect(messaging.sentTexts[1].body).toContain("meet.google.com");
   });
 
   it("N: booking success without a meetingUrl -- safe alternative message, never an invented URL", async () => {
@@ -172,10 +184,11 @@ describe("WhatsAppBookingHandler -- success", () => {
     if (offer.type !== "CREATED") throw new Error("unreachable");
 
     await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now });
 
-    expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("Te compartiremos el enlace de la videollamada antes de la cita");
-    expect(messaging.sentTexts[0].body).not.toContain("http");
+    expect(messaging.sentTexts).toHaveLength(2);
+    expect(messaging.sentTexts[1].body).toContain("Te compartiremos el enlace de la videollamada antes de la cita");
+    expect(messaging.sentTexts[1].body).not.toContain("http");
   });
 
   it("books successfully for a lead with no email on file -- attendeeEmail is undefined, never an invented placeholder", async () => {
@@ -187,6 +200,7 @@ describe("WhatsAppBookingHandler -- success", () => {
     if (offer.type !== "CREATED") throw new Error("unreachable");
 
     await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now });
 
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKED");
@@ -201,6 +215,7 @@ describe("WhatsAppBookingHandler -- success", () => {
     if (offer.type !== "CREATED") throw new Error("unreachable");
 
     await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now });
 
     const reloadedConversation = await conversations.findById(conversation.id);
     expect(reloadedConversation?.status).toBe("ACTIVE");
@@ -267,22 +282,28 @@ describe("WhatsAppBookingHandler -- existing appointment / idempotency", () => {
     const offer = await slotOffering.getOrCreateOffer({ lead, conversationId: conversation.id, now });
     if (offer.type !== "CREATED") throw new Error("unreachable");
 
-    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now }); // commitment question
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now }); // CONFIRMED -> books
     const firstAppointment = await appointments.findActiveByLeadId(lead.id);
 
     // Simulate a caller re-dispatching this exact turn with a stale BOOKING_PENDING lead
     // snapshot (e.g. a reprocessed inbound arriving before the caller refreshed lead state from
     // the repository). The top-level status guard alone would not catch this -- it's the
-    // appointment guard inside handleTurnInner that makes it safe.
+    // appointment guard inside handleTurnInner that makes it safe. Fase 7K: by the time a
+    // duplicate arrives, the booking confirmation (unmarked, no pending flow state) is already
+    // the last outbound message, so this duplicate "no" is read as fresh generic text, not as a
+    // second commitment reply -- and the SAME appointment guard that always ran first still
+    // short-circuits it before either the daypart or commitment logic ever runs.
     const staleLead = { ...offer.lead, status: "BOOKING_PENDING" as const };
-    await handler.handleTurn({ lead: staleLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    await handler.handleTurn({ lead: staleLead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now });
 
     const secondAppointment = await appointments.findActiveByLeadId(lead.id);
     expect(secondAppointment?.id).toBe(firstAppointment?.id); // same appointment, never a duplicate
     expect(await offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(1); // P: no new round
-    expect(messaging.sentTexts).toHaveLength(2);
-    expect(messaging.sentTexts[0].body).toContain("quedó agendada");
-    expect(messaging.sentTexts[1].body).toContain("tienes una asesoría agendada"); // 2nd turn hits the appointment guard directly
+    expect(messaging.sentTexts).toHaveLength(3);
+    expect(messaging.sentTexts[0].body).toContain("Antes de dejarla reservada");
+    expect(messaging.sentTexts[1].body).toContain("quedó agendada");
+    expect(messaging.sentTexts[2].body).toContain("tienes una asesoría agendada"); // 3rd turn hits the appointment guard directly
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKED"); // still BOOKED -- no InvalidLeadTransitionError, no regression
   });
@@ -339,11 +360,12 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
     // Simulate another booking landing on this exact slot between the offer and this selection.
     await calendar.createEvent({ title: "other", description: "", start: targetSlot.slotStart, end: targetSlot.slotEnd });
 
-    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now }); // commitment question
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now }); // CONFIRMED -> revalidates, finds it taken
 
     expect(await appointments.findActiveByLeadId(lead.id)).toBeNull();
-    expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("Ese horario acaba de dejar de estar disponible");
+    expect(messaging.sentTexts).toHaveLength(2);
+    expect(messaging.sentTexts[1].body).toContain("Ese horario acaba de dejar de estar disponible");
     expect(await offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(2);
   });
 
@@ -357,12 +379,13 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
     calendar.calls = 0;
     vi.spyOn(appointmentService, "book").mockRejectedValueOnce(new BookingInProgressError(`whatsapp-booking:${lead.id}:${offer.slots[0].id}`));
 
-    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now }); // commitment question
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now }); // CONFIRMED -> book() throws
 
     expect(calendar.calls).toBe(0); // no replaceOffer -- no extra Calendar call
     expect(await offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(1); // no new round
-    expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toBe("Estoy confirmando ese horario. Dame un momento e inténtalo nuevamente.");
+    expect(messaging.sentTexts).toHaveLength(2);
+    expect(messaging.sentTexts[1].body).toBe("Estoy confirmando ese horario. Dame un momento e inténtalo nuevamente.");
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKING_PENDING");
   });
@@ -373,7 +396,10 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
     const now = new Date("2026-03-02T12:00:00.000Z");
     vi.spyOn(slotOffering, "getOrCreateOffer").mockRejectedValueOnce(new SlotOfferClaimInProgressError(conversation.id));
 
-    await handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "hola", now });
+    // Fase 7K: getOrCreateOffer is only reached once a daypart is known -- "por la mañana"
+    // carries one already, so this turn goes straight to the (mocked) call instead of asking the
+    // daypart question first.
+    await handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "por la mañana", now });
 
     expect(messaging.sentTexts).toHaveLength(1); // exactly one outbound
     expect(messaging.sentTexts[0].body).toBe("Estoy preparando los horarios disponibles. Inténtalo nuevamente en unos segundos.");
@@ -396,10 +422,17 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
     const { lead, conversation } = await makeLeadAndConversation(leads, conversations);
     const now = new Date("2026-03-02T12:00:00.000Z");
 
+    // Fase 7K: "hola" carries no daypart -- the daypart question is asked first, before Calendar
+    // is ever consulted, so NO_AVAILABILITY only surfaces once the daypart is answered.
     await handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "hola", now });
-
     expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("no tengo horarios disponibles");
+    expect(messaging.sentTexts[0].body).toContain("por la mañana o por la tarde");
+    expect(await offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(0);
+
+    await handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "por la mañana", now });
+
+    expect(messaging.sentTexts).toHaveLength(2);
+    expect(messaging.sentTexts[1].body).toContain("no tengo horarios disponibles");
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKING_PENDING");
     expect(await offeredSlots.listRoundIdsByConversationId(conversation.id)).toHaveLength(0);
@@ -415,13 +448,18 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
       ]);
     }
 
+    // Fase 7K: the daypart question is asked before the round-cap check (inside
+    // getOrCreateOffer) is ever reached -- a first turn alone no longer escalates.
     await handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "hola", now });
+    expect((await leads.findById(lead.id))?.status).toBe("BOOKING_PENDING");
+
+    await handler.handleTurn({ lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "por la mañana", now });
 
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("HUMAN_HANDOFF");
     const reloadedConversation = await conversations.findById(conversation.id);
     expect(reloadedConversation?.status).toBe("HUMAN_HANDOFF");
-    expect(messaging.sentTexts).toHaveLength(1);
+    expect(messaging.sentTexts).toHaveLength(2);
   });
 
   it("I: multiple active roundIds (data inconsistency) -- HUMAN_HANDOFF, never mixes slots", async () => {
@@ -446,7 +484,8 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
     if (offer.type !== "CREATED") throw new Error("unreachable");
     vi.spyOn(appointmentService, "book").mockRejectedValueOnce(new BookingAttemptInconsistentError("attempt-1"));
 
-    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now }); // commitment question
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now }); // CONFIRMED -> book() throws
 
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("HUMAN_HANDOFF");
@@ -455,7 +494,7 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
     // Sanitized: leadId/conversationId/errorName only -- never the raw error message or any
     // booking-attempt/appointment payload.
     expect(Object.keys(warning!.details).sort()).toEqual(["conversationId", "errorName", "leadId"]);
-    expect(messaging.sentTexts).toHaveLength(1);
+    expect(messaging.sentTexts).toHaveLength(2);
   });
 
   it("K: CalendarProviderError from book() -- recoverable message, lead stays BOOKING_PENDING", async () => {
@@ -466,12 +505,13 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
     const offer = await slotOffering.getOrCreateOffer({ lead, conversationId: conversation.id, now });
     if (offer.type !== "CREATED") throw new Error("unreachable");
 
-    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now });
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now }); // commitment question
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "no", now }); // CONFIRMED -> createEvent throws
 
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKING_PENDING");
-    expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("no pude consultar la agenda");
+    expect(messaging.sentTexts).toHaveLength(2);
+    expect(messaging.sentTexts[1].body).toContain("no pude consultar la agenda");
   });
 
   it("L: a slot round that expired since the offer -- no booking; the turn falls back to offering a fresh round", async () => {
@@ -482,14 +522,22 @@ describe("WhatsAppBookingHandler -- offer/selection outcomes", () => {
     if (offer.type !== "CREATED") throw new Error("unreachable");
 
     const later = new Date(offerNow.getTime() + OFFERED_SLOT_TTL_MS + 60_000); // past the round's TTL
+    // Fase 7K: with no active round, "1" (bare number, no daypart) asks the daypart question
+    // first instead of directly re-offering -- the fresh round is only created once daypart is
+    // answered.
     await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "1", now: later });
+    expect(messaging.sentTexts).toHaveLength(1);
+    expect(messaging.sentTexts[0].body).toContain("por la mañana o por la tarde");
+    expect((await offeredSlots.listRoundIdsByConversationId(conversation.id))).toHaveLength(1); // no new round yet
+
+    await handler.handleTurn({ lead: offer.lead, conversationId: conversation.id, whatsappUserId: WHATSAPP_USER_ID, inboundText: "por la mañana", now: later });
 
     expect(await appointments.findActiveByLeadId(lead.id)).toBeNull();
     const reloadedLead = await leads.findById(lead.id);
     expect(reloadedLead?.status).toBe("BOOKING_PENDING"); // still pending, not BOOKED
     const rounds = await offeredSlots.listRoundIdsByConversationId(conversation.id);
     expect(rounds).toHaveLength(2); // the expired round + a fresh one offered instead
-    expect(messaging.sentTexts).toHaveLength(1);
-    expect(messaging.sentTexts[0].body).toContain("Tengo estos horarios disponibles");
+    expect(messaging.sentTexts).toHaveLength(2);
+    expect(messaging.sentTexts[1].body).toContain("Tengo estos horarios disponibles");
   });
 });

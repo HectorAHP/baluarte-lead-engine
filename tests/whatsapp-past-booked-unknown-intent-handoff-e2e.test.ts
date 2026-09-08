@@ -283,10 +283,11 @@ describe("Fase 7J.3 -- past-appointment unknown-intent handoff + menu fix", () =
     await send(app, "5214779993013", "wamid.13a", "hola tengo una duda");
     await send(app, "5214779993013", "wamid.13b", "hola");
     await send(app, "5214779993013", "wamid.13c", "3");
+    await send(app, "5214779993013", "wamid.13c2", "por la mañana");
 
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[2].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound[3].body).toContain("Tengo estos horarios disponibles");
   });
 
   it("16: DO_NOT_CONTACT unchanged", async () => {

@@ -128,14 +128,16 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     await send(app, "5214779980001", "wamid.1a", "Agendar");
     const first = await outboundMessages(repos, conversation.id);
     expect(first[0].body).not.toBe(PAST_BOOKED_GENERIC_INBOUND_MESSAGE); // the bug: same message again
-
-    await send(app, "5214779980001", "wamid.1b", "Agendar"); // retry, exactly as reported
-    const second = await outboundMessages(repos, conversation.id);
-    // Second "agendar" is no longer meaningful (lead already left BOOKED for BOOKING_PENDING),
-    // but the KEY assertion is the first reply already broke the loop:
-    expect(first[0].body).toContain("Tengo estos horarios disponibles");
+    // Fase 7K section 2/3/19: no daypart yet -- the first reply is the daypart question, not an
+    // immediate offer, but it's already broken the "same message forever" loop (a genuinely new,
+    // different, progressing message), and the lead has already left BOOKED for BOOKING_PENDING.
+    expect(first[0].body).toContain("por la mañana o por la tarde");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
-    void second;
+
+    await send(app, "5214779980001", "wamid.1b", "por la mañana"); // answers the daypart question
+    const second = await outboundMessages(repos, conversation.id);
+    expect(second[second.length - 1].body).toContain("Tengo estos horarios disponibles");
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
   });
 
   it("2. past booking + 'quiero agendar' enters the real booking handler (already worked, still works)", async () => {
@@ -145,10 +147,11 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779980002", "wamid.2a", "Quiero agendar");
+    await send(app, "5214779980002", "wamid.2b", "por la mañana");
 
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound[outbound.length - 1].body).toContain("Tengo estos horarios disponibles");
   });
 
   it("3. past booking + WHATSAPP_BOOKING_ENABLED=false uses the safe (unchanged prior) fallback -- never a fake booking", async () => {
@@ -219,11 +222,15 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     await send(app, "5214779980007", "wamid.7b", "Agendar"); // NOW recognized -> real booking, breaks the loop
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound).toHaveLength(2);
+    expect(outbound).toHaveLength(2); // fallback + daypart question (the real offer needs one more turn)
     expect(outbound[0].body).toBe(PAST_BOOKED_GENERIC_INBOUND_MESSAGE);
     expect(outbound[0].metadata).toEqual({ expectedIntent: "PAST_BOOKED_REACTIVATION" });
     expect(outbound[1].body).not.toBe(PAST_BOOKED_GENERIC_INBOUND_MESSAGE);
-    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound[1].body).toContain("por la mañana o por la tarde");
+
+    await send(app, "5214779980007", "wamid.7c", "por la mañana");
+    const finalOutbound = await outboundMessages(repos, conversation.id);
+    expect(finalOutbound[finalOutbound.length - 1].body).toContain("Tengo estos horarios disponibles");
   });
 
   it("8. the original past appointment is correctly closed out (EXPIRED) by the rebooking -- never reused as if it were the new one, its timing never altered", async () => {
@@ -233,8 +240,10 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     const staleAppointment = await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779980008", "wamid.8a", "Agendar");
+    await send(app, "5214779980008", "wamid.8a2", "por la mañana");
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     await send(app, "5214779980008", "wamid.8b", "1");
+    await send(app, "5214779980008", "wamid.8b2", "no");
 
     // Fase 7H: AppointmentService.expirePriorStaleBookedAppointments now closes this exact
     // orphan-shaped row out as part of the rebooking (BOOKED -> EXPIRED, never COMPLETED/NO_SHOW --
@@ -255,7 +264,9 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     const staleAppointment = await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779980009", "wamid.9a", "Agendar");
+    await send(app, "5214779980009", "wamid.9a2", "por la mañana");
     await send(app, "5214779980009", "wamid.9b", "1");
+    await send(app, "5214779980009", "wamid.9b2", "no");
 
     const all = await repos.appointmentsRepo.listAllByLeadId(lead.id);
     expect(all).toHaveLength(2); // the stale one + the new one
@@ -277,6 +288,7 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     await repos.calendar.createEvent({ title: "busy", description: "", start: busyStart, end: busyEnd });
 
     await send(app, "5214779980010", "wamid.10a", "Agendar");
+    await send(app, "5214779980010", "wamid.10a2", "por la mañana");
 
     const offered = await repos.offeredSlotsRepo.listActiveByConversationId(conversation.id, new Date());
     expect(offered.length).toBeGreaterThan(0);
@@ -304,9 +316,11 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     const { lead } = await createLeadAtStatus(repos, "5214779980012", "BOOKED");
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
     await send(app, "5214779980012", "wamid.12a", "Agendar");
+    await send(app, "5214779980012", "wamid.12a2", "por la mañana");
+    await send(app, "5214779980012", "wamid.12b", "1"); // commitment question
 
-    await send(app, "5214779980012", "wamid.dup12", "1");
-    await send(app, "5214779980012", "wamid.dup12", "1"); // exact redelivery of the slot selection
+    await send(app, "5214779980012", "wamid.dup12", "no");
+    await send(app, "5214779980012", "wamid.dup12", "no"); // exact redelivery of the CONFIRMED reply
 
     const all = await repos.appointmentsRepo.listAllByLeadId(lead.id);
     const newBookings = all.filter((a) => a.startsAt.getTime() !== PAST_STARTS_AT.getTime());
@@ -320,9 +334,10 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779980013", "wamid.13a", "Agendar");
+    await send(app, "5214779980013", "wamid.13a2", "por la mañana");
 
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound[0].body).toContain("Juan");
+    expect(outbound[outbound.length - 1].body).toContain("Juan");
   });
 
   it("14. the Fase 6E.1 nested qualified-options-menu fix is untouched -- MAIN -> OPTIONS -> digit still resolves correctly for a QUALIFIED_A lead", async () => {
@@ -366,6 +381,7 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779980016", "wamid.16a", "Agendar");
+    await send(app, "5214779980016", "wamid.16a2", "por la mañana");
 
     const rows = await repos.fiscalLeadScoresRepo.listByLeadId(lead.id);
     expect(rows).toHaveLength(1);
@@ -379,7 +395,9 @@ describe("Fase 6E.2 -- past-booked rebook routing fix", () => {
     await repos.appointmentsRepo.create({ leadId: lead.id, status: "BOOKED", startsAt: PAST_STARTS_AT, endsAt: PAST_ENDS_AT, timezone: "America/Mexico_City" });
 
     await send(app, "5214779980017", "wamid.17a", "Agendar");
+    await send(app, "5214779980017", "wamid.17a2", "por la mañana");
     await send(app, "5214779980017", "wamid.17b", "1");
+    await send(app, "5214779980017", "wamid.17b2", "no");
 
     const after = await repos.leadsRepo.findById(lead.id);
     expect(after?.score).toBe(74);

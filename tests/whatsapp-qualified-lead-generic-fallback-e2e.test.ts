@@ -150,12 +150,20 @@ describe("Pre-launch fix -- qualified/nurture lead generic conversational fallba
 
     await send(app, "5214779991004", "wamid.q4a", "Quiero agendar una asesoría");
 
-    const finalLead = await repos.leadsRepo.findById(lead.id);
-    expect(finalLead?.status).toBe("BOOKING_PENDING"); // real booking flow started
-    const outbound = await outboundMessages(repos, conversation.id);
+    const afterIntentLead = await repos.leadsRepo.findById(lead.id);
+    expect(afterIntentLead?.status).toBe("BOOKING_PENDING"); // real booking flow started (daypart gate first)
+    let outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(1); // exactly one reply -- never the fallback ADDITIONALLY
-    expect(outbound[0].body).toContain("Tengo estos horarios disponibles"); // the real slot offer, not the fallback
     expect(outbound[0].body).not.toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
+
+    await send(app, "5214779991004", "wamid.q4b", "por la mañana");
+
+    const finalLead = await repos.leadsRepo.findById(lead.id);
+    expect(finalLead?.status).toBe("BOOKING_PENDING");
+    outbound = await outboundMessages(repos, conversation.id);
+    expect(outbound).toHaveLength(2);
+    expect(outbound[1].body).toContain("Tengo estos horarios disponibles"); // the real slot offer, not the fallback
+    expect(outbound[1].body).not.toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE);
   });
 
   it("5: a duplicate provider_message_id never re-replies -- existing dedup is preserved", async () => {

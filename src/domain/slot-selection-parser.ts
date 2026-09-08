@@ -20,6 +20,13 @@ const DECLINED_PHRASES: ReadonlySet<string> = new Set([
   "prefiero otro",
   "prefiero otro horario",
   "ninguno me funciona",
+  // Fase 7K section 22 -- "otro día"/"otros días" additionally signal a preference for a
+  // DIFFERENT day (not just a different time on the same day) -- the handler layer distinguishes
+  // this from the other DECLINED phrases above to apply date exclusion (see
+  // whatsapp-booking-handler.ts/whatsapp-reschedule-handler.ts's own DECLINED branch), but the
+  // classification itself is identical: a real decline, never a new invalid-selection loop.
+  "otro dia",
+  "otros dias",
 ]);
 
 /**
@@ -39,6 +46,17 @@ function normalize(text: string): string {
     .toLowerCase()
     .trim()
     .replace(/\s+/g, " ");
+}
+
+/** Fase 7K section 22 -- narrow, closed check for the "otro día"/"otros días" subset of
+ * DECLINED_PHRASES, so a caller whose parseSlotSelection already returned DECLINED can decide
+ * whether to additionally exclude the currently-shown dates (never applied to the OTHER DECLINED
+ * phrases -- "otro horario"/"ninguno"/etc, which only ask for a different TIME, not a different
+ * day). Deliberately re-normalizes independently rather than exposing DECLINED_PHRASES itself, so
+ * this stays a simple, single-purpose predicate. */
+export function isOtherDayDeclineRequest(inboundText: string): boolean {
+  const normalized = normalize(inboundText);
+  return normalized === "otro dia" || normalized === "otros dias";
 }
 
 /**

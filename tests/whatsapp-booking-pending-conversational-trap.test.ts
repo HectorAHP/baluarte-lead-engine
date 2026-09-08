@@ -127,6 +127,7 @@ describe("Pre-launch hardening -- BOOKING_PENDING conversational trap", () => {
     await seedActiveRound(repos, lead.id, conversation.id);
 
     await send(app, "5214778891001", "wamid.g1a", "1");
+    await send(app, "5214778891001", "wamid.g1a2", "no");
 
     const finalLead = await repos.leadsRepo.findById(lead.id);
     expect(finalLead?.status).toBe("BOOKED");
@@ -270,12 +271,13 @@ describe("Pre-launch hardening -- BOOKING_PENDING conversational trap", () => {
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("QUALIFIED_A");
 
     await send(app, "5214778891007", "wamid.g7b", "quiero agendar");
+    await send(app, "5214778891007", "wamid.g7b2", "por la mañana");
 
     const finalLead = await repos.leadsRepo.findById(lead.id);
     expect(finalLead?.status).toBe("BOOKING_PENDING");
     const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound).toHaveLength(2); // abandon confirmation + slot offer
-    expect(outbound[1].body).toContain("Tengo estos horarios disponibles");
+    expect(outbound).toHaveLength(3); // abandon confirmation + daypart question + slot offer
+    expect(outbound[2].body).toContain("Tengo estos horarios disponibles");
   });
 
   it("8: score/product/qualification_answers/lead_scores remain intact after abandoning BOOKING_PENDING", async () => {

@@ -1,5 +1,6 @@
 import { zonedDateToUtc, zonedTimeParts, weekdayOfLocalDate, localDateString } from "./timezone.js";
 import { DAYPART_WINDOWS_MINUTES, type DatePreference } from "./date-preference.js";
+import { selectDiverseSlots } from "./slot-diversity.js";
 
 export interface Slot {
   start: Date;
@@ -115,6 +116,20 @@ export function computeAvailableSlots(
   // earlier weekday had availability first, no matter how correctly a preference was parsed.
   const preferred = filterSlotsByDatePreference(free, datePreference, rules.timezone);
   preferred.sort((a, b) => a.start.getTime() - b.start.getTime());
+
+  // Fase 7K -- spec section 7/8: diversity ONLY applies when the lead has NOT pinned a specific
+  // calendar date or weekday. "el sabado" / "el martes" must still be able to show up to
+  // maxSlots times on THAT single day, undiversified -- diversifying there would fight the
+  // lead's own explicit request instead of helping it. When neither is set, spreading the
+  // offer across distinct local dates is exactly what's meant to replace the old plain
+  // chronological slice below. Order matters: this runs strictly AFTER the date-preference
+  // filter and the chronological sort (never before -- see the ordering note above), and is
+  // itself the last step before returning, so it fully owns the maxSlots truncation for the
+  // no-explicit-date case instead of a second, separate slice.
+  const hasExplicitDate = datePreference?.targetDate !== undefined || datePreference?.weekday !== undefined;
+  if (!hasExplicitDate) {
+    return selectDiverseSlots(preferred, rules.maxSlots, rules.timezone);
+  }
   return preferred.slice(0, rules.maxSlots);
 }
 
@@ -140,6 +155,10 @@ export function filterSlotsByDatePreference(candidates: Slot[], preference: Date
       return false;
     }
     if (preference.weekday !== undefined && weekdayOfLocalDate(startParts.year, startParts.month, startParts.day) !== preference.weekday) {
+      return false;
+    }
+    // Fase 7K section 22 -- "otro día": a simple exclusion list, never a second diversity pass.
+    if (preference.excludeLocalDates?.includes(localDateString(slot.start, timezone))) {
       return false;
     }
     if (preference.daypart !== undefined) {
