@@ -4,7 +4,7 @@ import type { Appointment } from "../domain/appointment.js";
 import type { OfferedSlot } from "../domain/offered-slot.js";
 import { assertTransition } from "../domain/state-machine.js";
 import {
-  AppointmentRescheduleInconsistentError, RescheduleInProgressError,
+  AppointmentRescheduleInconsistentError, RescheduleInProgressError, SlotUnavailableError,
   ActiveOfferInconsistentError, SlotOfferClaimInProgressError,
 } from "../domain/errors.js";
 import { isCancellationRequest } from "../domain/cancellation-intent-detection.js";
@@ -268,6 +268,27 @@ export class WhatsAppRescheduleHandler implements RescheduleTurnHandler {
     } catch (err) {
       if (err instanceof RescheduleInProgressError) {
         await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, RESCHEDULE_IN_PROGRESS_MESSAGE);
+        return;
+      }
+      // Fase 7K.1 (pre-deploy review, gap 2) -- MUST be handled here, exactly like
+      // WhatsAppBookingHandler.handleSelection's own SlotUnavailableError branch: both
+      // GoogleCalendarProvider and FakeCalendarProvider's own createEvent() re-check availability
+      // and throw this the moment two callers race for the same real-world time, which
+      // AppointmentRescheduleService itself never pre-checks (see its own doc comment -- Phase A
+      // ownership guards against a DUPLICATE reschedule of the SAME selection, not against the
+      // underlying calendar slot itself having been taken by something else entirely). Before this
+      // fix, this fell through to the generic `throw err` below and reached handleError's final
+      // catch-all -- RESCHEDULE_TECHNICAL_ERROR_MESSAGE, a "try again" with NO fresh round ever
+      // offered, silently orphaning the lead's booking attempt. Now mirrors booking mode exactly:
+      // never marks the slot selected, replaces the round (same daypart/date preference as the
+      // one just lost, via resolveDatePreferenceForRound -- section 21's "never a colder re-offer"
+      // rule applies here too), and reuses the SAME SLOT_UNAVAILABLE_INTRO copy via
+      // dispatchSlotOfferOutcome's "slot_unavailable" reason -- never a duplicated message.
+      if (err instanceof SlotUnavailableError) {
+        const rescheduleMode = { type: "RESCHEDULE" as const, oldAppointmentId: oldAppointment.id };
+        const datePreference = resolveDatePreferenceForRound(activeSlots, this.advisorTimezone);
+        const replacement = await this.deps.slotOffering.replaceOffer({ lead, conversationId, now, mode: rescheduleMode, datePreference });
+        await dispatchSlotOfferOutcome(this.deps, replacement, lead, conversationId, whatsappUserId, this.advisorTimezone, "slot_unavailable");
         return;
       }
       throw err; // CalendarProviderError / any other technical failure -- handled generically by handleError.
