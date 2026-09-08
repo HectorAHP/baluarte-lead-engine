@@ -4,8 +4,9 @@ import { isRescheduleRequest } from "../domain/reschedule-intent-detection.js";
 import { isNewBookingRequest } from "../domain/new-booking-intent-detection.js";
 import { parseDatePreference } from "../domain/date-preference-parser.js";
 import { detectQualifiedLeadIntent } from "../domain/qualified-lead-intent-detection.js";
-import { qualifiedMainMenuMetadata, qualifiedOptionsMenuMetadata } from "../domain/qualified-lead-menu-state.js";
+import { qualifiedMainMenuMetadata, qualifiedOptionsMenuMetadata, resolvePendingQualifiedMenu } from "../domain/qualified-lead-menu-state.js";
 import { pastBookedReactivationMetadata, hasPastBookedReactivationBeenShown } from "../domain/past-booked-reactivation-state.js";
+import { isSocialAcknowledgement, isBareGreeting, isVagueInformationRequest } from "../domain/social-acknowledgement-detection.js";
 import {
   resolvePendingTopicFollowup, detectFollowupBranch, buildFollowupBranchAnswer, buildFollowupClarifyMessage,
   classifyShortResponse, topicFollowupMetadata, FOLLOWUP_CLOSING_MESSAGE, type QualifiedLeadFollowupTopic,
@@ -17,7 +18,8 @@ import { ActiveOfferInconsistentError, SlotOfferClaimInProgressError } from "../
 import {
   PAST_BOOKED_GENERIC_INBOUND_MESSAGE, PAST_BOOKED_RESCHEDULE_TO_NEW_BOOKING_MESSAGE, PAST_BOOKED_CANCELLATION_MESSAGE,
   RESCHEDULE_IN_PROGRESS_MESSAGE, RESCHEDULE_TECHNICAL_ERROR_MESSAGE, buildQualifiedLeadTopicAnswer, buildQualifiedLeadOptionsMessage,
-  QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE,
+  QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, buildQualifiedLeadAskQuestionMessage,
+  UNKNOWN_INTENT_HANDOFF_MESSAGE,
 } from "../domain/message-templates.js";
 import { config } from "../config.js";
 
@@ -158,12 +160,17 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
       // AI) so a past-booked lead's real question ("¿Cómo funciona el PPR?"), "conocer opciones",
       // an equivalent booking phrasing this router's own keyword set catches, or "¿quién eres?"
       // gets a real, useful answer -- never PAST_BOOKED_GENERIC_INBOUND_MESSAGE again. A past
-      // appointment is CONTEXT, not a routing dead end (see the Fase 6E.2 report, item 2/5). No
-      // pending-menu digit resolution is attempted here (second argument `null`): this flow never
-      // shows a numbered 1/2/3 menu, so a bare digit has no menu to resolve against and correctly
-      // falls through to UNKNOWN below (never guessed at -- item 7's "no interpretar dígitos fuera
-      // de un menú que realmente haya sido mostrado").
-      const intent = detectQualifiedLeadIntent(inboundText, null);
+      // appointment is CONTEXT, not a routing dead end (see the Fase 6E.2 report, item 2/5).
+      //
+      // Fase 7J.3 fix (CAUSE_MENU_SELECTION_STATE_MISSING, see
+      // docs/security/FASE7J3-DIAG-PAST-APPOINTMENT-UNKNOWN-INTENT.md Sec 5/6): this flow DOES
+      // show a numbered 1/2/3 menu -- QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE below, tagged with
+      // qualifiedMainMenuMetadata() -- so a bare digit MUST be resolved against it, the exact same
+      // way the main QUALIFIED_A/B/NURTURE_C router already does (whatsapp-inbound-service.ts's
+      // own `resolvePendingQualifiedMenu(priorMessages)` call) -- never a second, divergent
+      // resolution mechanism.
+      const pendingMenu = resolvePendingQualifiedMenu(priorMessages);
+      const intent = detectQualifiedLeadIntent(inboundText, pendingMenu, hasFiscalContext);
       switch (intent.kind) {
         case "QUESTION": {
           // Fase 6E.3: PPR/GMM answers now END by marking topicFollowupMetadata() -- see that
@@ -191,8 +198,17 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
           await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, QUALIFIED_LEAD_IDENTITY_ANSWER_MESSAGE);
           return;
         case "MENU_QUESTION":
+          // Fase 7J.3 fix (CAUSE_NUMERIC_SELECTION_UNHANDLED): digit "1" ("Resolver una duda")
+          // against the MAIN menu above -- same semantics as the main QUALIFIED_A/B/NURTURE_C
+          // router's own identical case (whatsapp-inbound-service.ts), never a distinct past-
+          // booked variant. Asks what the actual question is (a real deterministic prompt, not a
+          // fake resolution) -- the lead's NEXT reply is then classified normally by this same
+          // detectQualifiedLeadIntent pass; if THAT turns out to be genuinely unsupported, it
+          // reaches the UNKNOWN_INTENT_HANDOFF fallback below on its own turn.
+          await sendAndPersistReply(this.deps, lead.id, conversationId, whatsappUserId, buildQualifiedLeadAskQuestionMessage(hasFiscalContext));
+          return;
         case "UNKNOWN":
-          break; // falls through to the short-response/generic fallback below
+          break; // falls through to the classifier/generic fallback below
       }
 
       // Fase 6E.3, item 10: a short reply with NO pending followup state (sí/ok/va/perfecto or
@@ -210,9 +226,47 @@ export class WhatsAppPastBookedRecoveryHandler implements PastBookedRecoveryTurn
         return;
       }
 
-      // Genuinely unrecognized text (never a short-response token). Fase 6E.3, item 6:
+      // Fase 7J.3 fix (CAUSE_PAST_BOOKED_HANDLER_OVERBROAD /
+      // CAUSE_UNKNOWN_INTENT_ROUTING_UNREACHABLE, see
+      // docs/security/FASE7J3-DIAG-PAST-APPOINTMENT-UNKNOWN-INTENT.md): genuinely unrecognized
+      // text reaching this point used to ALWAYS get a generic reply, never escalating -- the exact
+      // gap that let a real, unsupported question ("¿también me pueden ayudar con un seguro de
+      // auto?") loop forever instead of ever reaching a human. Reuses the IDENTICAL classifier
+      // Fase 7J.1 already built for the BOOKED-generic-fallback branch in
+      // whatsapp-inbound-service.ts (item 1 of this phase's spec: "no crear un segundo
+      // clasificador diferente") -- same semantics for BOOKED with a current appointment and
+      // BOOKED with a past one:
+      //  - a trivial acknowledgement ("gracias" -- already handled above via classifyShortResponse,
+      //    reached here only for "listo" and anything CLOSING_TOKENS/GENERIC_CONTINUE_TOKENS
+      //    doesn't cover) or a bare greeting ("hola") -- stays on the existing generic reply,
+      //    unchanged.
+      //  - a vague, contentless request for info ("Hola, quiero información") -- same, unchanged.
+      //  - a stray number-shaped reply (no active menu to match it, or out of range) -- same,
+      //    unchanged (a plausible mis-selection, not a new topic).
+      //  - a parsed DatePreference with no explicit booking/change phrase (e.g. "el sábado por la
+      //    mañana" alone) -- same reasoning as Fase 7I.2's isContextualRescheduleRequest and
+      //    whatsapp-inbound-service.ts's own BOOKED-generic branch: a bare date/daypart mention is
+      //    deliberately NOT enough to auto-start a booking round, but it is squarely appointment-
+      //    adjacent content, never grounds to escalate.
+      //  - anything else (a real, specific unsupported question, or genuinely unparseable content)
+      //    -- escalates to HUMAN_HANDOFF via escalateToHuman (eventType "UNKNOWN_INTENT_HANDOFF",
+      //    same cause as every other unknown-intent escalation in this codebase -- never a new,
+      //    parallel event type). handoffAlertService flows through
+      //    WhatsAppPastBookedRecoveryHandlerDeps (extends BookingOutcomeDeps) already -- the
+      //    Fase 7J.2 advisor alert fires automatically, no additional wiring.
+      const staysGeneric =
+        isSocialAcknowledgement(inboundText)
+        || isBareGreeting(inboundText)
+        || isVagueInformationRequest(inboundText)
+        || /^(?:opcion |la |el )?[1-9]\d*$/i.test(inboundText.trim())
+        || !!parseDatePreference(inboundText, now, this.advisorTimezone);
+      if (!staysGeneric) {
+        await escalateToHuman(this.deps, lead, conversationId, whatsappUserId, "UNKNOWN_INTENT_HANDOFF", UNKNOWN_INTENT_HANDOFF_MESSAGE);
+        return;
+      }
+
       // PAST_BOOKED_GENERIC_INBOUND_MESSAGE is shown at most ONCE per reactivation episode -- once
-      // it has already appeared anywhere in this conversation's history, a LATER unrecognized
+      // it has already appeared anywhere in this conversation's history, a LATER safe-but-vague
       // reply gets the topic-agnostic QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE instead (never
       // repeats "tu cita anterior ya pasó" after the lead has already engaged normally).
       if (hasPastBookedReactivationBeenShown(priorMessages)) {

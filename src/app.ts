@@ -695,6 +695,11 @@ export async function buildApp(overrides: AppDependencies = {}): Promise<Fastify
           messages: messagesRepo,
           leadStatusHistory: leadStatusHistoryRepo,
           logger: app.log,
+          // Fase 7J.3 -- undefined unless HUMAN_HANDOFF_ALERTS_ENABLED (see above). This handler's
+          // own UNKNOWN_INTENT_HANDOFF fallback (docs/security/FASE7J3-DIAG-PAST-APPOINTMENT-UNKNOWN-INTENT.md)
+          // reuses escalateToHuman exactly like WhatsAppBookingHandler's BOOKING_PENDING branch --
+          // same optional dep, same automatic alert wiring, no parallel mechanism.
+          handoffAlertService,
         },
         config.ADVISOR_TIMEZONE,
       )

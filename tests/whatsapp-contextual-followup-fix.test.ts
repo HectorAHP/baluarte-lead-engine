@@ -13,6 +13,7 @@ import { FakeHubSpotCRMProvider } from "../src/infrastructure/fake-hubspot-crm-p
 import type { CalendarProvider } from "../src/application/ports.js";
 import {
   PAST_BOOKED_GENERIC_INBOUND_MESSAGE, QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE, buildQualifiedLeadTopicAnswer,
+  UNKNOWN_INTENT_HANDOFF_MESSAGE,
 } from "../src/domain/message-templates.js";
 import type { Lead, LeadStatus } from "../src/domain/lead.js";
 import type { OfferedSlot } from "../src/domain/offered-slot.js";
@@ -202,7 +203,13 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
     expect(outbound[2].body).not.toBe(PAST_BOOKED_GENERIC_INBOUND_MESSAGE);
   });
 
-  it("7. PAST_BOOKED_GENERIC_INBOUND_MESSAGE is shown only once per reactivation episode", async () => {
+  it("7. PAST_BOOKED_GENERIC_INBOUND_MESSAGE is shown only once per reactivation episode -- a later genuinely unrelated turn escalates instead of looping", async () => {
+    // Fase 7J.3 product decision (docs/security/FASE7J3-DIAG-PAST-APPOINTMENT-UNKNOWN-INTENT.md):
+    // "algo completamente distinto sin sentido" is genuinely unparseable content -- the same class
+    // as the spec's own "asdkjfh qweoiu" example, which escalates. This test used to assert the
+    // topic-agnostic QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE redirect instead; the underlying
+    // "never shown a second time" guarantee for PAST_BOOKED_GENERIC_INBOUND_MESSAGE itself is
+    // unchanged and still asserted below.
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214779970007", "BOOKED");
@@ -210,12 +217,13 @@ describe("Fase 6E.3 -- contextual follow-up + past-booked booking handoff fix", 
 
     await send(app, "5214779970007", "wamid.7a", "Hola"); // unrecognized -> past-booked #1
     await send(app, "5214779970007", "wamid.7b", "¿Qué es un PPR?"); // engages normally
-    await send(app, "5214779970007", "wamid.7c", "algo completamente distinto sin sentido"); // unrecognized again
+    await send(app, "5214779970007", "wamid.7c", "algo completamente distinto sin sentido"); // genuinely unrelated -> escalates
 
     const outbound = await outboundMessages(repos, conversation.id);
     const pastBookedCount = outbound.filter((m) => m.body === PAST_BOOKED_GENERIC_INBOUND_MESSAGE).length;
     expect(pastBookedCount).toBe(1); // never shown a second time
-    expect(outbound[2].body).toBe(QUALIFIED_LEAD_GENERIC_INBOUND_MESSAGE); // topic-agnostic redirect instead
+    expect(outbound[2].body).toBe(UNKNOWN_INTENT_HANDOFF_MESSAGE);
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF");
   });
 
   it("8. past-booked + 'agendar' with booking=true reaches the real booking handler", async () => {

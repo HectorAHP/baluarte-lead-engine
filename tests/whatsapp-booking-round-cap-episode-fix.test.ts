@@ -291,7 +291,14 @@ describe("Fase 6E.3.1 -- scope booking round cap to current episode", () => {
     let outbound = await outboundMessages(repos, conversation.id);
     expect(outbound[0]!.metadata).toEqual({ expectedIntent: "PPR_FOLLOWUP" });
 
-    await send(app, "5214779950010", "wamid.i2", "mejor cuéntame de otra cosa, algo distinto"); // unrelated, no keyword match -> clears the pending followup by not re-attaching its marker
+    // Fase 7J.3: a bare greeting -- deliberately NOT the original "mejor cuéntame de otra cosa,
+    // algo distinto", which is genuinely unrelated content and (correctly, as of this phase --
+    // see docs/security/FASE7J3-DIAG-PAST-APPOINTMENT-UNKNOWN-INTENT.md) now escalates to
+    // UNKNOWN_INTENT_HANDOFF instead of getting any generic reply, which would suppress the rest
+    // of this exact conversation and make this test's own point (verifying stale PPR_FOLLOWUP
+    // state doesn't leak into a LATER turn) impossible to observe. "hola" still clears the
+    // pending followup by not re-attaching its marker, without escalating.
+    await send(app, "5214779950010", "wamid.i2", "hola");
     outbound = await outboundMessages(repos, conversation.id);
     expect(outbound[1]!.metadata).not.toEqual({ expectedIntent: "PPR_FOLLOWUP" });
 

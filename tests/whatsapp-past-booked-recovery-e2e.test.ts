@@ -10,7 +10,7 @@ import {
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
 import type { CalendarProvider, CalendarEventInput } from "../src/application/ports.js";
-import { BOOKED_GENERIC_INBOUND_MESSAGE, PAST_BOOKED_GENERIC_INBOUND_MESSAGE } from "../src/domain/message-templates.js";
+import { BOOKED_GENERIC_INBOUND_MESSAGE, PAST_BOOKED_GENERIC_INBOUND_MESSAGE, UNKNOWN_INTENT_HANDOFF_MESSAGE } from "../src/domain/message-templates.js";
 import type { Lead, LeadStatus } from "../src/domain/lead.js";
 
 /**
@@ -230,7 +230,14 @@ describe("Pre-launch hardening -- stale/past BOOKED appointment recovery", () =>
     expect(reloadedStale?.status).toBe("BOOKED");
   });
 
-  it("6: past BOOKED + a general question gets a useful, non-repetitive fallback -- never silence, never the future-appointment copy", async () => {
+  it("6: past BOOKED + a general/unrelated question -> UNKNOWN_INTENT_HANDOFF, never silence, never the future-appointment copy", async () => {
+    // Fase 7J.3 product decision (docs/security/FASE7J3-DIAG-PAST-APPOINTMENT-UNKNOWN-INTENT.md):
+    // before this phase, ANY unrecognized text (including a real, unrelated question) got the
+    // SAME generic "tu cita ya pasó" reply forever -- this test used to assert exactly that. The
+    // new rule mirrors the identical BOOKED/BOOKING_PENDING decision from Fase 7J/7J.1 (this exact
+    // text, "¿Cuáles son los servicios?", already escalates in BOOKING_PENDING as of that phase):
+    // a message semantically unrelated to the appointment/booking domain escalates to a human
+    // instead of repeating an irrelevant menu indefinitely.
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214779990006", "BOOKED");
@@ -240,8 +247,8 @@ describe("Pre-launch hardening -- stale/past BOOKED appointment recovery", () =>
 
     const outbound = await outboundMessages(repos, conversation.id);
     expect(outbound).toHaveLength(1);
-    expect(outbound[0].body).toBe(PAST_BOOKED_GENERIC_INBOUND_MESSAGE);
-    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKED");
+    expect(outbound[0].body).toBe(UNKNOWN_INTENT_HANDOFF_MESSAGE);
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF");
   });
 
   it("7: score/product/qualification remain intact through the full past-booked recovery (generic reply + new booking start)", async () => {
