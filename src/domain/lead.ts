@@ -3,6 +3,37 @@ import type { PhoneQuality } from "./phone-quality.js";
 
 export type Vertical = "PATRIMONIAL" | "GMM" | "UNKNOWN";
 
+/**
+ * Fase 2.2 (Baluarte Content Intelligence -- "Launch Blocker Closure") -- first-party,
+ * web-capture attribution, persisted alongside the lead instead of living ONLY in the HubSpot
+ * sync payload (see HubSpotFiscalAttributionInput in hubspot-fiscal-properties.ts, which this
+ * type is deliberately structurally identical to -- not imported from there, to keep
+ * domain/lead.ts free of a dependency on a HubSpot-specific module; TypeScript's structural
+ * typing means a caller's `attribution` object satisfies both without any cast).
+ *
+ * Deliberately the SAME shape impuestos.html already sends today (see app.ts's
+ * `attributionSchema`) -- campaign_id/adset_id/ad_id are NOT fields here because the frontend
+ * never captures them (confirmed by reading captureUTM() in the live site during the Fase 2.1
+ * audit) -- adding them here would just be three more columns that are always null. If a future
+ * caller starts sending Meta's native campaign_id/adset_id/ad_id, they belong on the existing
+ * Lead.campaignId/adsetId/adId fields (already present since migration 001), not duplicated here.
+ */
+export interface WebAttribution {
+  utm_source?: string;
+  utm_medium?: string;
+  utm_campaign?: string;
+  /** For this campaign (bc_calc_diag_2026_09 and successors), utm_content IS the creative id --
+   * e.g. "BC-A-FEED-V01". No separate `creativeId` field: one value, one source of truth, see
+   * the Fase 2.2 report for why a dedicated column was rejected (utm_content already carries it
+   * losslessly, and Meta's own ad-level targeting already keys off utm_content in this account's
+   * naming convention). */
+  utm_content?: string;
+  utm_term?: string;
+  fbclid?: string;
+  landing_page?: string;
+  referrer?: string;
+}
+
 export type LeadStatus =
   | "NEW" | "CONTACT_PENDING" | "CONTACTED" | "QUALIFYING"
   | "QUALIFIED_A" | "QUALIFIED_B" | "NURTURE_C" | "BOOKING_PENDING"
@@ -80,6 +111,16 @@ export interface Lead {
    * a future scoring-rule change never silently reinterprets an old score under new rules, same
    * versioning discipline as fiscal_v1's own `version` field. */
   leadIntegrityVersion?: string;
+  /**
+   * Fase 2.2 -- first-party web attribution (migration 022_leads_attribution.sql). Set ONLY on
+   * first capture and NEVER overwritten by a later submission from the same lead (see
+   * WebLeadCaptureService's "first-touch attribution preserved on purpose" rule, applied here
+   * exactly like campaignName/source/productVertical/productInterest already are). Absent on
+   * every lead created before this migration, and absent on any lead whose capture request sent
+   * no `attribution` object (e.g. a manual lead, or a WhatsApp-originated lead) -- optional
+   * everywhere, never required.
+   */
+  attribution?: WebAttribution;
 }
 
 /** Priority order for deduplicating an inbound lead against existing records: exact

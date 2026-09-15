@@ -486,6 +486,13 @@ export class WebLeadCaptureService {
       if (!existing.phoneRaw && input.phone) { patch.phoneRaw = input.phone; patch.phoneE164 = phoneE164; }
       if (!existing.privacyAcceptedAt) patch.privacyAcceptedAt = input.privacyAcceptedAt;
       if (input.consentContact && !existing.consentContact) patch.consentContact = true; // consent can only be gained here, never revoked by a resubmission that simply left the box unchecked
+      // Fase 2.2: first-touch attribution, same rule as campaignName/source/productVertical/
+      // productInterest above (see this class's own doc comment) -- a SECOND submission from the
+      // same lead (different campaign, different creative, retargeting) must never overwrite the
+      // attribution that actually brought this person in the first time. Only fills the gap when
+      // the first capture genuinely had none (e.g. a WhatsApp-originated lead later completes the
+      // web form).
+      if (!existing.attribution && input.attribution) patch.attribution = input.attribution;
       const mergedNotes = appendNote(existing.notes, input.note);
       if (mergedNotes !== existing.notes) patch.notes = mergedNotes;
 
@@ -520,6 +527,11 @@ export class WebLeadCaptureService {
       consentContact: input.consentContact,
       notes: input.note,
       privacyAcceptedAt: input.privacyAcceptedAt,
+      // Fase 2.2: first-party persistence of the SAME attribution object this class already
+      // received and, until now, only ever forwarded to HubSpot (see buildFiscalSyncInput) --
+      // never to the lead itself. See domain/lead.ts's WebAttribution doc comment and the Fase 2.2
+      // report for why HubSpot must not be the only system that remembers this.
+      attribution: input.attribution,
     });
     // createLead()'s own input type is a fixed, narrow shape shared by every caller in this
     // codebase (whatsapp-inbound-service.ts included) -- deliberately NOT widened for Fase 7B's

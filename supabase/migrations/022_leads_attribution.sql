@@ -1,0 +1,23 @@
+-- Fase 2.2 (Baluarte Content Intelligence -- "Launch Blocker Closure"): first-party web
+-- attribution, persisted on `leads` instead of living only in the HubSpot sync payload
+-- (hubspot_sync_outbox.payload / bc_fiscal_utm_* properties, migration 020/021).
+--
+-- Additive, nullable, backwards compatible -- every existing row gets `attribution = null`, no
+-- backfill, no rewrite of history. Reversible via
+-- `alter table leads drop column if exists attribution;` if ever needed (same convention as
+-- migration 017's privacy_accepted_at).
+--
+-- Shape (see domain/lead.ts's WebAttribution doc comment for the full rationale): a single jsonb
+-- object holding utm_source/utm_medium/utm_campaign/utm_content/utm_term/fbclid/landing_page/
+-- referrer -- exactly what impuestos.html's attributionSchema (app.ts) already validates and
+-- already sends today. Chosen over six new flat columns (one per utm_* key) because:
+--   1. It's the exact shape already flowing through the request (app.ts's `attribution` object) --
+--      no reshaping needed at the write site.
+--   2. `leads.campaign_id/campaign_name/adset_id/adset_name/ad_id/ad_name` (migration 001) already
+--      exist for Meta's OWN native identifiers -- this is deliberately a separate concept (raw UTM
+--      capture from the landing page), not a duplicate of those columns. `campaign_name` is
+--      already populated today from `attribution.utm_campaign` (see app.ts line ~909) and is left
+--      untouched by this migration.
+--   3. A single jsonb column is queryable (`attribution->>'utm_content'`) without needing six new
+--      indexes for a field set that may still evolve (see "no schema explosion" instruction).
+alter table leads add column if not exists attribution jsonb;

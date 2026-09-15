@@ -50,6 +50,7 @@ const leadRow: LeadRow = {
   suspected_automation: null,
   lead_integrity_score: null,
   lead_integrity_version: null,
+  attribution: null,
 };
 
 describe("supabase lead mapping", () => {
@@ -65,6 +66,35 @@ describe("supabase lead mapping", () => {
     expect(lead.firstContactAt).toBeInstanceOf(Date);
     expect(lead.qualifiedAt).toBeInstanceOf(Date);
     expect(lead.bookedAt).toBeUndefined();
+    expect(lead.attribution).toBeUndefined();
+  });
+
+  // Fase 2.2 -- first-party web attribution (migration 022_leads_attribution.sql). Round-trips
+  // the exact shape impuestos.html/app.ts already send (see domain/lead.ts's WebAttribution doc
+  // comment) through all three mapping functions, mirroring how every other nullable jsonb-ish
+  // field in this file is verified.
+  it("round-trips attribution: row -> Lead -> insert row -> patch row", () => {
+    const attribution = {
+      utm_source: "meta",
+      utm_medium: "paid_social",
+      utm_campaign: "bc_calc_diag_2026_09",
+      utm_content: "BC-A-FEED-V01",
+      utm_term: "professionals",
+      fbclid: "test123",
+    };
+    const rowWithAttribution: LeadRow = { ...leadRow, attribution };
+    const lead = mapRowToLead(rowWithAttribution);
+    expect(lead.attribution).toEqual(attribution);
+
+    const insertRow = mapLeadToInsertRow({ ...lead, attribution } as Omit<Lead, "id" | "createdAt" | "updatedAt">);
+    expect(insertRow.attribution).toEqual(attribution);
+
+    const patchRow = mapLeadPatchToRow({ attribution });
+    expect(patchRow.attribution).toEqual(attribution);
+
+    // A lead with no attribution at all must insert/patch as null, never as undefined (which
+    // Supabase's client would silently drop from the request body instead of writing NULL).
+    expect(mapLeadToInsertRow({ ...lead, attribution: undefined } as Omit<Lead, "id" | "createdAt" | "updatedAt">).attribution).toBeNull();
   });
 
   it("maps null columns to undefined, not null", () => {

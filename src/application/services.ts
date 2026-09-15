@@ -1,6 +1,6 @@
 import {createHash} from "node:crypto";
 import type { LeadRepository,CalendarProvider,AppointmentRepository,BookingAttemptRepository,LeadScoreRepository,LeadStatusHistoryRepository,AppointmentStatusHistoryRepository,Logger } from "./ports.js";
-import type { Vertical,Lead,LeadStatus } from "../domain/lead.js";
+import type { Vertical,Lead,LeadStatus,WebAttribution } from "../domain/lead.js";
 import type { Appointment } from "../domain/appointment.js";
 import type { BookingAttempt } from "../domain/booking-attempt.js";
 import {scorePatrimonial,scoreGmm,LEGACY_MANUAL_SCORING_RULES_VERSION,type PatrimonialScoreInput,type GmmScoreInput,type ScoreClass} from "../domain/scoring.js";
@@ -24,7 +24,9 @@ export class LeadService{
     private readonly logger:Logger,
   ){}
 
-  async createLead(input:{firstName?:string;lastName?:string;phone?:string;email?:string;city?:string;source?:string;sourceDetail?:string;campaignName?:string;productVertical?:Vertical;productInterest?:string;metaLeadId?:string;whatsappUserId?:string;consentContact?:boolean;notes?:string;privacyAcceptedAt?:Date;}):Promise<Lead>{
+  async createLead(input:{firstName?:string;lastName?:string;phone?:string;email?:string;city?:string;source?:string;sourceDetail?:string;campaignName?:string;productVertical?:Vertical;productInterest?:string;metaLeadId?:string;whatsappUserId?:string;consentContact?:boolean;notes?:string;privacyAcceptedAt?:Date;/** Fase 2.2 -- see domain/lead.ts's WebAttribution doc comment. Optional, additive: every
+    * existing caller (whatsapp-inbound-service.ts included) simply omits it and behaves exactly
+    * as before. */attribution?:WebAttribution;}):Promise<Lead>{
     const {phone,consentContact,...rest}=input;
     const phoneE164=normalizePhoneToE164(phone)??undefined;
     return this.leads.create({
