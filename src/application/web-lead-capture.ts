@@ -284,6 +284,20 @@ export class WebLeadCaptureService {
    * Deliberately does NOT touch lead.score / lead.scoreClass / lead.status / assignedAdvisor /
    * conversations / appointments / lifecycle timestamps -- see migration
    * 018_fiscal_lead_scores.sql's header comment for why those stay untouched.
+   *
+   * Fase 2.2.7 -- HubSpot first-touch consistency fix: `attribution` below is `lead.attribution`
+   * (the already-persisted/merged record this method's caller passes in), never
+   * `input.attribution` (this one submission's own attribution). By the time capture() calls
+   * scoreFiscalCalculatorSubmission(lead, input), `lead` already carries EXACTLY the first-touch
+   * semantics Supabase implements (`capture()`'s own `if (!existing.attribution && input.attribution)
+   * patch.attribution = input.attribution` rule, a few lines up in this same file) -- first
+   * capture: lead.attribution === input.attribution; a later capture with a first-touch already on
+   * file: lead.attribution is that untouched first-touch, never the new submission's. Reusing it
+   * here (instead of re-deriving a second, parallel attribution rule) means HubSpot's inline sync
+   * and outbox delivery -- both of which call this same helper -- automatically tell the exact
+   * same attribution story Supabase already tells, including the legacy-lead-with-null-attribution
+   * case (which resolves to `input.attribution` for free, since capture() already backfilled it
+   * onto `lead` before calling this).
    */
   private buildFiscalSyncInput(lead: Lead, input: WebLeadCaptureInput, result: ReturnType<typeof scoreFiscalCalculatorLead>): SyncFiscalCalculatorLeadInput {
     return {
@@ -292,7 +306,7 @@ export class WebLeadCaptureService {
       fiscalCalculator: input.fiscalCalculatorSnapshot!,
       calculationVersion: input.calculationVersion,
       fiscalScore: { score: result.score, scoreClass: result.scoreClass, version: result.version },
-      attribution: input.attribution,
+      attribution: lead.attribution,
       consentContact: input.consentContact,
       privacyAcceptedAt: input.privacyAcceptedAt,
       // Fase 6F.1: the authoritative submission-capture timestamp, never the sync moment -- see

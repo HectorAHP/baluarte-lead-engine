@@ -126,6 +126,58 @@ describe("Fase 7C -- WebLeadCaptureService HubSpot outbox integration", () => {
   });
 });
 
+describe("Fase 2.2.7 -- HubSpot outbox preserves first-touch attribution (same fix as the inline path)", () => {
+  it("TEST 3: outbox payload for a SECOND submission still carries the FIRST submission's attribution, never the second's", async () => {
+    const { service, hubspotOutbox } = makeService(slowHubSpotCrm(0), true);
+    const phone = "4779000003", email = "outbox-ft@example.com";
+    const first = await service.capture(baseInput({
+      submissionId: "ft-outbox-sub-1", phone, email,
+      attribution: { utm_source: "meta", utm_campaign: "qa_phase_226", utm_content: "qa_creative_001", fbclid: "qa_fbclid_001" },
+    }));
+    await service.capture(baseInput({
+      submissionId: "ft-outbox-sub-2", phone, email,
+      attribution: { utm_source: "instagram", utm_campaign: "qa_second_touch", utm_content: "qa_creative_999", fbclid: "qa_fbclid_999" },
+    }));
+
+    const entries = await hubspotOutbox.listByStatus("PENDING");
+    expect(entries).toHaveLength(2); // two genuinely new fiscal_v1 submissions -> two scheduled deliveries, both about the SAME lead
+    for (const entry of entries) {
+      expect(entry.leadId).toBe(first.lead.id);
+      expect(entry.payload.properties.bc_fiscal_utm_source).toBe("meta");
+      expect(entry.payload.properties.bc_fiscal_utm_campaign).toBe("qa_phase_226");
+      expect(entry.payload.properties.bc_fiscal_utm_content).toBe("qa_creative_001");
+      expect(entry.payload.properties.bc_fiscal_fbclid).toBe("qa_fbclid_001");
+    }
+  });
+
+  it("TEST 4: legacy lead with no persisted attribution falls back to the current submission's attribution, no error", async () => {
+    const { service, leads, hubspotOutbox } = makeService(slowHubSpotCrm(0), true);
+    const phone = "4779000004", email = "outbox-legacy@example.com";
+    // Simulate a pre-Fase-2.2 lead that already exists with attribution explicitly absent --
+    // the exact "leads.attribution = null" case item 7 of the brief describes.
+    await leads.create({ country: "MX", productVertical: "GMM", status: "NEW", score: 0, assignedAdvisor: "Hector Herrera", consentContact: false, phoneRaw: phone, phoneE164: "+52" + phone, email, source: "WHATSAPP" });
+
+    const result = await service.capture(baseInput({
+      submissionId: "ft-legacy-sub-1", phone, email,
+      attribution: { utm_source: "meta", utm_campaign: "legacy_fallback" },
+    }));
+
+    expect(result.lead.attribution).toEqual({ utm_source: "meta", utm_campaign: "legacy_fallback" });
+    const [entry] = await hubspotOutbox.listByStatus("PENDING");
+    expect(entry.payload.properties.bc_fiscal_utm_source).toBe("meta");
+    expect(entry.payload.properties.bc_fiscal_utm_campaign).toBe("legacy_fallback");
+  });
+
+  it("TEST 5: dedupe/contact-identity behavior is unchanged -- still exactly one outbox delivery scheduled per genuinely new submission", async () => {
+    const { service, hubspotOutbox } = makeService(slowHubSpotCrm(0), true);
+    const input = baseInput({ submissionId: "ft-dedupe-sub-1" });
+    await service.capture(input);
+    await service.capture(input); // exact retry, same submissionId -- must not schedule a second delivery
+    const entries = await hubspotOutbox.listByStatus("PENDING");
+    expect(entries).toHaveLength(1);
+  });
+});
+
 // Fase 7C.1 §1/§2 -- WebLeadCaptureService wired with a REAL AtomicFiscalCaptureRepository
 // (InMemory stand-in here; migration 021's RPC in production/Supabase).
 describe("Fase 7C.1 -- WebLeadCaptureService atomic fiscal-score + outbox wiring", () => {

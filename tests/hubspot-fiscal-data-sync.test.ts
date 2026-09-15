@@ -382,6 +382,76 @@ describe("Fase 6F -- HubSpot fiscal data sync", () => {
   });
 });
 
+/**
+ * Fase 2.2.7 -- HubSpot first-touch consistency fix. Fase 2.2.6's live production QA found that
+ * test 19 above ("attribution (UTMs) is mapped") only ever exercised a SINGLE submission -- it
+ * never caught that a SECOND submission's attribution silently overwrote HubSpot's UTM
+ * properties, even though Supabase's own leads.attribution correctly stayed first-touch. These
+ * tests cover exactly that gap end-to-end, through the real HTTP route (the inline sync path).
+ */
+describe("Fase 2.2.7 -- HubSpot inline sync preserves first-touch attribution", () => {
+  it("TEST 1: a first submission -> HubSpot receives that submission's attribution", async () => {
+    const hubspotCrm = new FakeHubSpotCRMProvider();
+    const app = await buildTestApp({ hubspotCrm });
+    await app.inject({
+      method: "POST", url: "/api/leads",
+      payload: payload("4772000001", "ft1@example.com", {
+        attribution: { utm_source: "meta", utm_campaign: "qa_phase_226", utm_content: "qa_creative_001", utm_term: "qa_test", fbclid: "qa_fbclid_001" },
+      }),
+    });
+    const props = hubspotCrm.contacts[0].properties;
+    expect(props.bc_fiscal_utm_source).toBe("meta");
+    expect(props.bc_fiscal_utm_campaign).toBe("qa_phase_226");
+    expect(props.bc_fiscal_utm_content).toBe("qa_creative_001");
+    expect(props.bc_fiscal_utm_term).toBe("qa_test");
+    expect(props.bc_fiscal_fbclid).toBe("qa_fbclid_001");
+  });
+
+  it("TEST 2: a second submission with DIFFERENT attribution -- HubSpot keeps the first-touch values, never overwritten (the exact Fase 2.2.6 bug)", async () => {
+    const hubspotCrm = new FakeHubSpotCRMProvider();
+    const app = await buildTestApp({ hubspotCrm });
+    const phone = "4772000002", email = "ft2@example.com";
+    await app.inject({
+      method: "POST", url: "/api/leads",
+      headers: { "idempotency-key": "22000000-0000-4000-8000-000000000001" },
+      payload: payload(phone, email, {
+        attribution: { utm_source: "meta", utm_campaign: "qa_phase_226", utm_content: "qa_creative_001", utm_term: "qa_test", fbclid: "qa_fbclid_001" },
+      }),
+    });
+    await app.inject({
+      method: "POST", url: "/api/leads",
+      headers: { "idempotency-key": "22000000-0000-4000-8000-000000000002" },
+      payload: payload(phone, email, {
+        attribution: { utm_source: "instagram", utm_campaign: "qa_second_touch", utm_content: "qa_creative_999", utm_term: "qa_second", fbclid: "qa_fbclid_999" },
+      }),
+    });
+
+    expect(hubspotCrm.contacts).toHaveLength(1); // still no duplicate -- dedupe/contact identity unaffected by this fix
+    const props = hubspotCrm.contacts[0].properties;
+    expect(props.bc_fiscal_utm_source).toBe("meta");
+    expect(props.bc_fiscal_utm_campaign).toBe("qa_phase_226");
+    expect(props.bc_fiscal_utm_content).toBe("qa_creative_001");
+    expect(props.bc_fiscal_utm_term).toBe("qa_test");
+    expect(props.bc_fiscal_fbclid).toBe("qa_fbclid_001");
+  });
+
+  it("TEST 6: Supabase leads.attribution keeps its existing first-touch behavior, unaffected by this fix", async () => {
+    const hubspotCrm = new FakeHubSpotCRMProvider();
+    const app = await buildTestApp({ hubspotCrm });
+    const phone = "4772000006", email = "ft6@example.com";
+    const first = await app.inject({
+      method: "POST", url: "/api/leads",
+      payload: payload(phone, email, { attribution: { utm_source: "meta", utm_campaign: "ft6_first" } }),
+    });
+    await app.inject({
+      method: "POST", url: "/api/leads",
+      payload: payload(phone, email, { attribution: { utm_source: "instagram", utm_campaign: "ft6_second" } }),
+    });
+    const lead = await getLead(app, first.json().leadId);
+    expect(lead.attribution).toEqual({ utm_source: "meta", utm_campaign: "ft6_first" });
+  });
+});
+
 describe("Fase 6F -- HubSpotFiscalSyncService not-configured no-op", () => {
   afterEach(() => vi.restoreAllMocks());
 
