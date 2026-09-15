@@ -29,6 +29,7 @@ import {
 } from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
 import { getFiscalLeadContextForLead, type FiscalLeadContext } from "./fiscal-lead-context.js";
+import { HANDOFF_AUTO_RECOVERED_EVENT_TYPE, HANDOFF_AUTO_RECOVERED_REASON_CODE, type HumanHandoffRecoveryResult } from "./human-handoff-recovery-service.js";
 
 /**
  * Phase 3B qualifier orchestrator, injected only when config.QUALIFICATION_ENGINE_ENABLED is
@@ -202,6 +203,16 @@ export interface WhatsAppInboundDeps {
    * sends no alert -- byte-for-byte the Fase 7J/7J.1 behavior. See HandoffAlertTurnService's own
    * doc comment. */
   handoffAlertService?: HandoffAlertTurnService;
+  /**
+   * Fase 2.2.3 (Handoff Resilience) -- the SAME HumanHandoffRecoveryService instance app.ts
+   * already constructs unconditionally for the admin recover-handoff route (see app.ts, "Fase 7E:
+   * always constructed"). Present in production by construction, always; a test that doesn't
+   * need this critical-command bypass simply omits it, and the wasAlreadySuppressed branch below
+   * behaves byte-for-byte as it did before this phase -- same "optional dependency is the de
+   * facto flag" convention as every other handler in this file. Narrowed to just the one method
+   * this file calls, so this file never needs to import the concrete class.
+   */
+  handoffRecovery?: { recover(leadId: string, now: Date, eventType?: string, recoveryReasonCode?: string): Promise<HumanHandoffRecoveryResult> };
 }
 
 /**
@@ -426,13 +437,87 @@ export async function handleInboundWhatsAppText(
   const conversationId = conversation.id;
 
   if (wasAlreadySuppressed) {
-    // Lead was already DO_NOT_CONTACT or HUMAN_HANDOFF before this message: ingest silently,
-    // no automated reply of any kind (not even a repeated handoff/opt-out acknowledgment).
+    // DO_NOT_CONTACT: unconditionally silent, exactly as before this phase -- opt-out is final,
+    // never bypassed by anything below.
+    if (lead.status !== "HUMAN_HANDOFF") {
+      deps.logger.warn(
+        { stage: "suppressed-lead-check", reason: "lead already DO_NOT_CONTACT before this message", messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), conversationIdLast8: conversationId.slice(-8) },
+        "whatsapp inbound terminated",
+      );
+      return { outcome: "PROCESSED", leadId, conversationId };
+    }
+
+    // Fase 2.2.3 (Handoff Resilience) -- docs/FASE2.2.3-HANDOFF-RESILIENCE.md has the full audit
+    // and design rationale. HUMAN_HANDOFF must keep pausing automated COMMERCIAL conversation
+    // (unchanged below), but must never block an unambiguous OPERATIONAL command the lead is
+    // entitled to at any time. Exactly three such commands exist in this codebase today, each
+    // already deterministically detected: opt-out (isOptOutMessage), cancel (isCancellationRequest)
+    // and reschedule (isRescheduleRequest). Nothing here reimplements any of the three -- opt-out
+    // simply falls through into the SAME branch below (isOptOutMessage is unconditionally that
+    // branch's first check, so this exact message is claimed there, unmodified); cancel/reschedule
+    // reuse the SAME HumanHandoffRecoveryService the admin recover-handoff endpoint already uses
+    // to compute the one safe destination status from the lead's own real, persisted data -- once
+    // recovered to BOOKED, the EXISTING reschedule-intent/cancellation-intent branches further
+    // below claim the turn exactly as they would for any normal BOOKED lead, via the EXISTING
+    // WhatsAppCancellationHandler/WhatsAppRescheduleHandler, completely unmodified by this phase.
     deps.logger.warn(
-      { stage: "suppressed-lead-check", reason: "lead already DO_NOT_CONTACT or HUMAN_HANDOFF before this message", messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), conversationIdLast8: conversationId.slice(-8) },
-      "whatsapp inbound terminated",
+      { messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), conversationIdLast8: conversationId.slice(-8) },
+      "handoff_message_received",
     );
-    return { outcome: "PROCESSED", leadId, conversationId };
+
+    if (isOptOutMessage(input.text)) {
+      deps.logger.warn({ messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8) }, "critical_command_allowed");
+      // Falls through to the processing boundary below -- no early return.
+    } else if (
+      deps.appointments && deps.handoffRecovery
+      && ((deps.cancellationHandler && isCancellationRequest(input.text)) || (deps.rescheduleHandler && isRescheduleRequest(input.text)))
+    ) {
+      // Read-only precondition, using the SAME primitives (listActiveByLeadId + isUpcomingBooked)
+      // HumanHandoffRecoveryService itself uses to decide its own BOOKED case -- never a second,
+      // divergent decision rule. This exists ONLY to avoid invoking a status-mutating recovery for
+      // a message that could never actually be actioned (no live appointment to touch): without
+      // it, a lead with nothing to cancel/reschedule would still get silently moved out of
+      // HUMAN_HANDOFF (e.g. to CONTACTED/scoreClass tier), breaking the freeze for every
+      // SUBSEQUENT commercial message too -- exactly the regression Test 4 guards against.
+      const activeAppointments = await deps.appointments.listActiveByLeadId(leadId);
+      const hasLiveBookedAppointment = activeAppointments.length === 1 && isUpcomingBooked(activeAppointments[0], new Date());
+      if (hasLiveBookedAppointment) {
+        const recovery = await deps.handoffRecovery.recover(leadId, new Date(), HANDOFF_AUTO_RECOVERED_EVENT_TYPE, HANDOFF_AUTO_RECOVERED_REASON_CODE);
+        if (recovery.outcome === "RECOVERED" && recovery.toStatus === "BOOKED") {
+          lead = recovery.lead;
+          deps.logger.warn(
+            { messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), fromStatus: recovery.previousStatus, toStatus: recovery.toStatus },
+            "handoff_recovered",
+          );
+          deps.logger.warn({ messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8) }, "critical_command_allowed");
+          // Falls through -- lead.status is now BOOKED, so the reschedule-intent/cancellation-
+          // intent branches further below claim this exact message normally.
+        } else {
+          deps.logger.warn(
+            { messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), recoveryOutcome: recovery.outcome },
+            "commercial_message_suppressed",
+          );
+          return { outcome: "PROCESSED", leadId, conversationId };
+        }
+      } else {
+        deps.logger.warn(
+          { stage: "suppressed-lead-check", reason: "lead in HUMAN_HANDOFF, critical-command text but no live BOOKED appointment to act on", messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), conversationIdLast8: conversationId.slice(-8) },
+          "commercial_message_suppressed",
+        );
+        return { outcome: "PROCESSED", leadId, conversationId };
+      }
+    } else {
+      // Every other message while HUMAN_HANDOFF -- including a real commercial question, a
+      // greeting, or cancel/reschedule text when the relevant handler/appointments dependency is
+      // simply absent -- stays exactly as silent as it was before this phase: ingested, zero
+      // automated reply. This is the mechanism Test 4/6 (commercial message stays paused, both for
+      // UNKNOWN_INTENT_HANDOFF and EXPLICIT_HUMAN_HANDOFF alike) depend on.
+      deps.logger.warn(
+        { stage: "suppressed-lead-check", reason: "lead in HUMAN_HANDOFF, message not a recognized critical command", messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), conversationIdLast8: conversationId.slice(-8) },
+        "commercial_message_suppressed",
+      );
+      return { outcome: "PROCESSED", leadId, conversationId };
+    }
   }
 
   /** Pre-launch production diagnostic (temporary): logs exactly which routing branch this turn
