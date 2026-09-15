@@ -13,6 +13,19 @@ import { recordLeadStatusTransition } from "./lead-status-audit.js";
  */
 export const HANDOFF_MANUALLY_RECOVERED_EVENT_TYPE = "HANDOFF_MANUALLY_RECOVERED";
 
+/**
+ * Fase 2.2.3 (Handoff Resilience) -- the ONLY other caller of recover(), besides the admin
+ * recover-handoff route: whatsapp-inbound-service.ts, when a HUMAN_HANDOFF lead sends an
+ * unambiguous operational command (cancel/reschedule) for a real, live BOOKED appointment (see
+ * that file's own doc comment on the wasAlreadySuppressed branch). Deliberately its OWN event
+ * type and reason code -- never reuses HANDOFF_MANUALLY_RECOVERED_EVENT_TYPE/
+ * ADMIN_VERIFIED_HANDOFF_RESOLVED, which would misrepresent an automatic, message-triggered
+ * recovery as an admin's manual judgment call in the audit trail. The DECISION POLICY itself
+ * (recover()'s doc comment below) is 100% shared/unchanged -- only the audit label differs.
+ */
+export const HANDOFF_AUTO_RECOVERED_EVENT_TYPE = "HANDOFF_AUTO_RECOVERED_CRITICAL_COMMAND";
+export const HANDOFF_AUTO_RECOVERED_REASON_CODE = "AUTOMATIC_CRITICAL_COMMAND_DURING_HANDOFF";
+
 export interface HumanHandoffRecoveryDeps {
   leads: LeadRepository;
   appointments: AppointmentRepository;
@@ -89,14 +102,28 @@ export class HumanHandoffRecoveryService {
    *    HANDOFF_MANUALLY_RECOVERED, metadata {recoveryReasonCode, previousStatus,
    *    resolvedAppointmentState} -- operational only, never PII.
    */
-  async recover(leadId: string, now: Date): Promise<HumanHandoffRecoveryResult> {
+  async recover(
+    leadId: string,
+    now: Date,
+    // Fase 2.2.3: additive, defaulted parameters -- every existing caller (the admin
+    // recover-handoff route) omits both and gets byte-for-byte the Fase 7E behavior/audit
+    // labels. Only the new automatic caller above passes its own distinct pair.
+    eventType: string = HANDOFF_MANUALLY_RECOVERED_EVENT_TYPE,
+    recoveryReasonCode: string = "ADMIN_VERIFIED_HANDOFF_RESOLVED",
+  ): Promise<HumanHandoffRecoveryResult> {
     const lead = await this.deps.leads.findById(leadId);
     if (!lead) return { outcome: "NOT_FOUND" };
 
     if (lead.status !== "HUMAN_HANDOFF") {
       const history = await this.deps.leadStatusHistory.listByLeadId(lead.id);
       const mostRecent = history[history.length - 1];
-      if (mostRecent?.eventType === HANDOFF_MANUALLY_RECOVERED_EVENT_TYPE && mostRecent.toStatus === lead.status) {
+      // Fase 2.2.3: recognizes EITHER recovery event type as an idempotent retry -- a lead
+      // already recovered via one caller (admin endpoint or the automatic critical-command path)
+      // must stay idempotent no matter which of the two calls this again.
+      if (
+        (mostRecent?.eventType === HANDOFF_MANUALLY_RECOVERED_EVENT_TYPE || mostRecent?.eventType === HANDOFF_AUTO_RECOVERED_EVENT_TYPE)
+        && mostRecent.toStatus === lead.status
+      ) {
         return { outcome: "ALREADY_RECOVERED", lead };
       }
       return { outcome: "NOT_ELIGIBLE", lead, currentStatus: lead.status };
@@ -128,11 +155,9 @@ export class HumanHandoffRecoveryService {
       leadId: lead.id,
       fromStatus: previousStatus,
       toStatus,
-      eventType: HANDOFF_MANUALLY_RECOVERED_EVENT_TYPE,
-      // Operational metadata only -- no name/phone/email/message text. recoveryReasonCode is a
-      // closed constant (this is the ONLY reason code this service currently has -- a future
-      // second recovery policy would introduce its own distinct code, never overload this one).
-      metadata: { recoveryReasonCode: "ADMIN_VERIFIED_HANDOFF_RESOLVED", previousStatus, resolvedAppointmentState },
+      eventType,
+      // Operational metadata only -- no name/phone/email/message text.
+      metadata: { recoveryReasonCode, previousStatus, resolvedAppointmentState },
     });
 
     return { outcome: "RECOVERED", lead: updated, previousStatus, toStatus, resolvedAppointmentState };
