@@ -31,6 +31,13 @@ export const PATRIMONIAL_QUALIFICATION_FIELDS = [
   "age_range",
   "retirement_objective",
   "fiscal_situation",
+  // Fase 2.2 (Baluarte Content Intelligence -- "Launch Blocker Closure"): the 30-minute diagnosis
+  // call's structured outputs (see frameworks -> 30-minute-diagnosis-script.md /
+  // diagnosis-field-mapping.md in the marketing content repo). Reuses this EXISTING table/
+  // whitelist mechanism instead of a new table or new columns on `leads` -- see that report's
+  // "Existing Schema First" rationale. `source` on the qualification_answers row distinguishes
+  // MANUAL (Héctor enters it after/during the call) from anything automated later.
+  "ad_need_state", "diagnosed_need_state", "primary_concern", "solution_category", "product_fit", "insurer_fit", "next_step",
 ] as const;
 export type PatrimonialQualificationField = (typeof PATRIMONIAL_QUALIFICATION_FIELDS)[number];
 
@@ -52,6 +59,9 @@ export const GMM_QUALIFICATION_FIELDS = [
   "has_current_insurance",
   "priority",
   "urgency",
+  // Fase 2.2 -- same rationale as PATRIMONIAL_QUALIFICATION_FIELDS above; a lead may enter through
+  // the GMM vertical and still need these same call-diagnosis outputs recorded.
+  "ad_need_state", "diagnosed_need_state", "primary_concern", "solution_category", "product_fit", "insurer_fit", "next_step",
 ] as const;
 export type GmmQualificationField = (typeof GMM_QUALIFICATION_FIELDS)[number];
 

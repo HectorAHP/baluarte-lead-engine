@@ -1,6 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { LeadRepository } from "../application/ports.js";
-import type { Lead, LeadDedupKey } from "../domain/lead.js";
+import type { Lead, LeadDedupKey, WebAttribution } from "../domain/lead.js";
 
 export interface LeadRow {
   id: string;
@@ -48,6 +48,11 @@ export interface LeadRow {
   suspected_automation: boolean | null;
   lead_integrity_score: number | null;
   lead_integrity_version: string | null;
+  /** Fase 2.2, migration 022_leads_attribution.sql -- see domain/lead.ts's WebAttribution doc
+   * comment. `unknown` (not `WebAttribution | null`) because Postgres/PostgREST returns jsonb as
+   * parsed JSON with no runtime shape guarantee -- narrowed to WebAttribution only in
+   * mapRowToLead, at the single point that owns trusting this shape. */
+  attribution: unknown | null;
 }
 
 function toDateOrUndefined(value: string | null): Date | undefined {
@@ -101,6 +106,7 @@ export function mapRowToLead(row: LeadRow): Lead {
     suspectedAutomation: row.suspected_automation ?? undefined,
     leadIntegrityScore: row.lead_integrity_score ?? undefined,
     leadIntegrityVersion: row.lead_integrity_version ?? undefined,
+    attribution: (row.attribution as WebAttribution | null) ?? undefined,
   };
 }
 
@@ -148,6 +154,7 @@ export function mapLeadToInsertRow(input: Omit<Lead, "id" | "createdAt" | "updat
     suspected_automation: input.suspectedAutomation ?? null,
     lead_integrity_score: input.leadIntegrityScore ?? null,
     lead_integrity_version: input.leadIntegrityVersion ?? null,
+    attribution: input.attribution ?? null,
   };
 }
 
@@ -195,6 +202,7 @@ export function mapLeadPatchToRow(patch: Partial<Lead>): Record<string, unknown>
   if (patch.suspectedAutomation !== undefined) row.suspected_automation = patch.suspectedAutomation;
   if (patch.leadIntegrityScore !== undefined) row.lead_integrity_score = patch.leadIntegrityScore;
   if (patch.leadIntegrityVersion !== undefined) row.lead_integrity_version = patch.leadIntegrityVersion;
+  if (patch.attribution !== undefined) row.attribution = patch.attribution;
   return row;
 }
 
