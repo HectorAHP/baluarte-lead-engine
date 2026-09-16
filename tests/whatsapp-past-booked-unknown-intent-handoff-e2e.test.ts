@@ -216,21 +216,30 @@ describe("Fase 7J.3 -- past-appointment unknown-intent handoff + menu fix", () =
     expect(messaging.sentTemplates).toHaveLength(1);
   });
 
-  it("10: a subsequent, DISTINCT inbound while already HUMAN_HANDOFF -> suppressed, no second alert", async () => {
+  it("10: a subsequent, DISTINCT inbound while already HUMAN_HANDOFF now auto-recovers instead of staying suppressed forever (Fase 2.2.14A), and does not send a second alert", async () => {
+    // This test's ORIGINAL assertion was "suppressed, no second alert" (the lead stays frozen in
+    // HUMAN_HANDOFF). Fase 2.2.14A deliberately changed that -- see
+    // docs/FASE2.2.14-UNKNOWN-INTENT-HANDOFF-POLICY.md and
+    // docs/FASE2.2.14A-UNKNOWN-INTENT-AUTO-RECOVERY.md: the NEXT inbound message after an
+    // UNKNOWN_INTENT_HANDOFF escalation auto-recovers the lead (here, to BOOKING_PENDING -- this
+    // lead's appointment is PAST, so HumanHandoffRecoveryService's own "Caso B" applies) and that
+    // same message is then routed normally. "no second alert" is still true and still asserted --
+    // this specific follow-up text is understood by the recovered BOOKING_PENDING flow and does
+    // not re-escalate, so HandoffAlertTurnService never fires a second time either.
     const repos = buildRepos();
     const messaging = new FakeMessagingProvider();
     const app = await buildTestApp({ ...repos, messaging, whatsappBookingEnabled: true, whatsappRescheduleEnabled: true, whatsappCancellationEnabled: true, humanHandoffAlertsEnabled: true, humanHandoffAdvisorPhone: ADVISOR_PHONE_RAW });
-    const { lead, conversation } = await createPastBookedLead(repos, "5214779993010");
+    const { lead } = await createPastBookedLead(repos, "5214779993010");
 
     await send(app, "5214779993010", "wamid.10a", "también me ayudan con seguro de auto?");
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF");
 
     await send(app, "5214779993010", "wamid.10b", "hola, siguen ahi?");
 
-    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF"); // unchanged
-    const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound).toHaveLength(1); // only the original escalation message
-    expect(messaging.sentTemplates).toHaveLength(1);
+    expect((await repos.leadsRepo.findById(lead.id))?.status).not.toBe("HUMAN_HANDOFF"); // auto-recovered, no longer frozen
+    const history = await repos.leadStatusHistoryRepo.listByLeadId(lead.id);
+    expect(history.map((h) => h.eventType)).toContain("UNKNOWN_INTENT_AUTO_RECOVERY");
+    expect(messaging.sentTemplates).toHaveLength(1); // never a second alert
   });
 
   it("11/14/15: menu option '1' (Resolver una duda) resolves via pendingMenu -- MENU_QUESTION, does not repeat the menu", async () => {

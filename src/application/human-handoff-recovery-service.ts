@@ -26,6 +26,19 @@ export const HANDOFF_MANUALLY_RECOVERED_EVENT_TYPE = "HANDOFF_MANUALLY_RECOVERED
 export const HANDOFF_AUTO_RECOVERED_EVENT_TYPE = "HANDOFF_AUTO_RECOVERED_CRITICAL_COMMAND";
 export const HANDOFF_AUTO_RECOVERED_REASON_CODE = "AUTOMATIC_CRITICAL_COMMAND_DURING_HANDOFF";
 
+/**
+ * Fase 2.2.14A -- the THIRD caller of recover(), alongside the admin recover-handoff route and
+ * the Fase 2.2.3 critical-command bypass: whatsapp-inbound-service.ts, when a HUMAN_HANDOFF
+ * lead's MOST RECENT escalation into that status was UNKNOWN_INTENT_HANDOFF (an unrecognized
+ * free-text reply within an active flow -- see docs/FASE2.2.14-UNKNOWN-INTENT-HANDOFF-POLICY.md
+ * for the audit of the 5 real call sites, all funneling through booking-outcome-dispatch.ts's
+ * escalateToHuman). Deliberately its own event type/reason code -- never conflated with a genuine
+ * admin judgment call or a critical-command bypass in the audit trail, even though the underlying
+ * decision policy (recover()'s own doc comment) is 100% shared, unchanged, reused verbatim.
+ */
+export const HANDOFF_AUTO_RECOVERED_UNKNOWN_INTENT_EVENT_TYPE = "UNKNOWN_INTENT_AUTO_RECOVERY";
+export const HANDOFF_AUTO_RECOVERED_UNKNOWN_INTENT_REASON_CODE = "AUTOMATIC_UNKNOWN_INTENT_NOT_PERMANENT";
+
 export interface HumanHandoffRecoveryDeps {
   leads: LeadRepository;
   appointments: AppointmentRepository;
@@ -117,11 +130,14 @@ export class HumanHandoffRecoveryService {
     if (lead.status !== "HUMAN_HANDOFF") {
       const history = await this.deps.leadStatusHistory.listByLeadId(lead.id);
       const mostRecent = history[history.length - 1];
-      // Fase 2.2.3: recognizes EITHER recovery event type as an idempotent retry -- a lead
-      // already recovered via one caller (admin endpoint or the automatic critical-command path)
-      // must stay idempotent no matter which of the two calls this again.
+      // Fase 2.2.3/2.2.14A: recognizes ANY of the three recovery event types as an idempotent
+      // retry -- a lead already recovered via one caller (admin endpoint, the critical-command
+      // bypass, or the unknown-intent auto-recovery) must stay idempotent no matter which of the
+      // three calls this again.
       if (
-        (mostRecent?.eventType === HANDOFF_MANUALLY_RECOVERED_EVENT_TYPE || mostRecent?.eventType === HANDOFF_AUTO_RECOVERED_EVENT_TYPE)
+        (mostRecent?.eventType === HANDOFF_MANUALLY_RECOVERED_EVENT_TYPE
+          || mostRecent?.eventType === HANDOFF_AUTO_RECOVERED_EVENT_TYPE
+          || mostRecent?.eventType === HANDOFF_AUTO_RECOVERED_UNKNOWN_INTENT_EVENT_TYPE)
         && mostRecent.toStatus === lead.status
       ) {
         return { outcome: "ALREADY_RECOVERED", lead };
@@ -161,5 +177,33 @@ export class HumanHandoffRecoveryService {
     });
 
     return { outcome: "RECOVERED", lead: updated, previousStatus, toStatus, resolvedAppointmentState };
+  }
+
+  /**
+   * Fase 2.2.14A -- pure classification, no side effects, no write of any kind. Answers exactly
+   * one question: was the MOST RECENT transition into HUMAN_HANDOFF for this lead caused by
+   * UNKNOWN_INTENT_HANDOFF (an unrecognized free-text reply within an active flow), as opposed to
+   * an EXPLICIT escalation (a complaint, a request for a human, sensitive content, a genuine
+   * data-consistency error) or no escalation at all?
+   *
+   * Deliberately looks at the LAST lead_status_history entry whose toStatus is HUMAN_HANDOFF --
+   * never "was there ever an UNKNOWN_INTENT_HANDOFF anywhere in this lead's past". A lead
+   * escalated for UNKNOWN_INTENT_HANDOFF days ago, later manually recovered, and THEN separately
+   * escalated again for an explicit reason, must never auto-recover here -- only the CURRENT
+   * episode's own cause matters (see docs/FASE2.2.14-UNKNOWN-INTENT-HANDOFF-POLICY.md section B/D
+   * for the "caso obligatorio" this guards against).
+   *
+   * No history at all for this lead (e.g. a status set directly, bypassing the audit trail --
+   * only ever happens in tests) is treated as "not eligible" -- the safe default, same posture as
+   * every other ambiguous case in this service.
+   *
+   * Never itself checks lead.status === "HUMAN_HANDOFF" -- that precondition belongs to the
+   * caller (whatsapp-inbound-service.ts only ever calls this from inside its own HUMAN_HANDOFF
+   * branch); this method only classifies WHY, given that the lead already is.
+   */
+  async isUnknownIntentEscalation(leadId: string): Promise<boolean> {
+    const history = await this.deps.leadStatusHistory.listByLeadId(leadId);
+    const lastHandoffEntry = [...history].reverse().find((entry) => entry.toStatus === "HUMAN_HANDOFF");
+    return lastHandoffEntry?.eventType === "UNKNOWN_INTENT_HANDOFF";
   }
 }
