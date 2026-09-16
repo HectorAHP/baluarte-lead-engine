@@ -39,7 +39,7 @@ on:
     # schedules run at exact intervals -- under platform load, a run can be delayed by several
     # minutes or, rarely, skipped. Operationally acceptable at this volume (a single-advisor lead
     # flow, not a real-time system) -- a delayed run is not a failure, see the Fase 2.2.1 report.
-    - cron: "2-57/5 * * * *"
+    - cron: "*/5 * * * *"
   # Manual trigger for one-off verification (e.g. the QA flow in FASE7D-ROLLOUT-PLAN.md section
   # 11) without waiting for the next scheduled tick.
   workflow_dispatch: {}
