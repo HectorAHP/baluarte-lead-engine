@@ -1,0 +1,70 @@
+name: HubSpot Sync Outbox Drain
+
+# Fase 2.2 (Baluarte Content Intelligence -- "Launch Blocker Closure").
+#
+# Implements the "GitHub Actions scheduled workflow" fallback option already documented in
+# docs/security/FASE7D-ROLLOUT-PLAN.md, section 10 ("Scheduler HubSpot"), which was designed but
+# never implemented: no Render Cron Job, no cron-job.org config, and no GitHub Actions workflow
+# existed anywhere in this repo before this file (confirmed by inspection during the Fase 2.1
+# Launch Readiness Audit) -- meaning hubspot_sync_outbox rows could accumulate as PENDING
+# indefinitely with nothing ever calling POST /internal/hubspot-sync/run.
+#
+# This is the minimal fix: no new service, no new infrastructure, reuses the GitHub repo this
+# code already lives in -- exactly the "existing deployment capabilities before new
+# infrastructure" preference from the Fase 2.2 brief, and the same pattern this codebase's own
+# Phase 4 design doc (docs/PHASE4-DESIGN.md, section 8) already recommended for reminders.
+#
+# Does NOT deploy, does NOT touch Render, does NOT run until: (1) this file is committed and
+# pushed to the real GitHub remote, AND (2) HUBSPOT_SYNC_RUNNER_SECRET and LEAD_ENGINE_BASE_URL
+# are configured as repository secrets/variables. Neither of those two things was done by this
+# change -- see the Fase 2.2 report's Deployment Plan for the exact steps Héctor must take.
+
+on:
+  schedule:
+    # Fase 2.2.1 correction: GitHub's own scheduling guidance is that scheduled workflows should
+    # not rely on an interval shorter than 5 minutes -- GitHub explicitly reserves the right to
+    # disable a workflow that schedules more frequently, and busy periods already delay/drop
+    # exact-minute crons across the whole platform (every job queues for shared runner capacity
+    # at your requested time, not before). The original Fase 2.2 "*/2 * * * *" undershot that
+    # floor. Every job in the queue also collides on wall-clock minute 0 -- offsetting into
+    # "2-57/5" (first tick at :02, every 5 minutes, never :00/:05/:10 exactly) avoids piling onto
+    # the single most congested minute mark on the platform, per GitHub's own documented advice.
+    #
+    # domain/hubspot-sync-retry.ts's shortest retry backoff is 1 minute -- a 5-minute drain cycle
+    # still empties PENDING rows well inside HubSpot's own eventual-consistency expectations for
+    # this outbox (a lead's HubSpot contact appearing a few minutes after capture, not instantly,
+    # was already the accepted design in FASE7D-ROLLOUT-PLAN.md's original 2-minute proposal).
+    #
+    # NOTE (GitHub Actions platform limitation, disclosed): GitHub does not guarantee cron
+    # schedules run at exact intervals -- under platform load, a run can be delayed by several
+    # minutes or, rarely, skipped. Operationally acceptable at this volume (a single-advisor lead
+    # flow, not a real-time system) -- a delayed run is not a failure, see the Fase 2.2.1 report.
+    - cron: "2-57/5 * * * *"
+  # Manual trigger for one-off verification (e.g. the QA flow in FASE7D-ROLLOUT-PLAN.md section
+  # 11) without waiting for the next scheduled tick.
+  workflow_dispatch: {}
+
+jobs:
+  drain-outbox:
+    runs-on: ubuntu-latest
+    # Never let a slow/hanging HubSpot call turn into a stuck, billable Actions runner -- the
+    # endpoint itself is expected to respond in a few seconds (it claims a bounded batch and
+    # returns, per hubspot-outbox-processor.ts); this is a generous outer bound, not a tuned one.
+    timeout-minutes: 3
+    steps:
+      - name: Call POST /internal/hubspot-sync/run
+        run: |
+          if [ -z "${{ secrets.HUBSPOT_SYNC_RUNNER_SECRET }}" ] || [ -z "${{ vars.LEAD_ENGINE_BASE_URL }}" ]; then
+            echo "::error::HUBSPOT_SYNC_RUNNER_SECRET (secret) or LEAD_ENGINE_BASE_URL (variable) is not configured for this repository. See the Fase 2.2 Deployment Plan before this workflow can run."
+            exit 1
+          fi
+          http_status=$(curl -sS -o response.json -w "%{http_code}" -X POST \
+            "${{ vars.LEAD_ENGINE_BASE_URL }}/internal/hubspot-sync/run" \
+            -H "Authorization: Bearer ${{ secrets.HUBSPOT_SYNC_RUNNER_SECRET }}" \
+            -H "Content-Type: application/json")
+          echo "HTTP status: $http_status"
+          cat response.json
+          if [ "$http_status" -ne 200 ]; then
+            echo "::error::hubspot-sync/run returned HTTP $http_status"
+            exit 1
+          fi
