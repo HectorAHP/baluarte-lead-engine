@@ -328,10 +328,17 @@ describe("Pre-launch hardening -- BOOKING_PENDING conversational trap", () => {
     expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("QUALIFIED_B");
   });
 
-  it("11: after UNKNOWN_INTENT_HANDOFF, a further message stays silent -- terminal suppression, never a repeated escalation or a second message", async () => {
-    // Fase 7J item 15 (idempotency) + the pre-existing, protected DO_NOT_CONTACT/HUMAN_HANDOFF
-    // suppression in whatsapp-inbound-service.ts's wasAlreadySuppressed check: once escalated, the
-    // lead must stop receiving automated replies entirely, not just avoid re-escalating.
+  it("11: after UNKNOWN_INTENT_HANDOFF, a further message now auto-recovers instead of freezing forever (Fase 2.2.14A)", async () => {
+    // This test's ORIGINAL name/assertion was "a further message stays silent -- terminal
+    // suppression, never a repeated escalation or a second message". That was exactly the
+    // permanent-freeze behavior reproduced in real production during Fase 2.2.13 (a
+    // BOOKING_PENDING lead sending a plain, human message and getting stuck in HUMAN_HANDOFF
+    // forever) -- see docs/FASE2.2.14-UNKNOWN-INTENT-HANDOFF-POLICY.md and
+    // docs/FASE2.2.14A-UNKNOWN-INTENT-AUTO-RECOVERY.md. Fase 2.2.14A deliberately changed this:
+    // the NEXT inbound message after an UNKNOWN_INTENT_HANDOFF escalation now auto-recovers the
+    // lead (reusing HumanHandoffRecoveryService, the same mechanism as the Fase 2.2.3
+    // critical-command bypass) instead of staying frozen. This test is updated, not deleted, to
+    // assert the new, intended behavior.
     const repos = buildRepos();
     const app = await buildTestApp({ ...repos, whatsappBookingEnabled: true });
     const { lead, conversation } = await createLeadAtStatus(repos, "5214778891014", "BOOKING_PENDING");
@@ -342,9 +349,9 @@ describe("Pre-launch hardening -- BOOKING_PENDING conversational trap", () => {
 
     await send(app, "5214778891014", "wamid.g14b", "hola, siguen ahi?");
 
-    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF"); // unchanged
-    const outbound = await outboundMessages(repos, conversation.id);
-    expect(outbound).toHaveLength(1); // only the original escalation message -- never a second one
+    expect((await repos.leadsRepo.findById(lead.id))?.status).not.toBe("HUMAN_HANDOFF"); // auto-recovered, no longer frozen
+    const history = await repos.leadStatusHistoryRepo.listByLeadId(lead.id);
+    expect(history.map((h) => h.eventType)).toContain("UNKNOWN_INTENT_AUTO_RECOVERY");
   });
 
   it("flag-off regression: with WHATSAPP_BOOKING_ENABLED off, BOOKING_PENDING is never reached by this handler (byte-for-byte prior behavior)", async () => {

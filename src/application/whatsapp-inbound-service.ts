@@ -29,7 +29,11 @@ import {
 } from "../domain/message-templates.js";
 import { MessagingProviderError } from "../domain/errors.js";
 import { getFiscalLeadContextForLead, type FiscalLeadContext } from "./fiscal-lead-context.js";
-import { HANDOFF_AUTO_RECOVERED_EVENT_TYPE, HANDOFF_AUTO_RECOVERED_REASON_CODE, type HumanHandoffRecoveryResult } from "./human-handoff-recovery-service.js";
+import {
+  HANDOFF_AUTO_RECOVERED_EVENT_TYPE, HANDOFF_AUTO_RECOVERED_REASON_CODE,
+  HANDOFF_AUTO_RECOVERED_UNKNOWN_INTENT_EVENT_TYPE, HANDOFF_AUTO_RECOVERED_UNKNOWN_INTENT_REASON_CODE,
+  type HumanHandoffRecoveryResult,
+} from "./human-handoff-recovery-service.js";
 
 /**
  * Phase 3B qualifier orchestrator, injected only when config.QUALIFICATION_ENGINE_ENABLED is
@@ -209,10 +213,18 @@ export interface WhatsAppInboundDeps {
    * always constructed"). Present in production by construction, always; a test that doesn't
    * need this critical-command bypass simply omits it, and the wasAlreadySuppressed branch below
    * behaves byte-for-byte as it did before this phase -- same "optional dependency is the de
-   * facto flag" convention as every other handler in this file. Narrowed to just the one method
+   * facto flag" convention as every other handler in this file. Narrowed to just the methods
    * this file calls, so this file never needs to import the concrete class.
+   *
+   * Fase 2.2.14A -- `isUnknownIntentEscalation` added to this same narrow interface (the
+   * underlying instance already had the method; only the type seen here grows). Omitting it in a
+   * test that doesn't need the new unknown-intent auto-recovery keeps that branch untaken,
+   * byte-for-byte the Fase 2.2.3 behavior.
    */
-  handoffRecovery?: { recover(leadId: string, now: Date, eventType?: string, recoveryReasonCode?: string): Promise<HumanHandoffRecoveryResult> };
+  handoffRecovery?: {
+    recover(leadId: string, now: Date, eventType?: string, recoveryReasonCode?: string): Promise<HumanHandoffRecoveryResult>;
+    isUnknownIntentEscalation(leadId: string): Promise<boolean>;
+  };
 }
 
 /**
@@ -506,14 +518,60 @@ export async function handleInboundWhatsAppText(
         );
         return { outcome: "PROCESSED", leadId, conversationId };
       }
+    } else if (deps.handoffRecovery && await deps.handoffRecovery.isUnknownIntentEscalation(leadId)) {
+      // Fase 2.2.14A (docs/FASE2.2.14-UNKNOWN-INTENT-HANDOFF-POLICY.md has the full audit and
+      // policy). Reproduced in production: a lead whose MOST RECENT escalation into HUMAN_HANDOFF
+      // was UNKNOWN_INTENT_HANDOFF (an unrecognized free-text reply within an active flow -- see
+      // that doc's audit of the 5 real call sites, all funneling through
+      // booking-outcome-dispatch.ts's escalateToHuman) must never stay frozen forever just because
+      // the lead is still alive and writing in. Every OTHER handoff reason (a complaint, a request
+      // for a human, sensitive content, a genuine data-consistency error) is deliberately left
+      // completely untouched by this branch -- isUnknownIntentEscalation returns false for all of
+      // them, and control falls to the unchanged final suppression below, same as Test 4/6 already
+      // require.
+      //
+      // Reuses the EXACT SAME HumanHandoffRecoveryService the admin endpoint and the Fase 2.2.3
+      // critical-command bypass already use -- never a second, divergent decision rule for "what
+      // status should this lead really be in". No live-appointment precondition here (unlike the
+      // critical-command branch above): ANY next message is the "clear condition" this phase's
+      // policy is built on, not a specific command -- see the policy doc's section C for why a
+      // timeout/cron sweep was deliberately rejected in favor of this.
+      const recovery = await deps.handoffRecovery.recover(
+        leadId, new Date(), HANDOFF_AUTO_RECOVERED_UNKNOWN_INTENT_EVENT_TYPE, HANDOFF_AUTO_RECOVERED_UNKNOWN_INTENT_REASON_CODE,
+      );
+      if (recovery.outcome === "RECOVERED") {
+        lead = recovery.lead;
+        deps.logger.warn(
+          { messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), fromStatus: recovery.previousStatus, toStatus: recovery.toStatus },
+          "handoff_recovered_unknown_intent",
+        );
+        // Deliberately NO return here -- this exact turn continues below, through the SAME
+        // processing boundary/router every other non-suppressed lead already goes through, using
+        // the NOW-recovered lead.status. If this message doesn't match anything that status's own
+        // router recognizes, that router's own escalation logic (the same 5 call sites this whole
+        // phase is about) is free to escalate again -- a genuine, freshly-audited new episode,
+        // never a silent freeze, never a loop (this function never re-enters itself; a second
+        // escalation only happens on a truly separate, later inbound message).
+      } else {
+        // NOT_ELIGIBLE/AMBIGUOUS/NOT_FOUND -- something about the lead's current data made
+        // recovery unsafe to compute a destination for (see HumanHandoffRecoveryService's own
+        // decision policy). Never guessed at further: stays suppressed, the same safe default as
+        // before this phase existed.
+        deps.logger.warn(
+          { messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), recoveryOutcome: recovery.outcome },
+          "commercial_message_suppressed",
+        );
+        return { outcome: "PROCESSED", leadId, conversationId };
+      }
     } else {
       // Every other message while HUMAN_HANDOFF -- including a real commercial question, a
       // greeting, or cancel/reschedule text when the relevant handler/appointments dependency is
       // simply absent -- stays exactly as silent as it was before this phase: ingested, zero
-      // automated reply. This is the mechanism Test 4/6 (commercial message stays paused, both for
-      // UNKNOWN_INTENT_HANDOFF and EXPLICIT_HUMAN_HANDOFF alike) depend on.
+      // automated reply. This is the mechanism Test 4/6 (commercial message stays paused for an
+      // EXPLICIT_HUMAN_HANDOFF lead, and for any lead when handoffRecovery is simply absent)
+      // depend on.
       deps.logger.warn(
-        { stage: "suppressed-lead-check", reason: "lead in HUMAN_HANDOFF, message not a recognized critical command", messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), conversationIdLast8: conversationId.slice(-8) },
+        { stage: "suppressed-lead-check", reason: "lead in HUMAN_HANDOFF, message not a recognized critical command, handoff not unknown-intent-recoverable", messageIdLast8: msgIdLast8, leadIdLast8: leadId.slice(-8), conversationIdLast8: conversationId.slice(-8) },
         "commercial_message_suppressed",
       );
       return { outcome: "PROCESSED", leadId, conversationId };

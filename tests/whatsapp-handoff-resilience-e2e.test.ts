@@ -9,7 +9,7 @@ import {
   InMemoryAppointmentRescheduleRepository,
 } from "../src/infrastructure/memory-repositories.js";
 import { FakeCalendarProvider } from "../src/infrastructure/fake-calendar.js";
-import { UNKNOWN_INTENT_HANDOFF_MESSAGE } from "../src/domain/message-templates.js";
+import { UNKNOWN_INTENT_HANDOFF_MESSAGE, BOOKED_GENERIC_INBOUND_MESSAGE } from "../src/domain/message-templates.js";
 import type { Lead, LeadStatus } from "../src/domain/lead.js";
 
 /**
@@ -104,6 +104,29 @@ async function createHandoffLeadWithLiveAppointment(repos: ReturnType<typeof bui
 async function outboundMessages(repos: ReturnType<typeof buildRepos>, conversationId: string) {
   const messages = await repos.messagesRepo.listByConversationId(conversationId);
   return messages.filter((m) => m.direction === "OUTBOUND");
+}
+
+/** Test-only introspection, Fase 2.2.14A: escalateToHuman (booking-outcome-dispatch.ts) flips the
+ * conversation it's given to status "HUMAN_HANDOFF" -- so whatsapp-inbound-service.ts's own
+ * `findActiveByLeadId` (ACTIVE only) can no longer find it, and the NEXT inbound message creates a
+ * fresh conversation. This is pre-existing app behavior, unrelated to this phase, but it means a
+ * test that sends a real escalation and then a follow-up message must look across every
+ * conversation the lead has accumulated, not just the one its fixture originally created --
+ * ConversationRepository's own port has no "all conversations for a lead" query (only
+ * findActiveByLeadId), so this reaches into the InMemory implementation's own storage directly. */
+function allConversationsForLead(repos: ReturnType<typeof buildRepos>, leadId: string) {
+  const data = (repos.conversationsRepo as unknown as { data: Map<string, { id: string; leadId: string }> }).data;
+  return [...data.values()].filter((c) => c.leadId === leadId);
+}
+
+async function allMessagesForLead(repos: ReturnType<typeof buildRepos>, leadId: string) {
+  const conversations = allConversationsForLead(repos, leadId);
+  const perConversation = await Promise.all(conversations.map((c) => repos.messagesRepo.listByConversationId(c.id)));
+  return perConversation.flat().sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+}
+
+async function allOutboundMessagesForLead(repos: ReturnType<typeof buildRepos>, leadId: string) {
+  return (await allMessagesForLead(repos, leadId)).filter((m) => m.direction === "OUTBOUND");
 }
 
 describe("Fase 2.2.3 -- Handoff Resilience", () => {
@@ -332,5 +355,234 @@ describe("Fase 2.2.3 -- Handoff Resilience", () => {
     // The live appointment is untouched by an opt-out -- opting out of messages is not a cancellation.
     const appointments = await repos.appointmentsRepo.listAllByLeadId(lead.id);
     expect(appointments[0]?.status).toBe("BOOKED");
+  });
+});
+
+/**
+ * Fase 2.2.14A -- Unknown Intent Auto-Recovery. See
+ * docs/FASE2.2.14-UNKNOWN-INTENT-HANDOFF-POLICY.md (audit/policy) and
+ * docs/FASE2.2.14A-UNKNOWN-INTENT-AUTO-RECOVERY.md (this phase's report) for the full rationale.
+ * Covers the phase's own "Sección 7: TESTS OBLIGATORIOS" list, in order. TEST 5 above already
+ * proves the mechanism end-to-end for the critical-command path (existing since Fase 2.2.3) --
+ * these 10 tests prove the NEW unknown-intent path added in this phase, and its precedence
+ * relative to that existing path.
+ */
+describe("Fase 2.2.14A -- Unknown Intent Auto-Recovery", () => {
+  // TEST 1 -- el mensaje siguiente reconocido recupera Y se procesa en el mismo turno.
+  it("TEST 1: UNKNOWN_INTENT_HANDOFF + next recognized message -> auto-recovers and answers that SAME message, never stays frozen", async () => {
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappCancellationEnabled: true, whatsappRescheduleEnabled: true });
+    const { lead } = await createLeadAtStatus(repos, "5214772210001", "BOOKED");
+    await repos.appointmentsRepo.create({
+      leadId: lead.id, status: "BOOKED", startsAt: FUTURE_STARTS_AT, endsAt: FUTURE_ENDS_AT, timezone: "America/Mexico_City",
+    });
+
+    // Real escalation via the actual router (same trigger as the Fase 2.2.13 production incident).
+    await send(app, "5214772210001", "wamid.u1a", "no sé, tal vez tenga una junta");
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF");
+
+    // A generic, non-critical message the lead sends "a third time" that a plain BOOKED lead would
+    // get a real reply for -- proves the user never needs to write a third time to unstick this.
+    await send(app, "5214772210001", "wamid.u1b", "gracias");
+
+    const finalLead = await repos.leadsRepo.findById(lead.id);
+    expect(finalLead?.status).toBe("BOOKED"); // auto-recovered, and the recognized message did not re-escalate
+    // The escalation flips the ORIGINAL conversation away from ACTIVE (see the doc comment on
+    // allOutboundMessagesForLead), so the recovered turn's reply lands in a fresh conversation --
+    // gather across all of them rather than assuming a single conversation.id stays valid.
+    const outbound = await allOutboundMessagesForLead(repos, lead.id);
+    expect(outbound).toHaveLength(2); // 1: the original UNKNOWN_INTENT_HANDOFF_MESSAGE, 2: a real answer to "gracias"
+    expect(outbound[0]?.body).toBe(UNKNOWN_INTENT_HANDOFF_MESSAGE);
+    expect(outbound[1]?.body).not.toBe(UNKNOWN_INTENT_HANDOFF_MESSAGE); // a real reply, never silence, never another escalation message
+    const history = await repos.leadStatusHistoryRepo.listByLeadId(lead.id);
+    expect(history.map((h) => h.eventType)).toEqual(["UNKNOWN_INTENT_HANDOFF", "UNKNOWN_INTENT_AUTO_RECOVERY"]);
+  });
+
+  // TEST 2 -- el mensaje siguiente TAMBIÉN desconocido: recupera, enruta, vuelve a escalar -- sin loop.
+  it("TEST 2: UNKNOWN_INTENT_HANDOFF + next message ALSO unrecognized -> auto-recovers, routes, re-escalates to HUMAN_HANDOFF again -- no infinite loop", async () => {
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappCancellationEnabled: true, whatsappRescheduleEnabled: true });
+    const { lead } = await createLeadAtStatus(repos, "5214772210002", "BOOKED");
+    await repos.appointmentsRepo.create({
+      leadId: lead.id, status: "BOOKED", startsAt: FUTURE_STARTS_AT, endsAt: FUTURE_ENDS_AT, timezone: "America/Mexico_City",
+    });
+
+    await send(app, "5214772210002", "wamid.u2a", "no sé, tal vez tenga una junta");
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF");
+
+    // Same unparseable text again: recovers back to BOOKED, that status's own router still can't
+    // parse it, and its own (unmodified) escalation logic fires again -- a genuine second episode.
+    await send(app, "5214772210002", "wamid.u2b", "no sé, tal vez tenga una junta");
+
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF"); // back in handoff -- correct, not a bug
+    // Each escalation flips its own conversation away from ACTIVE (see allOutboundMessagesForLead's
+    // doc comment), so this episode's two escalation replies land in two different conversations.
+    const outbound = await allOutboundMessagesForLead(repos, lead.id);
+    expect(outbound).toHaveLength(2); // exactly one escalation message per episode -- finite, never a runaway loop
+    expect(outbound.every((m) => m.body === UNKNOWN_INTENT_HANDOFF_MESSAGE)).toBe(true);
+    const history = await repos.leadStatusHistoryRepo.listByLeadId(lead.id);
+    expect(history.map((h) => h.eventType)).toEqual(["UNKNOWN_INTENT_HANDOFF", "UNKNOWN_INTENT_AUTO_RECOVERY", "UNKNOWN_INTENT_HANDOFF"]);
+  });
+
+  // TEST 3 -- handoff explícito nunca se auto-recupera con un mensaje normal.
+  it("TEST 3: EXPLICIT_HUMAN_HANDOFF + normal message -> NO auto-recovery, stays silenced exactly as before this phase", async () => {
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappCancellationEnabled: true, whatsappRescheduleEnabled: true });
+    const { lead, conversation } = await createHandoffLeadWithLiveAppointment(repos, "5214772210003");
+    await repos.leadStatusHistoryRepo.create({ leadId: lead.id, fromStatus: "BOOKED", toStatus: "HUMAN_HANDOFF", eventType: "HUMAN_HANDOFF_REQUESTED", metadata: {} });
+
+    await send(app, "5214772210003", "wamid.u3", "¿me pueden ayudar con otra cosa?");
+
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF");
+    expect(await outboundMessages(repos, conversation.id)).toHaveLength(0);
+    const history = await repos.leadStatusHistoryRepo.listByLeadId(lead.id);
+    expect(history.map((h) => h.eventType)).not.toContain("UNKNOWN_INTENT_AUTO_RECOVERY");
+  });
+
+  // TEST 4 -- el bypass crítico existente (Cancelar) tiene precedencia sobre esta nueva rama.
+  it("TEST 4: UNKNOWN_INTENT_HANDOFF + 'Cancelar' -> preserves the EXISTING critical-command bypass, never the new unknown-intent path", async () => {
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappCancellationEnabled: true, whatsappRescheduleEnabled: true });
+    const { lead } = await createLeadAtStatus(repos, "5214772210004", "BOOKED");
+    await repos.appointmentsRepo.create({
+      leadId: lead.id, status: "BOOKED", startsAt: FUTURE_STARTS_AT, endsAt: FUTURE_ENDS_AT, timezone: "America/Mexico_City",
+    });
+
+    await send(app, "5214772210004", "wamid.u4a", "no sé, tal vez tenga una junta");
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF");
+
+    await send(app, "5214772210004", "wamid.u4b", "Cancelar");
+
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("CANCEL_PENDING");
+    const history = await repos.leadStatusHistoryRepo.listByLeadId(lead.id);
+    const recoveryEvents = history.map((h) => h.eventType).filter((e) => e === "HANDOFF_AUTO_RECOVERED_CRITICAL_COMMAND" || e === "UNKNOWN_INTENT_AUTO_RECOVERY");
+    expect(recoveryEvents).toEqual(["HANDOFF_AUTO_RECOVERED_CRITICAL_COMMAND"]); // the OLD bypass fired, never the new one
+  });
+
+  // TEST 5 -- el bypass crítico existente (Reagendar) tiene precedencia sobre esta nueva rama.
+  it("TEST 5: UNKNOWN_INTENT_HANDOFF + 'Reagendar' -> preserves the EXISTING critical-command bypass, never the new unknown-intent path", async () => {
+    const repos = buildRepos();
+    // Both flags needed: the initial escalation trigger itself (booked-generic-fallback branch,
+    // whatsapp-inbound-service.ts:977) requires BOTH rescheduleHandler AND cancellationHandler
+    // present before it will even evaluate whether to escalate -- reschedule-only would leave the
+    // first message unrouted (no reply, no escalation, lead stays BOOKED), never reaching the
+    // HUMAN_HANDOFF precondition this test needs.
+    const app = await buildTestApp({ ...repos, whatsappCancellationEnabled: true, whatsappRescheduleEnabled: true });
+    const { lead } = await createLeadAtStatus(repos, "5214772210005", "BOOKED");
+    await repos.appointmentsRepo.create({
+      leadId: lead.id, status: "BOOKED", startsAt: FUTURE_STARTS_AT, endsAt: FUTURE_ENDS_AT, timezone: "America/Mexico_City",
+    });
+
+    await send(app, "5214772210005", "wamid.u5a", "no sé, tal vez tenga una junta");
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF");
+
+    await send(app, "5214772210005", "wamid.u5b", "Reagendar");
+
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("RESCHEDULE_REQUESTED");
+    const history = await repos.leadStatusHistoryRepo.listByLeadId(lead.id);
+    const recoveryEvents = history.map((h) => h.eventType).filter((e) => e === "HANDOFF_AUTO_RECOVERED_CRITICAL_COMMAND" || e === "UNKNOWN_INTENT_AUTO_RECOVERY");
+    expect(recoveryEvents).toEqual(["HANDOFF_AUTO_RECOVERED_CRITICAL_COMMAND"]);
+  });
+
+  // TEST 6 -- "caso obligatorio": UNKNOWN_INTENT_HANDOFF histórico, pero el handoff ACTUAL es explícito.
+  it("TEST 6: historical UNKNOWN_INTENT_HANDOFF but the CURRENT handoff episode is explicit -> NO auto-recovery", async () => {
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappCancellationEnabled: true, whatsappRescheduleEnabled: true });
+    const { lead, conversation } = await createLeadAtStatus(repos, "5214772210006", "HUMAN_HANDOFF");
+    // Old episode, days ago: escalated for UNKNOWN_INTENT_HANDOFF, then manually recovered.
+    await repos.leadStatusHistoryRepo.create({ leadId: lead.id, fromStatus: "BOOKED", toStatus: "HUMAN_HANDOFF", eventType: "UNKNOWN_INTENT_HANDOFF", metadata: {} });
+    await repos.leadStatusHistoryRepo.create({ leadId: lead.id, fromStatus: "HUMAN_HANDOFF", toStatus: "BOOKED", eventType: "HANDOFF_MANUALLY_RECOVERED", metadata: {} });
+    // NEW, separate episode: a genuinely explicit escalation is the current, most recent reason.
+    await repos.leadStatusHistoryRepo.create({ leadId: lead.id, fromStatus: "BOOKED", toStatus: "HUMAN_HANDOFF", eventType: "HUMAN_HANDOFF_REQUESTED", metadata: {} });
+
+    await send(app, "5214772210006", "wamid.u6", "Hola, quiero revisar mi resultado");
+
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF"); // never confused with the old, unrelated episode
+    expect(await outboundMessages(repos, conversation.id)).toHaveLength(0);
+    const history = await repos.leadStatusHistoryRepo.listByLeadId(lead.id);
+    expect(history.map((h) => h.eventType)).not.toContain("UNKNOWN_INTENT_AUTO_RECOVERY");
+  });
+
+  // TEST 7 -- el audit trail registra un evento de auto-recuperación inequívoco y medible.
+  it("TEST 7: audit trail records an unambiguous, distinctly-labeled UNKNOWN_INTENT_AUTO_RECOVERY event", async () => {
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappCancellationEnabled: true, whatsappRescheduleEnabled: true });
+    const { lead } = await createLeadAtStatus(repos, "5214772210007", "BOOKED");
+    await repos.appointmentsRepo.create({
+      leadId: lead.id, status: "BOOKED", startsAt: FUTURE_STARTS_AT, endsAt: FUTURE_ENDS_AT, timezone: "America/Mexico_City",
+    });
+
+    await send(app, "5214772210007", "wamid.u7a", "no sé, tal vez tenga una junta");
+    await send(app, "5214772210007", "wamid.u7b", "gracias");
+
+    const history = await repos.leadStatusHistoryRepo.listByLeadId(lead.id);
+    const recoveryEntry = history.find((h) => h.eventType === "UNKNOWN_INTENT_AUTO_RECOVERY");
+    expect(recoveryEntry).toBeDefined();
+    expect(recoveryEntry).toMatchObject({ fromStatus: "HUMAN_HANDOFF", toStatus: "BOOKED" });
+    expect(recoveryEntry?.metadata).toMatchObject({ recoveryReasonCode: "AUTOMATIC_UNKNOWN_INTENT_NOT_PERMANENT" });
+    // Distinguishable from the OTHER two recover() callers' own labels -- never conflated.
+    expect(history.map((h) => h.eventType)).not.toContain("HANDOFF_MANUALLY_RECOVERED");
+    expect(history.map((h) => h.eventType)).not.toContain("HANDOFF_AUTO_RECOVERED_CRITICAL_COMMAND");
+  });
+
+  // TEST 8 -- el mismo mensaje entrante se procesa exactamente una vez tras la recuperación.
+  it("TEST 8: the message that triggers auto-recovery is processed exactly once (never double-ingested)", async () => {
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappCancellationEnabled: true, whatsappRescheduleEnabled: true });
+    const { lead } = await createLeadAtStatus(repos, "5214772210008", "BOOKED");
+    await repos.appointmentsRepo.create({
+      leadId: lead.id, status: "BOOKED", startsAt: FUTURE_STARTS_AT, endsAt: FUTURE_ENDS_AT, timezone: "America/Mexico_City",
+    });
+
+    await send(app, "5214772210008", "wamid.u8a", "no sé, tal vez tenga una junta");
+    await send(app, "5214772210008", "wamid.u8b", "gracias");
+
+    // The escalation creates a second conversation for the recovered turn (see
+    // allOutboundMessagesForLead's doc comment) -- look across all of the lead's conversations.
+    const messages = await allMessagesForLead(repos, lead.id);
+    expect(messages.filter((m) => m.direction === "INBOUND" && m.providerMessageId === "wamid.u8b")).toHaveLength(1);
+    const outbound = messages.filter((m) => m.direction === "OUTBOUND");
+    expect(outbound.filter((m) => m.body === BOOKED_GENERIC_INBOUND_MESSAGE)).toHaveLength(1); // exactly one answer, not two
+  });
+
+  // TEST 9 -- el dedupe por wamid sigue funcionando bajo esta nueva rama.
+  it("TEST 9: duplicate webhook delivery (same wamid) of the recovery-triggering message -> exactly one recovery, never two", async () => {
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, whatsappCancellationEnabled: true, whatsappRescheduleEnabled: true });
+    const { lead } = await createLeadAtStatus(repos, "5214772210009", "BOOKED");
+    await repos.appointmentsRepo.create({
+      leadId: lead.id, status: "BOOKED", startsAt: FUTURE_STARTS_AT, endsAt: FUTURE_ENDS_AT, timezone: "America/Mexico_City",
+    });
+
+    await send(app, "5214772210009", "wamid.u9a", "no sé, tal vez tenga una junta");
+    await send(app, "5214772210009", "wamid.u9b", "gracias");
+    await send(app, "5214772210009", "wamid.u9b", "gracias"); // exact same provider_message_id -- a real Meta redelivery
+
+    const messages = await allMessagesForLead(repos, lead.id);
+    expect(messages.filter((m) => m.direction === "INBOUND")).toHaveLength(2); // deduped: only u9a + u9b, not a third
+    const history = await repos.leadStatusHistoryRepo.listByLeadId(lead.id);
+    expect(history.filter((h) => h.eventType === "UNKNOWN_INTENT_AUTO_RECOVERY")).toHaveLength(1); // never a duplicate recovery
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("BOOKED");
+  });
+
+  // TEST 10 -- el endpoint admin recover-handoff sigue funcionando, incluso cuando el motivo original fue UNKNOWN_INTENT_HANDOFF.
+  it("TEST 10: admin POST /api/leads/:id/recover-handoff still works without regression for a lead originally escalated via UNKNOWN_INTENT_HANDOFF", async () => {
+    const repos = buildRepos();
+    const app = await buildTestApp({ ...repos, adminApiToken: TEST_ADMIN_API_TOKEN, whatsappCancellationEnabled: true, whatsappRescheduleEnabled: true });
+    const { lead } = await createLeadAtStatus(repos, "5214772210010", "BOOKED");
+    await repos.appointmentsRepo.create({
+      leadId: lead.id, status: "BOOKED", startsAt: FUTURE_STARTS_AT, endsAt: FUTURE_ENDS_AT, timezone: "America/Mexico_City",
+    });
+    await send(app, "5214772210010", "wamid.u10", "no sé, tal vez tenga una junta");
+    expect((await repos.leadsRepo.findById(lead.id))?.status).toBe("HUMAN_HANDOFF");
+
+    const res = await app.inject({
+      method: "POST", url: `/api/leads/${lead.id}/recover-handoff`, headers: { "x-admin-token": TEST_ADMIN_API_TOKEN },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ ok: true, outcome: "RECOVERED", previousStatus: "HUMAN_HANDOFF" });
+    const history = await repos.leadStatusHistoryRepo.listByLeadId(lead.id);
+    expect(history.at(-1)?.eventType).toBe("HANDOFF_MANUALLY_RECOVERED"); // unchanged admin-path label, unaffected by this phase
   });
 });
